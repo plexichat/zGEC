@@ -2899,6 +2899,22 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
     fh.block_log2 = (uint8_t)params.block_log2;
     fh.epoch_blocks = (uint8_t)params.epoch_blocks;
     fh.max_dict_log2 = (uint8_t)params.max_dict_log2;
+    /* 3.3/5.8: the header declares the largest dictionary a block may
+     * reference, and a decoder rejects a dictionary larger than that.
+     * Raise the declared cap to cover the registered external
+     * dictionaries, so a frame is always decodable with the very inputs
+     * that produced it. */
+    {
+        size_t si;
+        for (si = 0; si < n_ext; si++) {
+            size_t want = ext_sizes[si];
+            uint8_t need = 0;
+            while (need < (uint8_t)ZGEC_MAX_DICT_LOG2 &&
+                   ((size_t)1 << need) < want)
+                need = (uint8_t)(need + 1);
+            if (need > fh.max_dict_log2) fh.max_dict_log2 = need;
+        }
+    }
     fh.seg_hint_log2 = (uint8_t)params.seg_hint_log2;
     fh.content_size = (uint64_t)src_size;
     fh.block_count = (uint32_t)n_blocks;
@@ -3224,10 +3240,11 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
             size_t d;
             /* lr_buf/lr_len are newest first (index 0 is block b-1), and
              * 6.3 defines the region as blocks b-D .. b-1, so candidates
-             * are taken from the newest end; D shrinks (never to a
-             * different set) if the P24 position bound is reached. */
+             * are taken from the newest end: index d is block b-1-d. D
+             * shrinks (never to a different, non-contiguous set) when the
+             * P24 position bound is reached. */
             for (d = 0; d < lr_n; d++) {
-                size_t cand = lr_len[lr_n - 1 - d];
+                size_t cand = lr_len[d];
                 if (prefix + cand + bs > (size_t)(1u << 24)) break;
                 prefix += cand;
             }
@@ -3246,7 +3263,7 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
                     size_t off2 = 0;
                     size_t q;
                     for (q = 0; q < d; q++) {
-                        size_t si = lr_n - 1 - q; /* oldest first */
+                        size_t si = d - 1 - q; /* oldest first */
                         if (lr_len[si] > 0) {
                             memcpy(lr_region + off2, lr_buf[si], lr_len[si]);
                             off2 += lr_len[si];

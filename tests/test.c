@@ -1134,10 +1134,6 @@ static int zgec_test_litref_bound(void)
         printf("  litref_bound: block_count=%u\n", f.block_count);
         goto out;
     }
-    printf("  litref_bound: size=%zu blocks=%u dicts=%u src=%016llx dict=%016llx\n",
-           cmp_size, f.block_count, f.dict_count,
-           (unsigned long long)zgec_xxh64(src, n, 0),
-           (unsigned long long)zgec_xxh64(dict, dn, 0));
     for (i = 0; i < f.block_count; i++) {
         /* run = how many exportable predecessors the block has, which is
          * what bounds the encoder's chain (6.3). */
@@ -1154,16 +1150,12 @@ static int zgec_test_litref_bound(void)
         if (f.blocks[i].lit_ref_depth > 0 &&
             (size_t)f.blocks[i].lit_ref_depth < run)
             shrunken++;
-        printf("  litref_bound: blk%u depth=%u run=%u dict_id=%u rflags=%u\n",
-               (unsigned)i, (unsigned)f.blocks[i].lit_ref_depth,
-               (unsigned)run, (unsigned)f.blocks[i].dict_id,
-               (unsigned)f.blocks[i].rflags);
     }
     /* The chain must be used, and with 12 MiB of dictionary ahead of it
      * the bound must have shrunk it below the available run length. */
     if (depth_blocks == 0 || shrunken == 0) {
-        printf("  litref_bound: depth_blocks=%d shrunken=%d\n",
-               depth_blocks, shrunken);
+        printf("  litref_bound: chain unused or unbounded "
+               "(depth_blocks=%d shrunken=%d)\n", depth_blocks, shrunken);
         goto out;
     }
 
@@ -1176,6 +1168,10 @@ static int zgec_test_litref_bound(void)
             err = zgec_decode_frame(d, cmp, cmp_size, &out, &out_size);
         zgec_decoder_destroy(d);
         if (err != ZGEC_OK || out_size != n || memcmp(out, src, n) != 0) {
+            /* A shrunken D that named the wrong predecessor set (oldest
+             * instead of newest) surfaces here, not in the footer. */
+            printf("  litref_bound: round-trip failed err=%d out_size=%zu "
+                   "want=%zu\n", (int)err, out_size, n);
             zgec_free(out);
             goto out;
         }
