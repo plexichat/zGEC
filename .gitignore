@@ -1,0 +1,46 @@
+# Build output (out-of-source builds: cmake -B build or build_check)
+build/
+build_check/
+build-*/
+cmake-build-*/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.slnx
+*.vcxproj
+*.vcxproj.filters
+*.dir/
+
+# Compiled objects and binaries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.pdb
+*.ilk
+*.exp
+
+# Test / debug run artifacts
+*.zgec
+test_input.txt
+rt.bin
+rt.out
+rt.err
+dbg.out
+dbg.err
+dbg*.out
+dbg*.err
+
+# Editor / OS noise
+.vs/
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
