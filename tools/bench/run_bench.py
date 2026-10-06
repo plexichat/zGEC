@@ -66,7 +66,6 @@ XZ_LEVELS = [2]
 HEAVY_MB = 256
 HTTP_TIMEOUT = 120
 HTTP_TRIES = 4
-PROBE_BYTES = 1 * MIB
 
 
 def log(msg):
@@ -179,6 +178,20 @@ def tool_version(exe, args=("--version",)):
         return ""
 
 
+def exe_path(path):
+    """The path to an executable, allowing for the suffix Windows appends.
+
+    subprocess already finds build/zgec.exe for the name build/zgec, so the
+    existence checks have to agree with it or a perfectly usable binary is
+    reported as missing.
+    """
+    if not path or os.path.exists(path):
+        return path
+    if os.name == "nt" and os.path.exists(path + ".exe"):
+        return path + ".exe"
+    return path
+
+
 def file_equal(a, b):
     if a.stat().st_size != b.stat().st_size:
         return False
@@ -233,16 +246,50 @@ def check_members(names):
             raise SystemExit("refusing unsafe archive member %r" % name)
 
 
-def extract(archive, dest):
+def _tar_extract_all(tf, dest, members=None):
+    """Extract members, pinning tarfile's extraction filter.
+
+    From 3.12 tarfile warns when no filter is passed, and 3.14 changes the
+    default, which would quietly alter what an archive unpacks into. The names
+    are vetted by check_members() first, so the permissive filter is the one
+    intended here; interpreters older than 3.12 take no filter at all.
+    """
+    try:
+        tf.extractall(dest, members=members, filter="fully_trusted")
+    except TypeError:
+        tf.extractall(dest, members=members)
+
+
+def extract(archive, dest, only=None):
+    """Unpack archive into dest, or only the subtree named by `only`.
+
+    `only` is a path inside the archive. A manifest entry that names a nested
+    payload uses it, so a corpus that is a subtree of a large tree unpacks on
+    its own instead of writing that whole tree out a second time.
+
+    The member list is materialised before anything is written: extracting
+    while iterating the archive makes tarfile load its index, which drains the
+    stream and silently ends the loop after the first member.
+    """
     dest.mkdir(parents=True, exist_ok=True)
     if zipfile.is_zipfile(archive):
         with zipfile.ZipFile(archive) as zf:
-            check_members(zf.namelist())
-            zf.extractall(dest)
+            names = zf.namelist()
+            check_members(names)
+            if only:
+                names = [n for n in names
+                         if n == only or n.startswith(only + "/")]
+            zf.extractall(dest, members=names)
         return
     with tarfile.open(archive, "r:*") as tf:
-        check_members(tf.getnames())
-        tf.extractall(dest)
+        members = None
+        if only:
+            members = [m for m in tf.getmembers()
+                       if m.name == only or m.name.startswith(only + "/")]
+            check_members([m.name for m in members])
+        else:
+            check_members(tf.getnames())
+        _tar_extract_all(tf, dest, members)
 
 
 def deterministic_tar(payload, out):
@@ -291,10 +338,15 @@ def prepare(entry, cache, max_input_mb):
     archive = cache / "downloads" / url.rsplit("/", 1)[-1]
     download(url, archive)
     root = cache / "extracted" / cid
+    rel = entry.get("payload", ".")
+    # A payload below the archive root ("a/b") is unpacked on its own, so two
+    # corpora can share one download without writing the tree out twice.
+    only = rel.strip("/") if "/" in rel.strip("/") else None
     if not root.exists():
-        log("extracting %s" % archive.name)
-        extract(archive, root)
-    payload = root / entry.get("payload", ".")
+        log("extracting %s%s"
+            % (archive.name, " (%s only)" % only if only else ""))
+        extract(archive, root, only)
+    payload = root / rel
 
     units = []
     if entry.get("kind") == "files":
@@ -412,19 +464,17 @@ class Bench(object):
                 self.row(corpus, "zgec", ver, cfg, threads, "encode",
                          data, fsize, data, fsize, best[0], best[1])
 
-                sec, rss, rc, text = run(dec)
-                if rc != 0:
+                # The same best-of-N path as encode, so the first decode is not
+                # a cold special case that always counts.
+                (best_dec, derr) = self._best_of(dec, self.args.reps)
+                if best_dec is None:
                     self.row(corpus, "zgec", ver, cfg, threads, "decode",
                              fsize, 0, data, fsize, 0.0, None,
-                             error="roundtrip rc=%d %s" % (rc, text.strip()[-200:]))
+                             error="roundtrip %s" % derr)
                     continue
                 rt = "roundtrip-ok"
-                if back.stat().st_size != data or not file_equal(back, src):
+                if not back.exists() or not file_equal(back, src):
                     rt = "roundtrip-MISMATCH"
-                best_dec = (sec, rss)
-                other = self._best_of(dec, max(1, self.args.reps) - 1)
-                if other[0] is not None and other[0][0] < best_dec[0]:
-                    best_dec = other[0]
                 self.row(corpus, "zgec", ver, cfg, threads, "decode",
                          fsize, data, data, fsize, best_dec[0], best_dec[1],
                          extra=rt)
@@ -461,21 +511,18 @@ class Bench(object):
         else:
             dcmd = [exe] + spec["dec_args"] + [str(out), "-o", str(back)]
             dfactory = None
-        sec, rss, rc, text = run(dcmd, stdout=dfactory() if dfactory else None)
-        if dfactory:
-            pass
-        if rc != 0:
+        # Decode through the same best-of-N path as encode. Each round opens its
+        # stdout target and closes it again, so the round-trip check below reads
+        # a file nothing still holds open.
+        (best_dec, derr) = self._best_of(dcmd, self.args.reps, dfactory)
+        if best_dec is None:
             self.row(corpus, spec["tool"], spec["ver"], spec["config"],
                      spec["threads"], "decode", fsize, 0, data, fsize, 0.0,
-                     None, error="decode rc=%d %s" % (rc, text.strip()[-200:]))
+                     None, error="decode %s" % derr)
             return
         rt = "roundtrip-ok"
-        if back.stat().st_size != data or not file_equal(back, src):
+        if not back.exists() or not file_equal(back, src):
             rt = "roundtrip-MISMATCH"
-        best_dec = (sec, rss)
-        other = self._best_of(dcmd, max(1, self.args.reps) - 1, dfactory)
-        if other[0] is not None and other[0][0] < best_dec[0]:
-            best_dec = other[0]
         self.row(corpus, spec["tool"], spec["ver"], spec["config"],
                  spec["threads"], "decode", fsize, data, data, fsize,
                  best_dec[0], best_dec[1], extra=rt)
@@ -491,94 +538,118 @@ class Bench(object):
 # the zstd seekable format
 # --------------------------------------------------------------------------
 
-# The seekable format ships as an example program whose option spelling has
-# changed between releases, so the form is discovered once on a 1 MiB sample
-# and the winning spelling is recorded in the CSV row. A candidate counts only
-# if it exits zero and writes a non-empty file.
-SEEK_ENC_FORMS = [
-    ["-b{level}", "{inp}", "{out}"],
-    ["--level={level}", "{inp}", "{out}"],
-    ["-{level}", "{inp}", "{out}"],
-    ["{level}", "{inp}", "{out}"],
-    ["-i", "{inp}", "-o", "{out}"],
-    ["{inp}", "{out}"],
-]
-SEEK_DEC_FORMS = [
-    ["-d", "{inp}", "{out}"],
-    ["-d", "-i", "{inp}", "-o", "{out}"],
-    ["{inp}", "{out}"],
-]
+# The seekable format is a contrib example, not a zstd CLI mode, and in the
+# pinned release it is three separate programs with fixed positional
+# interfaces -- none of which accepts an output path:
+#
+#   seekable_compression    FILE FRAME_SIZE [LEVEL]    -> writes FILE.zst, serial
+#   parallel_compression    FILE FRAME_SIZE NB_THREADS -> writes FILE.zst, level 5
+#   seekable_decompression  FILE START END             -> writes the range, stdout
+#
+# The interfaces are read from the pinned sources rather than probed, because
+# the frame size is a required positional argument and the output name cannot
+# be chosen at all. The input is therefore staged under a private name in the
+# scratch directory, and the FILE.zst that appears beside it is what gets
+# measured. Encode and decode are two different binaries in this release, which
+# is what --seekable-dec is for.
+SEEKABLE_FRAME_SIZE = 1 * MIB
+SEEKABLE_MT_LEVEL = 5  # parallel_compression hard-codes the level
 
 
-def seek_probe(exe, forms, inp, out, level=1):
-    for form in forms:
-        args = [a.format(level=level, inp=inp, out=out) for a in form]
-        if os.path.exists(out):
-            os.remove(out)
-        sec, rss, rc, _ = run([exe] + args)
-        if rc == 0 and os.path.exists(out) and os.path.getsize(out) > 0:
-            return form
-    return None
+def default_seekable_dec(exe):
+    """The decompressor that ships beside the seekable compressor."""
+    if not exe:
+        return ""
+    cand = os.path.join(os.path.dirname(exe),
+                        os.path.basename(exe).replace("compression",
+                                                      "decompression"))
+    if cand != exe and os.path.exists(cand):
+        return cand
+    return ""
 
 
-def measure_seekable(bench, corpus, src, exe, ver, levels):
+def stage_seekable_input(src, tmp):
+    """Put the input where the seekable example may write beside it.
+
+    The examples derive FILE.zst from the path they are handed, so the input
+    cannot point into the cached corpora. A hard link costs no copying; a copy
+    is the fallback where links are unavailable.
+    """
+    staged = tmp / "seek.input"
+    for path in (staged, tmp / "seek.input.zst", tmp / "seek.output"):
+        if path.exists():
+            path.unlink()
+    try:
+        os.link(src, staged)
+    except OSError:
+        shutil.copyfile(src, staged)
+    return staged
+
+
+def measure_seekable(bench, corpus, src, exe, dec_exe, mt_exe, ver, levels):
+    """Measure the seekable format: the serial levels, plus the parallel example."""
     data = src.stat().st_size
     if not exe or not os.path.exists(exe):
-        bench.row(corpus, "zstd-seekable", "", "seekable", 0, "encode",
+        bench.row(corpus, "zstd-seekable", "", "seekable", 1, "encode",
                   data, 0, data, 0, 0.0, None,
-                  error="zstd-seekable binary not supplied")
+                  error="zstd-seekable compressor not supplied")
         return
-    probe_in = bench.tmp / "seek.probe.in"
-    head_copy(src, probe_in, PROBE_BYTES)
-    probe_out = bench.tmp / "seek.probe.zst"
-    probe_back = bench.tmp / "seek.probe.back"
-    enc_form = seek_probe(exe, SEEK_ENC_FORMS, str(probe_in), str(probe_out))
-    if enc_form is None:
-        bench.row(corpus, "zstd-seekable", ver, "seekable", 0, "encode",
-                  data, 0, data, 0, 0.0, None,
-                  error="no working seekable encode invocation")
-        return
-    dec_form = seek_probe(exe, SEEK_DEC_FORMS, str(probe_out), str(probe_back))
-    spelling = " ".join(enc_form)
-    log("seekable encode form: %s (decode form: %s)"
-        % (spelling, " ".join(dec_form) if dec_form else "none"))
-    if dec_form is not None and not file_equal(probe_back, probe_in):
-        dec_form = None
 
-    out = bench.tmp / "seek.zst"
-    back = bench.tmp / "seek.back"
-    for level in levels:
-        args = [a.format(level=level, inp=str(src), out=str(out))
-                for a in enc_form]
-        (best, err) = bench._best_of([exe] + args, bench.args.reps)
-        if best is None or not out.exists() or out.stat().st_size == 0:
-            bench.row(corpus, "zstd-seekable", ver, "seekable -%d" % level, 0,
-                      "encode", data, 0, data, 0, 0.0, None,
-                      error=err or "no output")
-            continue
-        fsize = out.stat().st_size
-        bench.row(corpus, "zstd-seekable", ver, "seekable -%d" % level, 0,
-                  "encode", data, fsize, data, fsize, best[0], best[1],
-                  extra="form='%s'" % spelling)
-        if dec_form is None:
-            continue
-        dargs = [a.format(level=level, inp=str(out), out=str(back))
-                 for a in dec_form]
-        sec, rss, rc, _ = run([exe] + dargs)
-        if rc != 0:
-            continue
-        rt = "roundtrip-ok"
-        if back.stat().st_size != data or not file_equal(back, src):
-            rt = "roundtrip-MISMATCH"
-        best_dec = (sec, rss)
-        # Decoding is cheap; still take the best of the requested repeats.
-        for _ in range(max(1, bench.args.reps) - 1):
-            s2, r2, rc2, _ = run([exe] + dargs)
-            if rc2 == 0 and s2 < best_dec[0]:
-                best_dec = (s2, r2)
-        bench.row(corpus, "zstd-seekable", ver, "seekable -%d" % level, 0,
-                  "decode", fsize, data, data, fsize, best_dec[0],
-                  best_dec[1], extra=rt)
+    staged = stage_seekable_input(src, bench.tmp)
+    frame = bench.tmp / "seek.input.zst"  # the name the examples derive
+    back = bench.tmp / "seek.output"
+    can_decode = bool(dec_exe and os.path.exists(dec_exe))
+    if not can_decode:
+        log("seekable: no decompressor available, decode rows will say so")
+
+    configs = [(exe, [str(SEEKABLE_FRAME_SIZE), str(level)], 1, "-%d" % level)
+               for level in levels]
+    if mt_exe and os.path.exists(mt_exe):
+        # parallel_compression takes the thread count where the serial example
+        # takes the level, and fixes the level at 5 in its own source.
+        configs.append((mt_exe,
+                        [str(SEEKABLE_FRAME_SIZE), str(bench.cpu_count)],
+                        bench.cpu_count,
+                        "parallel -%d" % SEEKABLE_MT_LEVEL))
+
+    try:
+        for program, extra, threads, label in configs:
+            (best, err) = bench._best_of([program, str(staged)] + extra,
+                                         bench.args.reps)
+            if best is None or not frame.exists() or frame.stat().st_size == 0:
+                bench.row(corpus, "zstd-seekable", ver, label, threads,
+                          "encode", data, 0, data, 0, 0.0, None,
+                          error=err or "no output")
+                continue
+            fsize = frame.stat().st_size
+            bench.row(corpus, "zstd-seekable", ver, label, threads, "encode",
+                      data, fsize, data, fsize, best[0], best[1],
+                      extra="frame=%dKiB" % (SEEKABLE_FRAME_SIZE // 1024))
+            if not can_decode:
+                bench.row(corpus, "zstd-seekable", ver, label, threads,
+                          "decode", fsize, 0, data, fsize, 0.0, None,
+                          error="zstd-seekable decompressor not supplied")
+                continue
+            # The decoder is a range reader that writes to stdout. The whole
+            # file is the range 0..data, so the capture is the round trip.
+            (best_dec, derr) = bench._best_of(
+                [dec_exe, str(frame), "0", str(data)], bench.args.reps,
+                lambda: open(back, "wb"))
+            if best_dec is None:
+                bench.row(corpus, "zstd-seekable", ver, label, threads,
+                          "decode", fsize, 0, data, fsize, 0.0, None,
+                          error="decode %s" % derr)
+                continue
+            rt = "roundtrip-ok"
+            if not back.exists() or not file_equal(back, src):
+                rt = "roundtrip-MISMATCH"
+            bench.row(corpus, "zstd-seekable", ver, label, threads, "decode",
+                      fsize, data, data, fsize, best_dec[0], best_dec[1],
+                      extra=rt)
+    finally:
+        for path in (staged, frame, back):
+            if path.exists():
+                path.unlink()
 
 
 # --------------------------------------------------------------------------
@@ -598,22 +669,27 @@ def cached_rows(cache_dir, corpus):
     return rows
 
 
-def zstd_spec(exe, ver, level, threads, label):
+# A spec's `config` names the options only, and `threads` is how many threads the
+# run actually used. report.py composes a point label from the tool, the config
+# and that count, so repeating the tool name or the thread count in the config
+# would print twice. -T0 means "one worker per core", which is why the column
+# records the resolved count rather than the flag value.
+def zstd_spec(exe, ver, level, threads_arg, threads_used):
     return {
         "tool": "zstd", "ver": ver, "exe": exe,
-        "args": ["-q", "-f", "-%d" % level, "-T%d" % threads],
+        "args": ["-q", "-f", "-%d" % level, "-T%d" % threads_arg],
         "dec_args": ["-q", "-f", "-d"],
-        "threads": threads, "config": label,
+        "threads": threads_used, "config": "-%d" % level,
     }
 
 
-def xz_spec(exe, ver, level, threads, cpu_count):
-    label = "xz -%d T%d" % (level, 1 if threads == 1 else cpu_count)
+def xz_spec(exe, ver, level, threads_arg, cpu_count):
     return {
         "tool": "xz", "ver": ver, "exe": exe,
-        "args": ["-q", "-f", "-c", "-%d" % level, "-T%d" % threads],
+        "args": ["-q", "-f", "-c", "-%d" % level, "-T%d" % threads_arg],
         "dec_args": ["-q", "-f", "-d", "-c"],
-        "threads": threads, "config": label,
+        "threads": 1 if threads_arg == 1 else cpu_count,
+        "config": "-%d" % level,
     }
 
 
@@ -631,7 +707,16 @@ def parse_args(argv):
                     help="baseline = zstd + zstd-seekable + xz, no zgec")
     ap.add_argument("--zgec", default="build/zgec")
     ap.add_argument("--zstd", default="zstd")
-    ap.add_argument("--seekable", default="")
+    ap.add_argument("--seekable", default="",
+                    help="zstd seekable compressor (seekable_compression)")
+    ap.add_argument("--seekable-dec", default="",
+                    help="zstd seekable range decoder; defaults to the "
+                         "sibling of --seekable")
+    ap.add_argument("--seekable-mt", default="",
+                    help="parallel seekable compressor (parallel_compression)")
+    ap.add_argument("--seekable-version", default="",
+                    help="version recorded for the seekable rows; the examples "
+                         "have no --version of their own")
     ap.add_argument("--xz", default="xz")
     ap.add_argument("--reps", type=int, default=2,
                     help="repetitions per measurement; the best is reported")
@@ -676,10 +761,18 @@ def main(argv):
     }
     log("cpu: %s x%d on %s" % (env["cpu_model"], env["cpu_count"], env["runner"]))
 
+    args.zgec = exe_path(args.zgec)
+    args.seekable = exe_path(args.seekable)
+    args.seekable_dec = (exe_path(args.seekable_dec) if args.seekable_dec
+                         else default_seekable_dec(args.seekable))
+    args.seekable_mt = exe_path(args.seekable_mt)
     zgec_ver = tool_version(args.zgec, ("-V",)) or tool_version(args.zgec)
     zstd_ver = tool_version(args.zstd)
     xz_ver = tool_version(args.xz)
-    seek_ver = tool_version(args.seekable) if args.seekable else ""
+    # The seekable examples print no version of their own -- asking for one
+    # yields their "wrong arguments" usage text -- so the version is whatever
+    # the caller knows the examples were built from, or blank.
+    seek_ver = args.seekable_version
     log("versions: zgec=%r zstd=%r xz=%r seekable=%r"
         % (zgec_ver, zstd_ver, xz_ver, seek_ver))
 
@@ -722,17 +815,17 @@ def main(argv):
                             % (level, args.heavy_mb))
                         continue
                     bench.generic(corpus, src, zstd_spec(
-                        args.zstd, zstd_ver, level, 1, "zstd -%d T1" % level))
+                        args.zstd, zstd_ver, level, 1, 1))
                     bench.generic(corpus, src, zstd_spec(
-                        args.zstd, zstd_ver, level, 0,
-                        "zstd -%d T%d" % (level, env["cpu_count"])))
+                        args.zstd, zstd_ver, level, 0, env["cpu_count"]))
             elif want["zstd"]:
                 log("zstd not available, skipped")
             if want["seekable"]:
                 levels = [l for l in ZSTD_SEEKABLE_LEVELS
                           if not (heavy and l >= 9)]
-                measure_seekable(bench, corpus, src, args.seekable, seek_ver,
-                                 levels)
+                measure_seekable(bench, corpus, src, args.seekable,
+                                 args.seekable_dec, args.seekable_mt,
+                                 seek_ver, levels)
             if want["xz"] and have["xz"]:
                 for level in XZ_LEVELS:
                     for threads in (1, 0):

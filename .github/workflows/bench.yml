@@ -104,14 +104,16 @@ jobs:
           make -C "zstd-${ZSTD_VERSION#v}" -j"$(nproc)" zstd
           sudo install -m755 "zstd-${ZSTD_VERSION#v}/zstd" /usr/local/bin/zstd
           zstd --version
-          # The seekable format ships as an example program. Its option
-          # spelling has moved between releases, so the driver probes it, and a
-          # build failure here only means the rows record the tool as
-          # unavailable rather than failing the run.
+          # The seekable format ships as contrib examples, not a CLI mode:
+          # seekable_compression and seekable_decompression encode and decode,
+          # and parallel_compression is the multithreaded encoder that the
+          # examples' default target does not build. The driver knows their
+          # fixed interfaces; a build failure here only makes the rows record
+          # the tool as unavailable instead of failing the whole run.
           make -C "zstd-${ZSTD_VERSION#v}/contrib/seekable_format/examples" \
-               -j"$(nproc)" || echo "seekable example did not build; rows will say so"
-          find "zstd-${ZSTD_VERSION#v}/contrib/seekable_format" \
-               -type f -perm -u+x -name '*seekable*' -print || true
+               -j"$(nproc)" seekable_compression seekable_decompression \
+               parallel_compression \
+               || echo "seekable examples did not build; rows will say so"
           curl -sSL "https://github.com/tukaani-project/xz/releases/download/${XZ_VERSION}/xz-${XZ_VERSION#v}.tar.gz" -o xz.tgz
           tar xf xz.tgz
           (cd "xz-${XZ_VERSION#v}" && ./configure --quiet --disable-doc --disable-nls && make -j"$(nproc)")
@@ -141,13 +143,24 @@ jobs:
           restore-keys: |
             baselines-${{ steps.toolver.outputs.hash }}-${{ hashFiles('tools/bench/corpora.json', 'tools/bench/run_bench.py') }}-
 
-      - name: Find the seekable example binary
+      - name: Find the seekable example binaries
         id: seek
         run: |
-          exe=$(find "zstd-${ZSTD_VERSION#v}/contrib/seekable_format" \
-                     -type f -perm -u+x -name '*seekable*' | head -1 || true)
-          echo "exe=$exe" >> "$GITHUB_OUTPUT"
-          echo "using '$exe'"
+          dir="zstd-${ZSTD_VERSION#v}/contrib/seekable_format/examples"
+          so=$(find "$dir" -maxdepth 1 -type f -perm -u+x \
+                    -name 'seekable_compression' | head -1 || true)
+          dec=$(find "$dir" -maxdepth 1 -type f -perm -u+x \
+                    -name 'seekable_decompression' | head -1 || true)
+          mt=$(find "$dir" -maxdepth 1 -type f -perm -u+x \
+                    -name 'parallel_compression' | head -1 || true)
+          {
+            echo "exe=$so"
+            echo "dec=$dec"
+            echo "mt=$mt"
+          } >> "$GITHUB_OUTPUT"
+          echo "compressor:   ${so:-none}"
+          echo "decompressor: ${dec:-none}"
+          echo "parallel:     ${mt:-none}"
 
       - name: Baseline measurements (cached when possible)
         run: |
@@ -165,6 +178,9 @@ jobs:
             --out "baselines/${corpus}.csv" \
             --zstd "$(command -v zstd)" \
             --seekable "${{ steps.seek.outputs.exe }}" \
+            --seekable-dec "${{ steps.seek.outputs.dec }}" \
+            --seekable-mt "${{ steps.seek.outputs.mt }}" \
+            --seekable-version "${ZSTD_VERSION}" \
             --xz "$(command -v xz)" \
             --reps "${{ github.event.inputs.reps || '2' }}" \
             --max-input-mb "${{ github.event.inputs.max_input_mb || '0' }}"

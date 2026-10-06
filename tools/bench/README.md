@@ -31,7 +31,11 @@ the ratios stop being comparable to a full-corpus run), `--heavy-mb N` is the
 size above which the slowest baseline levels are skipped, `--all-levels`
 overrides that, `--baseline-cache DIR` reuses `<corpus>.csv` baseline rows
 instead of re-measuring them, and `--reps N` sets how many times each
-measurement runs (the best is reported).
+measurement runs (the best is reported). `--seekable`, `--seekable-dec` and
+`--seekable-mt` point at the zstd contrib seekable examples, and
+`--seekable-version` is recorded in those rows because the examples print no
+version of their own; without the programs the seekable rows explain that they
+were not supplied.
 
 ## What is measured
 
@@ -42,11 +46,16 @@ measurement runs (the best is reported).
   reported; a mismatch is recorded in the row rather than thrown away.
 * **zstd** — levels 1, 3, 4, 6, 9, 12 and 19, one thread and all threads.
   Level 19 is skipped above `--heavy-mb` unless `--all-levels` is given.
-* **zstd-seekable** — the seekable format's example program, at levels 1, 3, 6
-  and 9. Its option spelling has moved between zstd releases, so the driver
-  probes candidate invocations once on a 1 MiB sample, verifies the one it
-  picks actually produces output and round-trips it, and records the spelling
-  in the row's notes. If none works the row says so instead of failing the run.
+* **zstd-seekable** — the seekable format's contrib examples, which are not a
+  zstd CLI mode. `seekable_compression` is measured at levels 1, 3, 6 and 9 on
+  one thread (the example is serial), and `parallel_compression` once at all
+  threads (its level is fixed at 5 in its source). Both are given a 1 MiB frame
+  size and derive their output name from the input path, so the input is
+  hard-linked into the driver's scratch directory and the `FILE.zst` that
+  appears beside it is what gets measured. Decoding uses
+  `seekable_decompression`, a range reader that writes to stdout; the measured
+  range is the whole file, so the capture is also the round trip. A program that
+  is missing makes its rows say so instead of failing the run.
 * **xz** — level 2, one thread and all threads.
 
 ## Corpora
@@ -56,7 +65,11 @@ Silesia corpus, each from its project's own release host, each pinned by
 version. A `tree` corpus is re-tarred without compression into one file with
 sorted names and zeroed ownership and timestamps, so the measured bytes are
 identical on every machine and a cached baseline stays valid. Silesia
-contributes one input per file, as `<corpus>/<file>`.
+contributes one input per file, as `<corpus>/<file>`. Clang comes from the LLVM
+release: those releases publish a single source tarball and no standalone clang
+asset, so the manifest names `.../clang` as the payload. A payload below the
+archive root is unpacked on its own, so LLVM and Clang share one download
+without the whole tree being written out twice.
 
 ## The CSV
 
@@ -114,3 +127,8 @@ runner.
 * A GitHub-hosted runner is a shared VM of a few cores. Absolute MB/s there is
   not the reference platform's; the comparisons and the calibration are what
   transfer.
+* On Windows the zstd seekable example writes its output through a `stdout`
+  that the C runtime opens in text mode, so the decoded bytes gain a CR before
+  every LF and the row reads `roundtrip-MISMATCH` even though the frame is
+  correct. The Linux runners the workflow uses are unaffected; on a Windows
+  developer machine only an LF-free input round-trips exactly.
