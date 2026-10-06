@@ -202,6 +202,26 @@ static inline unsigned zgec_highbit64(uint64_t v) {
     return n + zgec_highbit32((uint32_t)v);
 }
 
+/* ---- fast approximate log2 (encoder heuristics only) ----
+ * Integer part from the leading-zero count plus a linear fraction from
+ * the next 8 bits. The linear fraction overestimates log2(1+f)
+ * slightly but consistently, so differences of two estimates (all the
+ * encoder's cost comparisons) stay faithful. No libm call. */
+static inline double zgec_fast_log2_u32(uint32_t x) {
+    unsigned e, shift;
+    if (x < 2u) return 0.0;
+    e = 31u - (unsigned)__builtin_clz(x);
+    shift = (e >= 8u) ? (e - 8u) : 0u;
+    return (double)e + (double)((x >> shift) & 0xFFu) * (1.0 / 256.0);
+}
+static inline double zgec_fast_log2_u64(uint64_t x) {
+    unsigned e, shift;
+    if (x < 2u) return 0.0;
+    e = 63u - (unsigned)__builtin_clzll(x);
+    shift = (e >= 8u) ? (e - 8u) : 0u;
+    return (double)e + (double)((x >> shift) & 0xFFu) * (1.0 / 256.0);
+}
+
 /* ---- varint (LEB128, max 5 bytes for 32-bit values) ---- */
 /* Returns bytes written, or 0 on error (value too large for 5 bytes is impossible for u32). */
 static inline size_t zgec_varint_encode(uint8_t *p, uint32_t v) {

@@ -55,7 +55,7 @@ find_package(Threads REQUIRED)
 
 add_library(zgec_core STATIC ${ZGEC_SOURCES})
 target_include_directories(zgec_core PUBLIC include)
-target_link_libraries(zgec_core PUBLIC Threads::Threads)
+target_link_libraries(zgec_core PUBLIC Threads::Threads m)
 
 # Command-line tool.
 add_executable(zgec src/cli.c)

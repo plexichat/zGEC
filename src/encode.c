@@ -453,20 +453,11 @@ static void zgec_encode_normalize(int16_t *counts, const uint32_t *hist,
  * from the top bit plus a linear fraction from the next 8 bits. The
  * linear fraction overestimates log2(1+f) slightly but consistently,
  * so candidate comparisons are unaffected. */
-static double zgec_enc_log2_u64(uint64_t x)
+static inline double zgec_enc_log2_u64(uint64_t x)
 {
-    if (x < 2u) return 0.0;
-    {
-        unsigned e = zgec_highbit64(x);
-        unsigned shift = (e >= 8u) ? (e - 8u) : 0u;
-        uint64_t top;
-        if (e >= 8u) {
-            top = (x >> shift) & 0xFFu;
-        } else {
-            top = (x << (8u - e)) & 0xFFu;
-        }
-        return (double)e + (double)top / 256.0;
-    }
+    /* Same estimate as zgec_fast_log2_u64, but via the shared helper so
+     * the encoder uses one branch-free clz-based form everywhere. */
+    return zgec_fast_log2_u64(x);
 }
 
 /* Shannon entropy estimate in bits of a histogram. */
@@ -866,6 +857,13 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
      * stack local: the block pass runs one block per worker (11.8). */
     static _Thread_local uint32_t
         work[ZGEC_ENC_NCLASS][ZGEC_NSYM_LIT];
+    /* Cached merge deltas dlt[a][b] for a < b. A merge changes only the
+     * deltas that involve the surviving cluster, so one row is
+     * refreshed per merge instead of every pair. The greedy choice and
+     * its tie-breaking scan order are unchanged, so the result is
+     * identical to recomputing all pairs each time. */
+    static _Thread_local double dlt[ZGEC_ENC_NCLASS][ZGEC_ENC_NCLASS];
+    uint32_t merged[ZGEC_NSYM_LIT];
     uint8_t members[ZGEC_ENC_NCLASS][ZGEC_ENC_NCLASS];
     uint8_t nmem[ZGEC_ENC_NCLASS];
     int alive[ZGEC_ENC_NCLASS];
@@ -891,6 +889,19 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
     *bits_k2 = -1.0;
     *bits_k1 = -1.0;
 
+    /* Seed the delta cache once (all pairs of singletons). */
+    for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
+        int bb;
+        for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+                merged[(size_t)s] =
+                    work[(size_t)c][(size_t)s] + work[(size_t)bb][(size_t)s];
+            }
+            dlt[(size_t)c][(size_t)bb] =
+                zgec_class_entropy(merged) - cent[(size_t)c] - cent[(size_t)bb];
+        }
+    }
+
     while (ncl > 1) {
         int best_a = -1;
         int best_b = -1;
@@ -903,19 +914,12 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         if (ncl == 2) { *bits_k2 = total; zgec_cluster_snapshot(members, nmem, alive, assign_out[1]); }
 
         for (a = 0; a < ZGEC_ENC_NCLASS; a++) {
-            uint32_t merged[ZGEC_NSYM_LIT];
             int bb;
             if (!alive[a]) continue;
             for (bb = a + 1; bb < ZGEC_ENC_NCLASS; bb++) {
-                double hm;
                 double delta;
                 if (!alive[bb]) continue;
-                for (s = 0; s < ZGEC_NSYM_LIT; s++) {
-                    merged[(size_t)s] =
-                        work[(size_t)a][(size_t)s] + work[(size_t)bb][(size_t)s];
-                }
-                hm = zgec_class_entropy(merged);
-                delta = hm - cent[(size_t)a] - cent[(size_t)bb];
+                delta = dlt[(size_t)a][(size_t)bb];
                 if (first || delta < best_delta) {
                     best_delta = delta;
                     best_a = a;
@@ -942,6 +946,20 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         alive[best_b] = 0;
         total += best_delta;
         ncl--;
+        /* Refresh only the deltas that involve the survivor. */
+        for (a = 0; a < ZGEC_ENC_NCLASS; a++) {
+            int lo;
+            int hi;
+            if (a == best_a || !alive[a]) continue;
+            lo = (a < best_a) ? a : best_a;
+            hi = (a < best_a) ? best_a : a;
+            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+                merged[(size_t)s] =
+                    work[(size_t)lo][(size_t)s] + work[(size_t)hi][(size_t)s];
+            }
+            dlt[(size_t)lo][(size_t)hi] =
+                zgec_class_entropy(merged) - cent[(size_t)lo] - cent[(size_t)hi];
+        }
     }
     *bits_k1 = total;
     zgec_cluster_snapshot(members, nmem, alive, assign_out[0]);
@@ -988,16 +1006,28 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
     }
     zgec_enc_runstart(runstart, n_lit, ll, n_seq);
 
-    for (mi = 0; mi < 3; mi++) {
-        uint32_t *h = hist3 + (size_t)mi * (size_t)64 * 256u;
+    /* One pass builds all three class histograms: LSB6 and MSB6 are
+     * bit operations, TEXT is the Annex C table. Every class is < 64
+     * by construction, so no class check is needed. */
+    {
+        uint32_t *h0 = hist3;
+        uint32_t *h1 = hist3 + (size_t)64 * 256u;
+        uint32_t *h2 = hist3 + (size_t)2 * (size_t)64 * 256u;
         size_t j;
-        memset(h, 0, hist_bytes);
+        memset(hist3, 0, 3u * hist_bytes);
         for (j = 1; j < n_lit; j++) {
-            unsigned cls;
+            unsigned c0, c1, c2;
+            uint32_t nxt;
+            uint8_t prev;
             if (runstart[j]) continue; /* run starts use their own table */
-            cls = zgec_classify(modes[(size_t)mi], lit[j - 1]);
-            if (cls >= 64u) continue;
-            h[(size_t)cls * 256u + (uint32_t)lit[j]]++;
+            prev = lit[j - 1];
+            nxt = (uint32_t)lit[j];
+            c0 = (unsigned)(prev & 63u);
+            c1 = (unsigned)(prev >> 2u);
+            c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
+            h0[(size_t)c0 * 256u + nxt]++;
+            h1[(size_t)c1 * 256u + nxt]++;
+            h2[(size_t)c2 * 256u + nxt]++;
         }
     }
 

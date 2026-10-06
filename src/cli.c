@@ -57,7 +57,8 @@ static void cli_usage(FILE *f, const char *argv0)
         "  -l, --level N       1 (fastest) .. 9 (best ratio); default 3\n"
         "  -T, --threads N     worker threads (0 = one per core); default 0\n"
         "      --tier T        match finder tier: fast, main, high\n"
-        "      --block-log2 N  block size log2, 16..26 (default 21)\n"
+        "      --block-log2 N  block size log2, 16..26 (default: the level\n"
+        "                      preset, 23 or 24)\n"
         "      --lambda X      speed/ratio dial (11.7)\n"
         "      --contexts      learned literal contexts (11.6)\n"
         "      --sub-lit       sub-literal segments (9.6)\n"
@@ -99,18 +100,24 @@ typedef struct {
     int       dicts;
     int       filter;
     int       ck;
+    int       block_log2;
 } cli_level;
 
+/* The window is the strongest ratio/speed lever, so every level uses the
+ * largest block the P24 match-finder profile allows. Levels that keep the
+ * literal-reference chain or epoch/external dictionaries need headroom for
+ * the dictionary and LITREF prefix in the same 16 MiB virtual buffer, so
+ * they use 8 MiB blocks (23); the rest use the full 16 MiB (24). */
 static const cli_level cli_levels[9] = {
-    /* 1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0 },
-    /* 2 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0 },
-    /* 3 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0 },
-    /* 4 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0 },
-    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 0, 0, 0, 0, 0 },
-    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 0, 1, 0, 0, 0 },
-    /* 7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 1, 0, 0, 0 },
-    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 0 },
-    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1 }
+    /* 1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 24 },
+    /* 2 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 24 },
+    /* 3 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 24 },
+    /* 4 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 24 },
+    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 0, 0, 0, 0, 0, 24 },
+    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 0, 1, 0, 0, 0, 23 },
+    /* 7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 1, 0, 0, 0, 23 },
+    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 0, 23 },
+    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)
@@ -119,6 +126,7 @@ static void cli_apply_level(zgec_params *p, int level)
     if (level < 1) level = 1;
     if (level > 9) level = 9;
     l = &cli_levels[level - 1];
+    p->block_log2 = l->block_log2;
     p->tier = l->tier;
     p->lambda = l->lambda;
     p->use_contexts = l->ctx;

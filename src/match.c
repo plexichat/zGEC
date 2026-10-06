@@ -50,6 +50,9 @@
 #include "zgec_match.h"
 
 #include <string.h>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 
 /* Entry layout: 24-bit position (stored as pos + 1)
  * and an 8-bit tag from the spare hash bits (P24). */
@@ -144,6 +147,7 @@ struct zgec_matcher {
     uint32_t       nlanes;
     uint32_t       long_buckets;  /* long buckets (one entry each) */
     uint32_t      *short_tab;   /* nbuckets * nlanes entries */
+    uint8_t       *short_head;  /* per-bucket next write lane (ring) */
     uint32_t      *long_tab;    /* long_buckets entries */
     int            is_binary;   /* short hash uses 4 bytes */
     size_t         vb_capacity; /* maximum referenceable offset */
@@ -240,20 +244,16 @@ static void mf_prefetch_bucket(const void *line)
     __builtin_prefetch(line, 0, 3);
 }
 
-/* Insert pos into the short bucket, shifting the
- * existing entries down one lane with a permute so
- * buckets stay ordered newest first (section 11.2).
- * A bucket is loaded once per visited position and
- * the line is reused for lookup and insert. */
+/* Insert pos into the short bucket. The lanes are a ring: the next
+ * write slot is short_head[bucket], so an insert is two stores rather
+ * than an nlanes-wide shift. Lookup walks the ring newest first. */
 static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
     uint32_t *b = &m->short_tab[(size_t)bucket * (size_t)m->nlanes];
-    uint32_t i;
+    uint32_t h = (uint32_t)m->short_head[bucket];
     mf_prefetch_bucket((const void *)b);
-    for (i = m->nlanes; i > 1u; i--) {
-        b[i - 1u] = b[i - 2u];
-    }
-    b[0] = entry;
+    b[h] = entry;
+    m->short_head[bucket] = (uint8_t)((h + 1u) & (m->nlanes - 1u));
 }
 
 /* Insert pos into the long table: one entry per
@@ -323,6 +323,19 @@ static uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t 
             return first;
         }
         len = 8u;
+#if defined(__AVX2__)
+        /* Extend beyond the first 8 bytes 32 at a time; a 32-byte
+         * movemask finds the first differing byte directly. */
+        while (len + 32u <= cap) {
+            __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(src + len));
+            __m256i b32 = _mm256_loadu_si256((const __m256i *)(const void *)(dst + len));
+            unsigned m32 = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b32));
+            if (m32 != 0xFFFFFFFFu) {
+                return len + (uint32_t)__builtin_ctz(~m32);
+            }
+            len += 32u;
+        }
+#else
         /* Extend beyond 8 bytes with wide compares in
          * a loop that normally runs once. */
         while (len + 32u <= cap) {
@@ -339,6 +352,7 @@ static uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t 
             }
             len += 32u;
         }
+#endif
         while (len + 8u <= cap) {
             if (zgec_rd64(src + (size_t)len) != zgec_rd64(dst + (size_t)len)) {
                 break;
@@ -350,6 +364,36 @@ static uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t 
         len++;
     }
     return len;
+}
+
+/* Hit mask of the short bucket: bit `lane` is set when entry `lane`
+ * carries the wanted 8-bit tag and is not the empty sentinel. AVX2
+ * compares eight lanes at once (fast/main/high use 4/8/16); the
+ * remaining lanes stay scalar. */
+static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes)
+{
+    uint32_t mask = 0u;
+    uint32_t lane = 0u;
+#if defined(__AVX2__)
+    __m256i tagv = _mm256_set1_epi32((int)(tag << ZGEC_MF_TAG_SHIFT));
+    __m256i tagmask = _mm256_set1_epi32((int)(ZGEC_MF_TAG_MASK << ZGEC_MF_TAG_SHIFT));
+    __m256i posmask = _mm256_set1_epi32((int)ZGEC_MF_POS_MASK);
+    __m256i zero = _mm256_setzero_si256();
+    for (; lane + 8u <= nlanes; lane += 8u) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(b + lane));
+        __m256i eq = _mm256_cmpeq_epi32(_mm256_and_si256(v, tagmask), tagv);
+        __m256i pos = _mm256_and_si256(v, posmask);
+        __m256i nz = _mm256_cmpeq_epi32(pos, zero);
+        __m256i hit = _mm256_andnot_si256(nz, eq);
+        mask |= (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(hit)) << lane;
+    }
+#endif
+    for (; lane < nlanes; lane++) {
+        uint32_t e = b[lane];
+        uint32_t etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
+        mask |= (uint32_t)((e != 0u && etag == tag) ? 1u : 0u) << lane;
+    }
+    return mask;
 }
 
 /* Record a candidate if it beats the current best:
@@ -384,6 +428,7 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     m->vb_size = 0;
     m->is_binary = 0;
     m->short_tab = NULL;
+    m->short_head = NULL;
     m->long_tab = NULL;
     switch (tier) {
     case ZGEC_TIER_FAST:
@@ -418,7 +463,15 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
         zgec_free(m);
         return NULL;
     }
+    m->short_head = (uint8_t *)zgec_alloc(m->nbuckets, 64);
+    if (!m->short_head) {
+        zgec_free(m->long_tab);
+        zgec_free(m->short_tab);
+        zgec_free(m);
+        return NULL;
+    }
     memset(m->short_tab, 0, short_n * sizeof(uint32_t));
+    memset(m->short_head, 0, m->nbuckets);
     memset(m->long_tab, 0, long_n * sizeof(uint32_t));
     return m;
 }
@@ -429,6 +482,7 @@ void zgec_matcher_destroy(zgec_matcher *m)
         return;
     }
     zgec_free(m->short_tab);
+    zgec_free(m->short_head);
     zgec_free(m->long_tab);
     zgec_free(m);
 }
@@ -450,6 +504,9 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
     long_n = (size_t)m->long_buckets;
     if (m->short_tab) {
         memset(m->short_tab, 0, short_n * sizeof(uint32_t));
+    }
+    if (m->short_head) {
+        memset(m->short_head, 0, m->nbuckets);
     }
     if (m->long_tab) {
         memset(m->long_tab, 0, long_n * sizeof(uint32_t));
@@ -585,33 +642,30 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             uint32_t bucket = h & (m->nbuckets - 1u);
             const uint32_t *b = &m->short_tab[(size_t)bucket * (size_t)m->nlanes];
             uint32_t tag = (h >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
-            uint32_t mask = 0u;
-            uint32_t lane;
+            uint32_t mask;
+            uint32_t head;
             uint32_t nmatch;
             uint32_t want;
             uint32_t nhit;
-            unsigned rest;
             uint32_t k;
             mf_prefetch_bucket((const void *)b);
-            for (lane = 0; lane < m->nlanes; lane++) {
-                uint32_t e = b[lane];
-                uint32_t etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
-                unsigned hit = (e != 0u && etag == tag) ? 1u : 0u;
-                mask |= (uint32_t)(hit << lane);
-            }
+            mask = mf_bucket_hits(b, tag, m->nlanes);
             nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
             want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
                                                : ZGEC_MF_PROBE_DEPTH;
             nhit = (nmatch < want) ? nmatch : want;
-            rest = (unsigned)mask;
-            for (k = 0; k < nhit; k++) {
-                unsigned idx = (unsigned)__builtin_ctz(rest);
+            head = (uint32_t)m->short_head[bucket];
+            /* The live entries walk backwards from the newest lane: the
+             * ring head points one past the most recent write. */
+            for (k = 0; k < m->nlanes && nhit > 0; k++) {
+                uint32_t lane = (head + m->nlanes - 1u - k) & (m->nlanes - 1u);
                 uint32_t entry;
                 uint32_t pos;
                 uint32_t d;
                 uint32_t len;
-                rest &= rest - 1u; /* clear lowest set bit */
-                entry = b[(size_t)idx];
+                if (!(mask & (1u << lane))) continue;
+                nhit--;
+                entry = b[lane];
                 pos = mf_pos(entry);
                 if ((size_t)pos >= ip) {
                     continue;
