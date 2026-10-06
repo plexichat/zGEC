@@ -36,6 +36,19 @@ dbg.err
 dbg*.out
 dbg*.err
 
+# Benchmark run output (tools/bench/*)
+.bench-cache/
+baselines/
+results.csv
+results_*.csv
+joined_*.csv
+env_*.txt
+report/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
 # Editor / OS noise
 .vs/
 .vscode/

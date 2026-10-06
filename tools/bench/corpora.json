@@ -1,0 +1,82 @@
+{
+  "_comment": [
+    "Benchmark corpora. Each entry names an archive to download and the payload inside it",
+    "that is fed to the compressors.",
+    "",
+    "kind=tree: the payload is a directory in the archive. The driver re-tars it WITHOUT",
+    "compression into one input file, with sorted names and zeroed timestamps so the input",
+    "is byte-identical on every run and machine. This is the unit measured.",
+    "",
+    "kind=files: the payload is a set of loose files. Each file is its own corpus id",
+    "(\"<id>/<name>\"), which is how the Silesia corpus is normally reported.",
+    "",
+    "Versions are pinned so a cached baseline stays comparable; bump the version and the",
+    "cache key changes with it. Every URL is the project's own release host:",
+    "  Linux      cdn.kernel.org/pub/linux/kernel/v7.x/  (7.0 released 2026-04-12)",
+    "  LLVM/Clang github.com/llvm/llvm-project/releases  (llvmorg-23.1.2, 2026-09-22)",
+    "  CPython    python.org/ftp/python/                 (3.14.8, 2026-09-30)",
+    "  Redis      download.redis.io/releases/            (8.10.2, 2026-07-29)",
+    "  Silesia    mattmahoney.net/dc/silesia.html        (the surviving mirror; the",
+    "             original sun.aei.polsl.pl host is gone)"
+  ],
+  "corpora": [
+    {
+      "id": "linux",
+      "title": "Linux kernel 7.1 sources",
+      "url": "https://cdn.kernel.org/pub/linux/kernel/v7.x/linux-7.1.tar.xz",
+      "archive": "tar.xz",
+      "kind": "tree",
+      "payload": "linux-7.1",
+      "license": "GPL-2.0-only"
+    },
+    {
+      "id": "llvm",
+      "title": "LLVM 23.1.2 sources",
+      "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/llvm-project-23.1.2.src.tar.xz",
+      "archive": "tar.xz",
+      "kind": "tree",
+      "payload": "llvm-project-23.1.2.src",
+      "license": "Apache-2.0 WITH LLVM-exception"
+    },
+    {
+      "id": "clang",
+      "title": "Clang 23.1.2 sources",
+      "url": "https://github.com/llvm/llvm-project/releases/download/llvmorg-23.1.2/cfe-23.1.2.src.tar.xz",
+      "archive": "tar.xz",
+      "kind": "tree",
+      "payload": "cfe-23.1.2.src",
+      "license": "Apache-2.0 WITH LLVM-exception"
+    },
+    {
+      "id": "python",
+      "title": "CPython 3.14.8 sources",
+      "url": "https://www.python.org/ftp/python/3.14.8/Python-3.14.8.tgz",
+      "archive": "tar.gz",
+      "kind": "tree",
+      "payload": "Python-3.14.8",
+      "license": "PSF-2.0"
+    },
+    {
+      "id": "redis",
+      "title": "Redis 8.10.2 sources",
+      "url": "https://download.redis.io/releases/redis-8.10.2.tar.gz",
+      "archive": "tar.gz",
+      "kind": "tree",
+      "payload": "redis-8.10.2",
+      "license": "AGPL-3.0"
+    },
+    {
+      "id": "silesia",
+      "title": "Silesia compression corpus",
+      "url": "https://mattmahoney.net/dc/silesia.zip",
+      "archive": "zip",
+      "kind": "files",
+      "payload": ".",
+      "files": [
+        "dickens", "mozilla", "mr", "nci", "ooffice", "osdb",
+        "reymont", "samba", "sao", "webster", "x-ray", "xml"
+      ],
+      "license": "see data-compression.info/Corpora/SilesiaCorpus"
+    }
+  ]
+}

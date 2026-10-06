@@ -1,0 +1,275 @@
+# Compression benchmark: zGEC against zstd, the zstd seekable format and xz.
+#
+# Shape of the run
+#   baselines  zstd / zstd-seekable / xz, once per corpus -- cached, because a
+#              pinned tool on a pinned corpus produces the same bytes every
+#              time, so the numbers cannot change.
+#   zgec       every level 1..9 plus one all-features configuration, encode and
+#              decode, one thread and all threads, round-tripped against the
+#              input before its numbers are reported.
+#   report     merges the per-corpus CSVs, computes the Pareto frontiers and
+#              publishes CSV, HTML, SVG, PNG and JSON as a downloadable
+#              artifact.
+#
+# The baseline tools are built from pinned release tags rather than taken from
+# the image, so a cached baseline stays valid: the cache key contains the
+# manifest, the driver and the measured tool versions. Bump ZSTD_VERSION or
+# XZ_VERSION and the key changes with it.
+#
+# Reproducibility notes that end up in the report: every row carries the CPU
+# model, the logical CPU count, the load average at that moment, the runner
+# name and a SHA-256 calibration in MiB/s. The calibration is the contention
+# proxy -- a figure well below another run on the same hardware means the
+# machine was busy. The matrix runs with max-parallel 1 so two measurements
+# never share a runner.
+
+name: benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      corpora:
+        description: "comma separated corpus ids, empty = all"
+        required: false
+        default: ""
+      reps:
+        description: "repetitions per measurement (the best is reported)"
+        required: false
+        default: "2"
+      max_input_mb:
+        description: "truncate every input to this many MiB (0 = full corpus)"
+        required: false
+        default: "0"
+      force_baseline:
+        description: "re-measure zstd/xz even if a cached baseline exists"
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # Weekly, so the published report tracks the encoder as it changes.
+    - cron: "17 4 * * 1"
+
+env:
+  ZSTD_VERSION: v1.5.7
+  XZ_VERSION: v5.8.3
+
+permissions:
+  contents: read
+
+jobs:
+  corpora:
+    name: corpus list
+    runs-on: ubuntu-latest
+    outputs:
+      ids: ${{ steps.list.outputs.ids }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: list
+        run: |
+          # An empty --only means every corpus in the manifest.
+          echo "ids=$(python3 tools/bench/run_bench.py --list-json \
+                --only "${{ github.event.inputs.corpora }}")" >> "$GITHUB_OUTPUT"
+          cat "$GITHUB_OUTPUT"
+
+  bench:
+    name: ${{ matrix.corpus }}
+    needs: corpora
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        corpus: ${{ fromJSON(needs.corpora.outputs.ids) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android \
+                      /opt/ghc /opt/hostedtoolcache/CodeQL || true
+          df -h /
+
+      - name: Build zGEC
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+          ./build/zgec -V
+
+      - name: Build the pinned baseline tools
+        run: |
+          set -euo pipefail
+          nproc
+          curl -sSL "https://github.com/facebook/zstd/releases/download/${ZSTD_VERSION}/zstd-${ZSTD_VERSION#v}.tar.gz" -o zstd.tgz
+          tar xf zstd.tgz
+          make -C "zstd-${ZSTD_VERSION#v}" -j"$(nproc)" zstd
+          sudo install -m755 "zstd-${ZSTD_VERSION#v}/zstd" /usr/local/bin/zstd
+          zstd --version
+          # The seekable format ships as an example program. Its option
+          # spelling has moved between releases, so the driver probes it, and a
+          # build failure here only means the rows record the tool as
+          # unavailable rather than failing the run.
+          make -C "zstd-${ZSTD_VERSION#v}/contrib/seekable_format/examples" \
+               -j"$(nproc)" || echo "seekable example did not build; rows will say so"
+          find "zstd-${ZSTD_VERSION#v}/contrib/seekable_format" \
+               -type f -perm -u+x -name '*seekable*' -print || true
+          curl -sSL "https://github.com/tukaani-project/xz/releases/download/${XZ_VERSION}/xz-${XZ_VERSION#v}.tar.gz" -o xz.tgz
+          tar xf xz.tgz
+          (cd "xz-${XZ_VERSION#v}" && ./configure --quiet --disable-doc --disable-nls && make -j"$(nproc)")
+          sudo install -m755 "xz-${XZ_VERSION#v}/src/xz/xz" /usr/local/bin/xz
+          xz --version
+
+      - name: Cache corpora downloads and materialised inputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            .bench-cache/downloads
+            .bench-cache/inputs
+          key: corpora-${{ hashFiles('tools/bench/corpora.json') }}
+
+      - name: Tool versions, for the baseline cache key
+        id: toolver
+        run: |
+          { zstd --version; xz --version; } > /tmp/toolver.txt
+          echo "hash=$(sha256sum /tmp/toolver.txt | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          cat /tmp/toolver.txt
+
+      - name: Restore cached baselines
+        uses: actions/cache/restore@v4
+        with:
+          path: baselines
+          key: baselines-${{ steps.toolver.outputs.hash }}-${{ hashFiles('tools/bench/corpora.json', 'tools/bench/run_bench.py') }}-${{ matrix.corpus }}
+          restore-keys: |
+            baselines-${{ steps.toolver.outputs.hash }}-${{ hashFiles('tools/bench/corpora.json', 'tools/bench/run_bench.py') }}-
+
+      - name: Find the seekable example binary
+        id: seek
+        run: |
+          exe=$(find "zstd-${ZSTD_VERSION#v}/contrib/seekable_format" \
+                     -type f -perm -u+x -name '*seekable*' | head -1 || true)
+          echo "exe=$exe" >> "$GITHUB_OUTPUT"
+          echo "using '$exe'"
+
+      - name: Baseline measurements (cached when possible)
+        run: |
+          set -euo pipefail
+          mkdir -p baselines
+          corpus="${{ matrix.corpus }}"
+          if [ -s "baselines/${corpus}.csv" ] && \
+             [ "${{ github.event.inputs.force_baseline }}" != "true" ]; then
+            echo "using the cached baseline: $(( $(wc -l < "baselines/${corpus}.csv") - 1 )) rows"
+            exit 0
+          fi
+          python3 tools/bench/run_bench.py \
+            --tool baseline \
+            --only "${corpus}" \
+            --out "baselines/${corpus}.csv" \
+            --zstd "$(command -v zstd)" \
+            --seekable "${{ steps.seek.outputs.exe }}" \
+            --xz "$(command -v xz)" \
+            --reps "${{ github.event.inputs.reps || '2' }}" \
+            --max-input-mb "${{ github.event.inputs.max_input_mb || '0' }}"
+
+      - name: zGEC measurements
+        run: |
+          set -euo pipefail
+          python3 tools/bench/run_bench.py \
+            --tool zgec \
+            --only "${{ matrix.corpus }}" \
+            --out "results_${{ matrix.corpus }}.csv" \
+            --zgec build/zgec \
+            --reps "${{ github.event.inputs.reps || '2' }}" \
+            --max-input-mb "${{ github.event.inputs.max_input_mb || '0' }}"
+
+      - name: Merge baseline and zGEC rows for this corpus
+        run: |
+          set -euo pipefail
+          joined="joined_${{ matrix.corpus }}.csv"
+          head -1 "results_${{ matrix.corpus }}.csv" > "$joined"
+          base="baselines/${{ matrix.corpus }}.csv"
+          if [ -f "$base" ]; then tail -n +2 "$base" >> "$joined"; fi
+          tail -n +2 "results_${{ matrix.corpus }}.csv" >> "$joined"
+          echo "rows: $(( $(wc -l < "$joined") - 1 ))"
+
+      - name: Environment and contention record
+        run: |
+          {
+            echo "corpus=${{ matrix.corpus }}"
+            echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "cpu_model=$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2- | sed 's/^ //')"
+            echo "cpu_count=$(nproc)"
+            echo "mem_total_mb=$(free -m | awk '/Mem:/ {print $2}')"
+            echo "loadavg=$(cat /proc/loadavg)"
+            echo "runner=${RUNNER_NAME:-?}"
+            zstd --version
+            xz --version
+            ./build/zgec -V
+            df -h / | tail -1
+          } > "env_${{ matrix.corpus }}.txt"
+          cat "env_${{ matrix.corpus }}.txt"
+
+      - name: Upload this corpus
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.corpus }}
+          path: |
+            joined_${{ matrix.corpus }}.csv
+            env_${{ matrix.corpus }}.txt
+          if-no-files-found: error
+
+      - name: Save cached baselines
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: baselines
+          key: baselines-${{ steps.toolver.outputs.hash }}-${{ hashFiles('tools/bench/corpora.json', 'tools/bench/run_bench.py') }}-${{ matrix.corpus }}-${{ github.run_id }}
+
+  report:
+    name: report
+    needs: bench
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Collect every corpus
+        uses: actions/download-artifact@v4
+        with:
+          pattern: bench-*
+          path: artifacts
+
+      - name: Merge into one CSV
+        run: |
+          set -euo pipefail
+          first=$(find artifacts -name 'joined_*.csv' | sort | head -1)
+          if [ -z "$first" ]; then
+            echo "no corpus produced results" >&2
+            exit 1
+          fi
+          head -1 "$first" > results.csv
+          for f in $(find artifacts -name 'joined_*.csv' | sort); do
+            tail -n +2 "$f" >> results.csv
+          done
+          echo "rows: $(( $(wc -l < results.csv) - 1 ))"
+          cat artifacts/*/env_*.txt > environment.txt || true
+          head -40 environment.txt
+
+      - name: Build the report
+        run: |
+          pip install --quiet matplotlib || echo "matplotlib unavailable, SVG only"
+          python3 tools/bench/report.py --csv results.csv --out report \
+            --title "zGEC vs zstd, zstd-seekable and xz"
+          ls -la report
+
+      - name: Job summary
+        run: cat report/summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the report
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-report
+          path: |
+            report/
+            results.csv
+            environment.txt
+          retention-days: 90
+          if-no-files-found: error

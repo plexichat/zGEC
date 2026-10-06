@@ -1,0 +1,122 @@
+# Build, test and fuzz.
+#
+# The warning flags live in CMakeLists.txt and end in -Werror, so a warning is
+# a build failure: there is no separate "check for warnings" step to drift out
+# of sync with what the code is compiled with. -pedantic is part of that set.
+#
+# The fuzzer is built twice on purpose. The plain CMake target (`zgec_fuzz`) is
+# a deterministic random fuzzer and is part of the -Werror build above. The
+# sanitizer build is a direct clang invocation instead of the
+# -DZGEC_FUZZ_LIBFUZZER option, because a sanitizer build is not a style gate
+# and should not be able to fail on a warning.
+
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    name: build + test (${{ matrix.os }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    # Linux is the gate. macOS is a portability probe, not a gate: the
+    # reference platform in CMakeLists.txt is x86-64 with AVX2 and BMI2, the
+    # vector kernels are the only ones that have been exercised, and the ARM
+    # runners take the scalar fallbacks this far untested. A red macOS job is
+    # a report to act on, not a reason to block a change.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        cc: [gcc, clang]
+        exclude:
+          # Apple's gcc is clang, so the pair is redundant.
+          - os: macos-latest
+            cc: gcc
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build (-Werror, -pedantic)
+        run: cmake --build build --parallel
+
+      - name: Compiler and build type
+        run: $CC --version | head -1
+
+      - name: Round-trip and format tests
+        run: ./build/zgec_test
+
+      - name: Minimal smoke tests
+        run: ./build/zgec_test_mini
+
+      - name: Block, segment and bitstream checks
+        run: ./build/zgec_test_block
+
+      - name: Benchmark harness runs
+        run: ./build/zgec_bench
+
+      - name: Fuzzer smoke run
+        run: ./build/zgec_fuzz 20000 1
+
+      - name: Level and thread round-trip sweep
+        run: |
+          set -euo pipefail
+          head -c 4194304 /dev/urandom > /tmp/noise.bin
+          for lvl in 1 3 5 7 9; do
+            for t in 1 4; do
+              ./build/zgec t -l "$lvl" -T "$t" /tmp/noise.bin
+              ./build/zgec t -l "$lvl" -T "$t" README.md
+            done
+          done
+          ./build/zgec t -l 9 --dicts --filter --checksums README.md
+
+  fuzz:
+    name: fuzz (libFuzzer + ASan/UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Build with the sanitizers and libFuzzer
+        run: |
+          clang -std=c11 -O1 -g -fno-omit-frame-pointer \
+            -fsanitize=fuzzer,address,undefined \
+            -mavx2 -mbmi2 -msse4.2 -Iinclude \
+            -o fuzz tools/fuzz/fuzz_roundtrip.c \
+            src/common.c src/bitstream.c src/crc32c.c src/xxhash.c \
+            src/fse.c src/rans.c src/frame.c src/dict.c src/seq.c src/lit.c \
+            src/block.c src/decode.c src/match.c src/parse.c src/encode.c \
+            -lpthread -lm
+
+      - name: Seed corpus
+        run: |
+          mkdir -p corpus
+          printf 'zgec' > corpus/seed
+
+      - name: Fuzz for five minutes
+        run: |
+          ./fuzz corpus -max_total_time=300 -max_len=4096 \
+            -rss_limit_mb=4096 -print_final_stats=1 -jobs=1 -workers=1
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-crashes
+          path: |
+            crash-*
+            timeout-*
+            leak-*
+            oom-*
+          if-no-files-found: ignore
