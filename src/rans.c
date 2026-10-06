@@ -50,10 +50,16 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts)
             t->f[s] = (uint16_t)eff;
             t->c[s] = (uint16_t)sum;
             sum += eff;
-            /* Precompute reciprocal for fast division: f[s] is 16-bit. */
-            if (eff > 0) {
-                uint64_t recip = ((uint64_t)1 << 32) / (uint64_t)eff;
+            /* Precompute a biased reciprocal for the encode loop's
+             * division by f[s]. floor(2^32 / f) + 1 is the bias that
+             * makes the multiply-shift below off by at most one, which
+             * the encode loop corrects exactly. f == 1 would need
+             * 2^32 + 1, so it is stored as 0 and takes a branch there. */
+            if (eff > 1u) {
+                uint64_t recip = ((uint64_t)1 << 32) / (uint64_t)eff + 1u;
                 t->f_recip[s] = (uint32_t)recip;
+            } else {
+                t->f_recip[s] = 0u;   /* eff == 0 unused; eff == 1 branched */
             }
         }
         if (sum != (uint32_t)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
@@ -222,13 +228,29 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 x >>= 16;
             }
             uint32_t recip = tab->f_recip[s];
-            (void)recip;
-            /* Annex B.2: x = (x / f) << 11 | (x % f) + c. Plain division
-             * is conforming; the precomputed reciprocal is an optional
-             * optimisation for platforms with slow divides. */
-            uint64_t quot = (uint64_t)x / f;
-            uint32_t rem = (uint32_t)((uint64_t)x % f);
-            x = (uint32_t)(((uint64_t)quot << ZGEC_RANS_L) + (uint64_t)rem + (uint64_t)tab->c[s]);
+            /* Annex B.2: x = (x / f) << 11 | (x % f) + c.
+             * A hardware divide per literal was the most expensive
+             * instruction in this loop. After the renormalisation above,
+             * x < f << 21 <= 2^32 and f <= ZGEC_RANS_M, so with
+             * recip = floor(2^32 / f) + 1 the value floor(x * recip /
+             * 2^32) is either floor(x/f) or floor(x/f) + 1; one
+             * correction step makes quo and rems exact. f == 1 has no
+             * 32-bit reciprocal and is handled directly. */
+            uint32_t quo;
+            int64_t rems;
+            if (f == 1u) {
+                quo = x;
+                rems = 0;
+            } else {
+                uint64_t prod = (uint64_t)x * (uint64_t)recip;
+                quo = (uint32_t)(prod >> 32);
+                rems = (int64_t)x - (int64_t)quo * (int64_t)f;
+                if (rems < 0) {
+                    quo--;
+                    rems += (int64_t)f;
+                }
+            }
+            x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
             state[lane] = x;
         }
     }
@@ -327,14 +349,23 @@ zgec_err zgec_rans_normalise(int16_t *counts, const uint32_t *hist)
     /* Adjust to exactly target. */
     int64_t diff = (int64_t)(target - scaled_sum);
     if (diff != 0) {
-        /* Find symbols with largest/smallest fractional parts. */
+        /* Find symbols with largest/smallest fractional parts.
+         * fscaled[s] is hist[s] * target / total, which the comparison
+         * below used to recompute with a 64-bit division on both sides of
+         * every one of the ~32768 inner-loop iterations. It depends only
+         * on the symbol, so it is computed once here; the comparison, the
+         * swap rule and the resulting selection order are unchanged. */
+        uint64_t fscaled[ZGEC_NSYM_LIT];
         int order[ZGEC_NSYM_LIT];
-        for (int s = 0; s < ZGEC_NSYM_LIT; s++) order[s] = s;
+        for (int s = 0; s < ZGEC_NSYM_LIT; s++) {
+            order[s] = s;
+            fscaled[s] = (total > 0) ? (uint64_t)hist[s] * target / total : 0;
+        }
         /* Sort by hist[s] * target / total - counts[s] descending if diff > 0. */
         for (int i = 0; i < ZGEC_NSYM_LIT - 1; i++) {
             for (int j = i + 1; j < ZGEC_NSYM_LIT; j++) {
-                uint64_t fi = (total > 0) ? (uint64_t)hist[order[i]] * target / total : 0;
-                uint64_t fj = (total > 0) ? (uint64_t)hist[order[j]] * target / total : 0;
+                uint64_t fi = fscaled[order[i]];
+                uint64_t fj = fscaled[order[j]];
                 int swap = 0;
                 if (diff > 0 && fi > fj) swap = 1;
                 else if (diff < 0 && fi < fj) swap = 1;

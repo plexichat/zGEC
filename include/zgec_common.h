@@ -186,20 +186,18 @@ static inline void zgec_wr64(uint8_t *p, uint64_t v) {
 }
 
 /* ---- bit helpers ---- */
+/* floor(log2(v)), defined as 0 for v == 0.
+ *
+ * This is one instruction (bsr) rather than the five-branch narrowing
+ * cascade it used to be. It sits on the encoder's hottest path --
+ * zgec_seq_code_of calls it for every candidate price-gate evaluation
+ * (tens of millions per block) -- where five data-dependent branches per
+ * call dominated the profile. */
 static inline unsigned zgec_highbit32(uint32_t v) {
-    /* floor(log2(v)) for v > 0; undefined for v == 0 */
-    unsigned n = 0;
-    if (v >= 1u << 16) { v >>= 16; n += 16; }
-    if (v >= 1u << 8)  { v >>= 8;  n += 8; }
-    if (v >= 1u << 4)  { v >>= 4;  n += 4; }
-    if (v >= 1u << 2)  { v >>= 2;  n += 2; }
-    if (v >= 1u << 1)  { n += 1; }
-    return n;
+    return (v == 0u) ? 0u : (31u - (unsigned)__builtin_clz(v));
 }
 static inline unsigned zgec_highbit64(uint64_t v) {
-    unsigned n = 0;
-    if (v >= 1ull << 32) { v >>= 32; n += 32; }
-    return n + zgec_highbit32((uint32_t)v);
+    return (v == 0ull) ? 0u : (63u - (unsigned)__builtin_clzll(v));
 }
 
 /* ---- fast approximate log2 (encoder heuristics only) ----

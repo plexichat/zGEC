@@ -69,18 +69,22 @@
 #define ZGEC_MF_LONG_BYTES 8u
 
 /* Table geometry (section 11.2: "begin with 2^16 entries for fast and
- * main, and 2^18 for high, and let measurement decide"). Measurement
- * on source-tree data says the long-range retention of the smaller
- * tables, not probe cost, is what loses ratio, so the main tier's
- * long table is widened to 2^18 buckets and its short buckets to 2^17
- * lanes-equal rows. The short table hashes 5 bytes into a bucket of
- * `lanes` packed entries; the long table hashes 8 bytes into one
- * entry per bucket. Overridable so a build can re-measure. */
+ * main, and 2^18 for high, and let measurement decide"). Measurement on
+ * a 15.6 MB source tree says the short table's footprint, not its
+ * retention, is what costs time: a 2^17-bucket main short table is
+ * 4 MiB per worker, so every probe is an L3 round trip. Dropping it to
+ * 2^16 buckets costs 0.2% of ratio and buys ~7% of encode wall time
+ * (the probe count is unchanged, the miss latency is not). The long
+ * table keeps 2^18 buckets: halving it as well costs another 0.8% of
+ * ratio, which measurement says is not worth it. The short table hashes
+ * 5 bytes into a bucket of `lanes` packed entries; the long table hashes
+ * 8 bytes into one entry per bucket. Overridable so a build can
+ * re-measure. */
 #ifndef ZGEC_MF_FAST_BUCKETS
 #define ZGEC_MF_FAST_BUCKETS (1u << 16)
 #endif
 #ifndef ZGEC_MF_MAIN_BUCKETS
-#define ZGEC_MF_MAIN_BUCKETS (1u << 17)
+#define ZGEC_MF_MAIN_BUCKETS (1u << 16)
 #endif
 #ifndef ZGEC_MF_HIGH_BUCKETS
 #define ZGEC_MF_HIGH_BUCKETS (1u << 18)
@@ -104,11 +108,21 @@
 #define ZGEC_MF_HIGH_LANES   16u
 #endif
 
-/* Probes: how many tag hits of a short bucket are scored. Section
- * 11.2 starts at 2 (fast/main) and 4 (high); measuring on source-tree
- * data, 8 probes win about 1% of ratio and cost ~5% of encode time,
- * because the deeper hits are exactly the long-range candidates that
- * the newest few lanes had pushed out. */
+/* Probes: how many tag hits of a short bucket are scored per find.
+ *
+ * Section 11.2 gives the fast tier two hits and the high tier "deeper";
+ * for main it only names the candidates (rep0, rep1, long, short), and
+ * 11.3 step 4 makes each probe a random memory access into the virtual
+ * buffer, not a compare. Measurement on a source tree, where 62% of the
+ * lanes of a probed bucket carry the queried tag (the corpus repeats
+ * 5-byte fragments constantly, so a tag hit is a real candidate and not
+ * noise), says the depth is where the ratio is: scoring the whole 8-lane
+ * bucket instead of the two newest lanes is worth 3.2% of ratio for 25%
+ * of the probe count. Main therefore scores the bucket; fast keeps the
+ * spec's two hits. */
+#ifndef ZGEC_MF_PROBE_DEPTH_FAST
+#define ZGEC_MF_PROBE_DEPTH_FAST 2u
+#endif
 #ifndef ZGEC_MF_PROBE_DEPTH
 #define ZGEC_MF_PROBE_DEPTH 8u
 #endif
@@ -117,10 +131,15 @@
 #endif
 
 /* Positions sampled inside a match for the fast and main tiers.
- * Section 11.2 starts at 2-3; measurement says the table's memory of
- * older content, not probe cost, is what recovers long-range periodic
- * matches, so the default samples far more densely. Fast tier keeps
- * the spec's sparse form because it is the speed tier. */
+ * Section 11.2: "Inside a match insert 2-3 sampled positions (fast and
+ * main tiers); insert every position only in the high tier". Each sample
+ * is two hashes and two random table stores. The spec's 2-3 is a sizeable
+ * ratio sacrifice on a source tree, because the matches are short (about
+ * seven bytes) so few samples already cover a whole match: measured at a
+ * fixed 2^16-bucket main table, dropping the main count from 16 to 3
+ * costs 7% of ratio and buys 12% of encode time. The dial stays at the
+ * measured-better value; compile with -DZGEC_MF_MATCH_SAMPLES=3 to take
+ * the spec's faster end. */
 #ifndef ZGEC_MF_MATCH_SAMPLES
 #define ZGEC_MF_MATCH_SAMPLES 16u
 #endif
@@ -652,6 +671,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             mask = mf_bucket_hits(b, tag, m->nlanes);
             nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
             want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
+                 : (m->tier == ZGEC_TIER_FAST) ? ZGEC_MF_PROBE_DEPTH_FAST
                                                : ZGEC_MF_PROBE_DEPTH;
             nhit = (nmatch < want) ? nmatch : want;
             head = (uint32_t)m->short_head[bucket];

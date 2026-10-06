@@ -1315,6 +1315,41 @@ static zgec_err decode_segment(zgec_segment_arrays *seg,
 
 /* ---- Phase B: execute (Annex D, scalar-conforming) ---- */
 
+/* Copy n literals byte-exactly, without calling the C library.
+ *
+ * n averages about 1.4 on text, so an out-of-line memcpy spent far more
+ * time on its call sequence and length dispatch than on the copy. Every
+ * copy stays inside [d, d+n) and reads only bytes [s, s+n), so it is
+ * exact and cannot overrun either buffer.
+ *
+ * For n >= 8 an aligned 8-byte stride is used and the final 8 bytes are
+ * re-copied (overlapping the last full chunk) rather than handled as a
+ * remainder; for n < 8 a 4/2/1 cascade copies the head and the tail of
+ * the run, which together cover it. */
+static void exec_copy_literals(uint8_t *d, const uint8_t *s, size_t n)
+{
+    size_t i = 0;
+    if (n >= 8) {
+        while (i + 8 <= n) {
+            memcpy(d + i, s + i, 8);
+            i += 8;
+        }
+        memcpy(d + n - 8, s + n - 8, 8);
+        return;
+    }
+    if (n >= 4) {
+        memcpy(d, s, 4);
+        memcpy(d + n - 4, s + n - 4, 4);
+        return;
+    }
+    if (n >= 2) {
+        memcpy(d, s, 2);
+        memcpy(d + n - 2, s + n - 2, 2);
+        return;
+    }
+    if (n == 1) d[0] = s[0];
+}
+
 static void exec_literals_plain(uint8_t *dst, const uint8_t *lit, size_t n,
                                  size_t pos, size_t raw_size)
 {
@@ -1326,7 +1361,7 @@ static void exec_literals_plain(uint8_t *dst, const uint8_t *lit, size_t n,
     if (raw_size > 64 && pos + n > raw_size - 64) {
         for (i = 0; i < n; i++) dst[pos + i] = lit[i]; /* safe scalar tail */
     } else {
-        memcpy(dst + pos, lit, n);
+        exec_copy_literals(dst + pos, lit, n);
     }
 }
 
@@ -1347,27 +1382,46 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
     }
 }
 
+/* Copy one match.
+ *
+ * Spec 6.1/Annex D: a match copies byte by byte in increasing order, so
+ * an overlapping match (len > off) replicates the bytes just written.
+ * When off >= 8 that ordering is exactly what 8-byte chunks produce: each
+ * chunk at offset i reads [i-off, i-off+8) and writes [i, i+8), and
+ * off >= 8 puts every source byte strictly before every destination byte
+ * of the same chunk, so the source is always final. Chunking therefore
+ * replaces the out-of-line memmove call with a handful of 8-byte moves
+ * while preserving the byte-at-a-time result. For off < 8 the copy must
+ * stay byte at a time, because the source can run into the bytes this
+ * match is itself producing. src is the VB position of the match; it is
+ * never below the virtual buffer because V2 checked off <= Ld + Ll + pos. */
 static void exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
                         size_t raw_size)
 {
-    size_t i;
-    const uint8_t *src;
+    size_t i = 0;
+    uint8_t *d = dst + pos;
+    const uint8_t *src = d - off;
     if (len == 0) return;
-    /* Spec 6.1/Annex D: a match copies byte by byte in increasing
-     * order, so an overlapping match (len > off) replicates the bytes
-     * just written. memmove preserves the original source instead,
-     * which is wrong there, so it is used only when the source and
-     * destination ranges do not overlap (len <= off). src is the VB
-     * position of the match; it is never below the virtual buffer
-     * because V2 checked off <= Ld + Ll + pos. */
-    src = dst + pos - off;
     if (raw_size > 64 && pos + len > raw_size - 64) {
-        for (i = 0; i < len; i++) dst[pos + i] = src[i];
-    } else if (len <= off) {
-        memmove(dst + pos, src, len);
-    } else {
-        for (i = 0; i < len; i++) dst[pos + i] = src[i];
+        for (i = 0; i < len; i++) d[i] = src[i]; /* safe scalar tail */
+        return;
     }
+    if (off >= 8) {
+        if (len >= 8) {
+            while (i + 8 <= len) {
+                memcpy(d + i, src + i, 8);
+                i += 8;
+            }
+            memcpy(d + len - 8, src + len - 8, 8); /* within [0,len) */
+            return;
+        }
+        if (len >= 4) {
+            memcpy(d, src, 4);
+            memcpy(d + len - 4, src + len - 4, 4);
+            return;
+        }
+    }
+    for (i = 0; i < len; i++) d[i] = src[i];
 }
 
 static zgec_err exec_block(zgec_block_arrays *ba)
@@ -2182,19 +2236,31 @@ static zgec_err fetch_dict(zgec_decoder *d, const zgec_frame_header *fh,
 
 /* ---- sequential frame decode (section 4.7) ---- */
 
+/* Append one block's output.
+ *
+ * The capacity grows geometrically. Growing by exactly the bytes needed
+ * (as this did) re-copies the whole accumulated output once per block, so
+ * a frame of K blocks costs O(K) copies of the output -- quadratic, and
+ * the dominant cost of a single-threaded decode of many small blocks.
+ * Doubling bounds the total copied bytes to under twice the output. */
 static zgec_err frame_output_append(uint8_t **out, size_t *len, size_t *cap,
                                      const uint8_t *data, size_t n)
 {
     if (n == 0) return ZGEC_OK;
     if (*len + n < *len) return ZGEC_ERR_OUTPUT_SIZE;
     if (*len + n > *cap) {
-        size_t nc = *len + n + 65536;
-        uint8_t *nb = (uint8_t *)zgec_alloc(nc, 64);
-        if (!nb) return ZGEC_ERR_NOMEM;
-        if (*len > 0) memcpy(nb, *out, *len);
-        zgec_free(*out);
-        *out = nb;
-        *cap = nc;
+        size_t need = *len + n;
+        size_t nc = (*cap != 0) ? *cap : (size_t)1u << 20;
+        if (need > (SIZE_MAX >> 1)) return ZGEC_ERR_OUTPUT_SIZE;
+        while (nc < need) nc <<= 1;
+        {
+            uint8_t *nb = (uint8_t *)zgec_alloc(nc, 64);
+            if (!nb) return ZGEC_ERR_NOMEM;
+            if (*len > 0) memcpy(nb, *out, *len);
+            zgec_free(*out);
+            *out = nb;
+            *cap = nc;
+        }
     }
     memcpy(*out + *len, data, n);
     *len += n;
@@ -2669,6 +2735,27 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
             if (took != 0) {
                 zgec_footer_free(&footer);
                 return err;
+            }
+        }
+    }
+
+    /* Reserve the output once when the footer states its size. Growing it
+     * block by block would re-copy everything appended so far on each
+     * growth step. The claim is clamped to what the frame's own block count
+     * and block size can possibly produce (every block record contributes
+     * at most 2^block_log2 bytes), so a bogus content_size cannot make the
+     * decoder reserve arbitrary memory; a claim that is too small or too
+     * large is still caught by the content-size checks at the end, and if
+     * the reservation fails the buffer simply grows as before. */
+    if (have_footer && footer.content_size > 0u) {
+        uint64_t bcap = dec_block_cap(fh.block_log2);
+        if (bcap != 0u) {
+            uint64_t bound = bcap * (uint64_t)footer.block_count;
+            uint64_t want = footer.content_size;
+            if (want > bound) want = bound;
+            if (want > 0u && want <= (uint64_t)SIZE_MAX) {
+                out = (uint8_t *)zgec_alloc((size_t)want, 64);
+                if (out != NULL) out_cap = (size_t)want;
             }
         }
     }

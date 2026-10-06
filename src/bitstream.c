@@ -20,65 +20,9 @@
  * high address). The sentinel is appended as the final byte.
  */
 
-void zgec_br_init(zgec_br *b, const void *buf, size_t size)
-{
-    const uint8_t *p = (const uint8_t *)buf;
-    b->start = p;
-    b->end = p + size;
-    b->overflow = 0;
-    if (size == 0) {
-        b->ptr = p - 1;
-        b->acc = 0;
-        b->nacc = 0;
-        b->overflow = 1;   /* a stream must have a sentinel byte */
-        return;
-    }
-    uint8_t last = p[size - 1];
-    if (last == 0) {
-        b->ptr = p - 1;
-        b->acc = 0;
-        b->nacc = 0;
-        b->overflow = 1;   /* sentinel missing */
-        return;
-    }
-    unsigned s = zgec_highbit32(last);   /* sentinel position 0..7 */
-    /* the consumable bits of the last byte are bits [s-1 .. 0];
-       place them at the top of the accumulator, bit s-1 at 63 */
-    b->acc = (s == 0) ? 0ull
-                      : (uint64_t)(last & (uint8_t)((1u << s) - 1u)) << (64 - s);
-    b->nacc = s;
-    b->ptr = p + size - 2;   /* next byte to load, moving backwards */
-}
-
-void zgec_br_refill(zgec_br *b)
-{
-    while (b->nacc <= 56 && b->ptr >= b->start) {
-        b->acc |= (uint64_t)(b->ptr[0]) << (56 - b->nacc);
-        b->nacc += 8;
-        b->ptr--;
-    }
-}
-
-uint32_t zgec_br_read(zgec_br *b, unsigned n)
-{
-    if (n == 0) return 0;
-    if (b->nacc < n) {
-        zgec_br_refill(b);
-        if (b->nacc < n) {
-            b->overflow = 1;
-            return 0;
-        }
-    }
-    uint32_t v = (uint32_t)(b->acc >> (64 - n));
-    b->acc <<= n;
-    b->nacc -= n;
-    return v;
-}
-
-int zgec_br_done(const zgec_br *b)
-{
-    return b->nacc == 0 && b->ptr < b->start && !b->overflow;
-}
+/* The backward reader (zgec_br_init / _refill / _read / _done) is defined
+ * `static inline` in zgec_bitstream.h: it runs twice per decoded symbol, so
+ * it must inline into fse.c/seq.c/decode.c rather than be called. */
 
 void zgec_bw_init(zgec_bw *b, void *buf, size_t capacity)
 {

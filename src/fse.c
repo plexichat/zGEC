@@ -114,42 +114,68 @@ void zgec_fse_free_dec(zgec_fse_dec_table *t)
 
 zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *dec)
 {
+    /* One (symbol, occurrence index) record. Held in a flat S-entry
+     * scratch instead of a full nsym * S intermediate table: the sum of
+     * counts[s] is exactly S, so this is at most 2^ZGEC_MAX_AL = 2048
+     * entries (16 KiB) rather than nsym * S entries (~1 MiB for
+     * sequences, allocated and zeroed per table build, i.e. per stream
+     * per segment). */
+    struct zgec_fse_occ {
+        uint8_t  nb_bits;
+        uint16_t new_state;
+        uint16_t baseline;
+    };
+
     if (!dec || !out) return ZGEC_ERR_INVAL;
     int al = dec->al;
     int nsym = dec->nsym;
     int S = 1 << al;
 
-    size_t enc_size = sizeof(zgec_fse_enc_table) + (size_t)nsym * (size_t)S * sizeof(zgec_fse_enc_entry);
-    zgec_fse_enc_table *t = (zgec_fse_enc_table *)zgec_alloc(enc_size, _Alignof(zgec_fse_enc_table));
-    if (!t) return ZGEC_ERR_NOMEM;
-    memset(t, 0, enc_size);
-    t->e = (zgec_fse_enc_entry *)((uint8_t *)t + sizeof(zgec_fse_enc_table));
-    t->al = al;
-    t->nsym = nsym;
-
+    struct zgec_fse_occ *occ;
     int counts[256];
+    int off[256];
+    int run;
+    size_t full_size;
+    zgec_fse_enc_table *full;
+
     memset(counts, 0, sizeof(counts));
     for (int i = 0; i < S; i++) counts[dec->e[i].symbol]++;
 
-    /* Each symbol owns its own 2^al block at (s * S), so the occurrence
-     * index j is 0-based within that block. (An earlier version added
-     * offset[s] here, which belongs to a flat layout; it shifted every
-     * symbol after the first onto uninitialised cells, so the encoder's
-     * next-state mapping for those symbols was all zeros.) */
-    int used[256];
-    memset(used, 0, sizeof(used));
-    for (int i = 0; i < S; i++) {
-        int s = dec->e[i].symbol;
-        int j = used[s]++;
-        size_t idx = (size_t)s * (size_t)S + (size_t)j;
-        t->e[idx].nb_bits = dec->e[i].nb_bits;
-        t->e[idx].new_state = (uint16_t)i;
-        t->e[idx].baseline = (uint16_t)dec->e[i].baseline;
+    /* Per-symbol base within the flat scratch. */
+    run = 0;
+    for (int s = 0; s < nsym; s++) {
+        off[s] = run;
+        run += counts[s];
     }
 
-    size_t full_size = (size_t)nsym * (size_t)S * sizeof(zgec_fse_enc_entry);
-    zgec_fse_enc_table *full = (zgec_fse_enc_table *)zgec_alloc(sizeof(zgec_fse_enc_table) + full_size, _Alignof(zgec_fse_enc_table));
-    if (!full) { zgec_fse_free_enc(t); return ZGEC_ERR_NOMEM; }
+    occ = (struct zgec_fse_occ *)zgec_alloc(
+        (size_t)S * sizeof(*occ), _Alignof(struct zgec_fse_occ));
+    if (!occ) return ZGEC_ERR_NOMEM;
+
+    /* Each symbol owns its own 2^al block at (s * S) in the encoder
+     * table, so the occurrence index j is 0-based within that block.
+     * (An earlier version added offset[s] to the in-table index, which
+     * belongs to a flat layout; it shifted every symbol after the first
+     * onto uninitialised cells, so the encoder's next-state mapping for
+     * those symbols was all zeros.) The scratch stores them per symbol
+     * with the same j indexing, so the expansion below reads exactly
+     * what the old intermediate table held. */
+    {
+        int used[256];
+        memset(used, 0, sizeof(used));
+        for (int i = 0; i < S; i++) {
+            int s = dec->e[i].symbol;
+            int j = used[s]++;
+            struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
+            o->nb_bits = dec->e[i].nb_bits;
+            o->new_state = (uint16_t)i;
+            o->baseline = (uint16_t)dec->e[i].baseline;
+        }
+    }
+
+    full_size = (size_t)nsym * (size_t)S * sizeof(zgec_fse_enc_entry);
+    full = (zgec_fse_enc_table *)zgec_alloc(sizeof(zgec_fse_enc_table) + full_size, _Alignof(zgec_fse_enc_table));
+    if (!full) { zgec_free(occ); return ZGEC_ERR_NOMEM; }
     memset(full, 0, sizeof(zgec_fse_enc_table) + full_size);
     full->e = (zgec_fse_enc_entry *)((uint8_t *)full + sizeof(zgec_fse_enc_table));
     full->al = al;
@@ -157,9 +183,10 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
 
     for (int s = 0; s < nsym; s++) {
         for (int j = 0; j < counts[s]; j++) {
-            uint8_t nb = t->e[(size_t)s * (size_t)S + (size_t)j].nb_bits;
-            uint16_t st = t->e[(size_t)s * (size_t)S + (size_t)j].new_state;
-            uint16_t bl = t->e[(size_t)s * (size_t)S + (size_t)j].baseline;
+            const struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
+            uint8_t nb = o->nb_bits;
+            uint16_t st = o->new_state;
+            uint16_t bl = o->baseline;
             unsigned range = 1u << nb;
             int lo = (int)bl;                       /* decoder next-state range is
                                                        [baseline, baseline+range-1] */
@@ -175,7 +202,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
         }
     }
 
-    zgec_fse_free_enc(t);
+    zgec_free(occ);
     *out = full;
     return ZGEC_OK;
 }
@@ -409,45 +436,100 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
 
 /* ---- FSE stream decode / encode (section 8.4) ---- */
 
+/* Take _nb bits into _dst from the local reader (acc/nacc/ptr/left).
+ * Behaviour is exactly zgec_br_read's: bytes are refilled lazily in the
+ * same order, a read that cannot be satisfied sets br->overflow, and a
+ * zero-width read yields 0. Holding the reader in locals instead of in
+ * the zgec_br struct is what lets the compiler keep it in registers:
+ * reached through the struct, every one of the two reads per symbol went
+ * to memory and back. `bad` is the function's error exit. */
+#define ZGEC_BRF_TAKE(_nb, _dst) do { \
+        unsigned _k = (unsigned)(_nb); \
+        if (_k != 0u) { \
+            if (nacc < _k) { \
+                while (nacc <= 56u && left > 0u) { \
+                    acc |= (uint64_t)(ptr[0]) << (56u - nacc); \
+                    nacc += 8u; \
+                    left--; \
+                    if (left > 0u) ptr--; \
+                } \
+            } \
+            if (nacc < _k) { br->overflow = 1; goto bad; } \
+            (_dst) = (uint32_t)(acc >> (64u - _k)); \
+            acc <<= _k; \
+            nacc -= _k; \
+        } else { \
+            (_dst) = 0u; \
+        } \
+    } while (0)
+
 zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
                           uint32_t *out, uint8_t *syms, size_t n,
                           const uint32_t *base, const uint8_t *nbits)
 {
+    uint64_t acc;
+    unsigned nacc;
+    const uint8_t *ptr;
+    size_t left;
+    unsigned state;
+    unsigned S;
+    size_t i;
+    zgec_err err = ZGEC_ERR_BITSTREAM;
+
     if (!t || !br) return ZGEC_ERR_INVAL;
     if (n == 0) {
         if (!zgec_br_done(br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
         return ZGEC_OK;
     }
-    int S = 1 << t->al;
-    uint32_t state = zgec_br_read(br, (unsigned)t->al);
-    if (br->overflow) return ZGEC_ERR_BITSTREAM;
-    if (state >= (unsigned)S) return ZGEC_ERR_BITSTREAM;
+    S = (unsigned)1 << (unsigned)t->al;
+    acc = br->acc;
+    nacc = br->nacc;
+    ptr = br->ptr;
+    left = br->left;
 
-    for (size_t i = 0; i < n; i++) {
+    ZGEC_BRF_TAKE(t->al, state);
+    if (state >= S) goto bad;
+
+    for (i = 0; i < n; i++) {
         const zgec_fse_dec_entry *e = &t->e[state];
-        if (e->symbol < 0 || e->symbol >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-        uint8_t sym = (uint8_t)e->symbol;
-        if (syms) syms[i] = sym;
-
+        unsigned sym = 0;
         uint32_t extra = 0;
-        if (nbits && nbits[sym] > 0) {
-            extra = zgec_br_read(br, (unsigned)nbits[sym]);
-            if (br->overflow) return ZGEC_ERR_BITSTREAM;
+        if (e->symbol < 0 || e->symbol >= t->nsym) {
+            err = ZGEC_ERR_FSE_SYMBOL;
+            goto bad;
+        }
+        sym = (unsigned)e->symbol;
+        if (syms) syms[i] = (uint8_t)sym;
+
+        if (nbits != NULL && nbits[sym] > 0) {
+            ZGEC_BRF_TAKE(nbits[sym], extra);
         }
         if (out) {
             out[i] = (base ? base[sym] : (uint32_t)sym) + extra;
         }
 
         if (i + 1 < n) {
-            uint32_t bits = zgec_br_read(br, e->nb_bits);
-            if (br->overflow) return ZGEC_ERR_BITSTREAM;
-            int32_t next = (int32_t)(e->baseline + (int32_t)bits);
-            if (next < 0 || next >= S) return ZGEC_ERR_BITSTREAM;
+            uint32_t bits = 0;
+            int32_t next;
+            ZGEC_BRF_TAKE(e->nb_bits, bits);
+            next = e->baseline + (int32_t)bits;
+            if (next < 0 || next >= (int32_t)S) goto bad;
             state = (unsigned)next;
         }
     }
+    br->acc = acc;
+    br->nacc = nacc;
+    br->ptr = ptr;
+    br->left = left;
     if (!zgec_br_done(br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
     return ZGEC_OK;
+
+bad:
+    br->acc = acc;
+    br->nacc = nacc;
+    br->ptr = ptr;
+    br->left = left;
+    return err;
 }
 
 zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,

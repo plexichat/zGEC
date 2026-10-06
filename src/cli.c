@@ -15,6 +15,33 @@
 
 #define CLI_MAX_DICTS 4
 
+/* Monotonic wall clock, for the throughput line of a c/d/t run. */
+#if defined(_WIN32)
+#include <windows.h>
+static double cli_now(void)
+{
+    LARGE_INTEGER c, f;
+    QueryPerformanceCounter(&c);
+    QueryPerformanceFrequency(&f);
+    return (double)c.QuadPart / (double)f.QuadPart;
+}
+#else
+#include <time.h>
+static double cli_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+#endif
+
+/* MiB per second over a wall-clock interval; 0 when the interval is empty. */
+static double cli_mbs(size_t bytes, double sec)
+{
+    if (sec <= 0.0) return 0.0;
+    return ((double)bytes / 1048576.0) / sec;
+}
+
 static zgec_err zgec_read_file(const char *path, uint8_t **out, size_t *out_size)
 {
     FILE *f = fopen(path, "rb");
@@ -58,7 +85,7 @@ static void cli_usage(FILE *f, const char *argv0)
         "  -T, --threads N     worker threads (0 = one per core); default 0\n"
         "      --tier T        match finder tier: fast, main, high\n"
         "      --block-log2 N  block size log2, 16..26 (default: the level\n"
-        "                      preset, 23 or 24)\n"
+        "                      preset: 21, i.e. 2 MiB, section 12.3)\n"
         "      --lambda X      speed/ratio dial (11.7)\n"
         "      --contexts      learned literal contexts (11.6)\n"
         "      --sub-lit       sub-literal segments (9.6)\n"
@@ -103,32 +130,48 @@ typedef struct {
 /* A level adds the feature that measured best on the reference corpus, so
  * the compressed size never rises with the level.
  *
- * Two orderings matter. Every level uses the largest block the P24 profile
- * allows: a dictionary or literal-reference prefix shares the 16 MiB
- * virtual buffer, and the encoder shrinks the prefix to fit rather than
- * shrinking the block, which measured better than 8 MiB blocks throughout.
- * And a literal-reference level carries its own bit set, which suppresses
- * conditioning (6.3), so conditioning is added after literal references
- * rather than before them; the level that adds it re-states the flag rather
- * than dropping one.
+ * Two orderings matter. A literal-reference level carries its own bit set,
+ * which suppresses conditioning (6.3), so conditioning is added after
+ * literal references rather than before them; the level that adds it
+ * re-states the flag rather than dropping one.
  *
- * Levels 8 and 9 additionally enable sub-literals, epoch dictionaries and
- * the pre-filter. On that corpus none of the three changes the output size:
- * the filter's sampled gate declines, and a dictionary prefix cannot share
- * the 16 MiB virtual buffer with a full block. They are worth their place on
- * binary, columnar and heterogeneous data, where a smaller block leaves the
- * dictionary room and recovers more than it costs; pass --block-log2 23 to
- * let the dictionary fit on such input. */
+ * Every preset uses the 2 MiB block of section 12.3 (block_log2 21). A
+ * larger block is not free: blocks are the unit of parallelism (10.6), so a
+ * 16 MiB block leaves a short input with a single worker and no scaling at
+ * all, and section 12.3 caps the working set per worker at a size that
+ * spills the shared L3 long before this machine's 32 MiB is exhausted.
+ * 2 MiB measured both smaller and faster than 16 MiB everywhere in the
+ * level ladder. The block also has to hold the P24 prefix: a dictionary or
+ * literal-reference region shares the 16 MiB virtual buffer with the block,
+ * and the encoder shrinks the prefix to fit rather than the block.
+ *
+ * Level 8 adds sub-literals; level 9 adds the per-block CRC-32C, which is a
+ * fixed-width field and so does not move the size.
+ *
+ * Two features are deliberately in no preset: the sampled pre-filter and
+ * epoch dictionaries. The preset rule is measured, so a feature keeps a
+ * level only while it is a net win on the reference corpus at the 2 MiB
+ * block, and neither is. The filter's sampled gate accepts, and a block it
+ * accepts cannot set LIT_EXPORTABLE (6.3, V11), which breaks the
+ * literal-reference chain the levels above 5 rely on: 254 KB, 1.0% of a
+ * 26 MB frame, which made level 9 come out larger than level 7. The epoch
+ * dictionary is a 186 byte net loss on the same frame, because one epoch's
+ * block is encoded with a dictionary that does not pay for itself there and
+ * the encoder does not re-encode to prove each per-block choice. At 16 MiB
+ * blocks neither one showed, which is why the earlier ladder did not. Both
+ * stay available as flags for the input where they do pay (binary, columnar
+ * and heterogeneous data), and a caller that wants a dictionary prefix on a
+ * small block is the reason --block-log2 is still an option. */
 static const cli_level cli_levels[9] = {
-    /* 1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 24 },
-    /* 2 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 24 },
-    /* 3 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 24 },
-    /* 4 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 24 },
-    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 1, 0, 0, 0, 24 },
-    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 1, 1, 0, 0, 0, 24 },
-    /* 7 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 1, 1, 0, 0, 0, 24 },
-    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 0, 24 },
-    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24 }
+    /* 1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21 },
+    /* 2 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21 },
+    /* 3 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 21 },
+    /* 4 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 21 },
+    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 1, 0, 0, 0, 21 },
+    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 1, 1, 0, 0, 0, 21 },
+    /* 7 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 1, 1, 0, 0, 0, 21 },
+    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21 },
+    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)
@@ -217,6 +260,9 @@ int main(int argc, char **argv)
     const char *inpath;
     const char *outpath = NULL;
     zgec_err err;
+    double enc_sec = 0.0;
+    double dec_sec = 0.0;
+    double dec_t0 = 0.0;
 
     /* Every dictionary slot starts empty so an early error can free the
      * whole array safely. */
@@ -403,7 +449,11 @@ int main(int argc, char **argv)
                 goto done;
             }
         }
-        err = zgec_encode_frame(e, in, in_size, &out, &out_size);
+        {
+            double t0 = cli_now();
+            err = zgec_encode_frame(e, in, in_size, &out, &out_size);
+            enc_sec = cli_now() - t0;
+        }
         zgec_encoder_destroy(e);
         if (err != ZGEC_OK) {
             fprintf(stderr, "zgec: compress failed: %s\n", zgec_strerror(err));
@@ -412,8 +462,11 @@ int main(int argc, char **argv)
         if (!quiet) {
             double ratio = (out_size > 0)
                 ? (double)in_size / (double)out_size : 0.0;
-            fprintf(stderr, "zgec: level %d, %zu -> %zu bytes (%.4fx)\n",
-                    level, in_size, out_size, ratio);
+            fprintf(stderr,
+                    "zgec: level %d, %zu -> %zu bytes (%.4fx)  %.1f ms  "
+                    "%.1f MB/s\n",
+                    level, in_size, out_size, ratio, enc_sec * 1000.0,
+                    cli_mbs(in_size, enc_sec));
         }
     }
 
@@ -444,7 +497,9 @@ int main(int argc, char **argv)
                 goto done;
             }
         }
+        dec_t0 = cli_now();
         err = zgec_decode_frame(d, in, in_size, &out, &out_size);
+        dec_sec = cli_now() - dec_t0;
         zgec_decoder_destroy(d);
         if (err != ZGEC_OK) {
             fprintf(stderr, "zgec: decompress failed: %s\n",
@@ -452,7 +507,9 @@ int main(int argc, char **argv)
             goto done;
         }
         if (!quiet) {
-            fprintf(stderr, "zgec: %zu -> %zu bytes\n", in_size, out_size);
+            fprintf(stderr, "zgec: %zu -> %zu bytes  %.1f ms  %.1f MB/s\n",
+                    in_size, out_size, dec_sec * 1000.0,
+                    cli_mbs(out_size, dec_sec));
         }
         err = zgec_write_file(outpath, out, out_size);
         if (err != ZGEC_OK) {

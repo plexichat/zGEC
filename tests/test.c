@@ -1081,108 +1081,141 @@ out:
 /* Section 6.3 with a large dictionary: dict + region + block must stay
  * inside the P24 position limit, so the region is bounded and D shrinks.
  * A shrunken D must still name the *newest* D predecessors, the set the
- * decoder rebuilds, or the round-trip breaks. */
-static int zgec_test_litref_bound(void)
+ * decoder rebuilds, or the round-trip breaks. */static int zgec_test_litref_bound(void)
 {
     size_t block = (size_t)1 << 21;      /* 2 MiB blocks */
     size_t n = 4u * block;               /* four blocks */
-    size_t dn = 11u << 20;               /* 11 MiB external dictionary */
+    static const size_t dict_mib[4] = { 11u, 12u, 13u, 14u };
+    int round_tripped = 0;
     uint8_t *src = (uint8_t *)malloc(n);
-    uint8_t *dict = (uint8_t *)malloc(dn);
     uint8_t *cmp = NULL;
     size_t cmp_size = 0;
-    zgec_params p;
-    zgec_encoder *e;
-    zgec_err err;
-    zgec_frame_header fh;
-    zgec_footer f;
     uint16_t did = 5;
     int ok = 0;
-    int depth_blocks = 0;
-    int shrunken = 0;
-    size_t i;
+    int depth_blocks = 0;   /* blocks that reference a literal region */
+    int shrunken = 0;       /* blocks whose depth is below what is available */
+    int bad_depth = 0;      /* blocks referencing a non-exportable run */
+    size_t cf;
 
-    if (!src || !dict) { free(src); free(dict); return 0; }
+    if (!src) return 0;
     /* A body that is roughly half literals keeps each block's literal
-     * buffer large enough for the P24 bound to bite (measured: this
-     * shape leaves one block with run 3 but D = 1). */
-    t_noisy_body(dict, dn, 45, 12345u);
+     * buffer large enough for the P24 prefix bound to bite. */
     t_noisy_body(src, n, 45, 999u);
-    memset(&f, 0, sizeof(f));
 
-    zgec_params_default(&p);
-    p.block_log2 = 21;
-    p.max_dict_log2 = 24;   /* 24.5.8: the frame must admit the dictionary */
-    p.use_litref = 1;
-    p.use_contexts = 1;
-    p.n_threads = 4;
+    /* Whether the ratio gate chooses to reference a predecessor's literals
+     * at all, and how many of them fit, depends on the parse, so the test
+     * does not pin one dictionary size: it sweeps sizes that all leave less
+     * room than three predecessors need (P24 caps the virtual buffer at
+     * 16 MiB, so 9..13 MiB of dictionary plus a 2 MiB block leaves under
+     * 5 MiB), and requires the chain to be used AND to be shrunk below the
+     * available run somewhere in the sweep. What must hold in EVERY
+     * configuration is the invariant: a block never references more
+     * exportable predecessors than it actually has (6.3). */
+    for (cf = 0; cf < sizeof(dict_mib) / sizeof(dict_mib[0]); cf++) {
+        size_t dn = dict_mib[cf] << 20;
+        uint8_t *dict = (uint8_t *)malloc(dn);
+        zgec_params p;
+        zgec_encoder *e;
+        zgec_err err;
+        zgec_frame_header fh;
+        zgec_footer f;
+        size_t i;
+        int shrunk_here = 0;
 
-    e = zgec_encoder_create(&p);
-    if (!e) goto out;
-    err = zgec_encoder_set_external_dict(e, did, dict, dn);
-    if (err == ZGEC_OK) err = zgec_encode_frame(e, src, n, &cmp, &cmp_size);
-    zgec_encoder_destroy(e);
-    if (err != ZGEC_OK) {
-        printf("  litref_bound: encode err=%d\n", err);
-        goto out;
-    }
-    if (!t_frame_parts(cmp, cmp_size, &fh, &f)) {
-        printf("  litref_bound: frame parts failed\n");
-        goto out;
-    }
-    if (f.block_count != 4) {
-        printf("  litref_bound: block_count=%u\n", f.block_count);
-        goto out;
-    }
-    for (i = 0; i < f.block_count; i++) {
-        /* run = how many exportable predecessors the block has, which is
-         * what bounds the encoder's chain (6.3). */
-        size_t run = 0;
-        size_t j;
-        if (f.blocks[i].lit_ref_depth > 0) depth_blocks++;
-        for (j = i; j > 0; j--) {
-            if ((f.blocks[j - 1].rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0)
-                break;
-            run++;
-        }
-        /* Fewer references than available predecessors can only mean the
-         * P24 bound shrank the region: that is the path under test. */
-        if (f.blocks[i].lit_ref_depth > 0 &&
-            (size_t)f.blocks[i].lit_ref_depth < run)
-            shrunken++;
-    }
-    /* The chain must be used, and with 12 MiB of dictionary ahead of it
-     * the bound must have shrunk it below the available run length. */
-    if (depth_blocks == 0 || shrunken == 0) {
-        printf("  litref_bound: chain unused or unbounded "
-               "(depth_blocks=%d shrunken=%d)\n", depth_blocks, shrunken);
-        goto out;
-    }
+        if (!dict) break;
+        memset(&f, 0, sizeof(f));
+        t_noisy_body(dict, dn, 45, 12345u);
 
-    {
-        zgec_decoder *d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
-        uint8_t *out = NULL;
-        size_t out_size = 0;
-        err = zgec_decoder_add_external_dict(d, did, dict, dn);
+        zgec_params_default(&p);
+        p.block_log2 = 21;
+        p.max_dict_log2 = 24;   /* 24.5.8: the frame must admit the dictionary */
+        p.use_litref = 1;
+        p.use_contexts = 1;
+        p.n_threads = 4;
+
+        e = zgec_encoder_create(&p);
+        if (!e) { free(dict); break; }
+        err = zgec_encoder_set_external_dict(e, did, dict, dn);
         if (err == ZGEC_OK)
-            err = zgec_decode_frame(d, cmp, cmp_size, &out, &out_size);
-        zgec_decoder_destroy(d);
-        if (err != ZGEC_OK || out_size != n || memcmp(out, src, n) != 0) {
-            /* A shrunken D that named the wrong predecessor set (oldest
-             * instead of newest) surfaces here, not in the footer. */
-            printf("  litref_bound: round-trip failed err=%d out_size=%zu "
-                   "want=%zu\n", (int)err, out_size, n);
-            zgec_free(out);
+            err = zgec_encode_frame(e, src, n, &cmp, &cmp_size);
+        zgec_encoder_destroy(e);
+        if (err != ZGEC_OK) {
+            printf("  litref_bound: encode err=%d\n", err);
+            free(dict);
             goto out;
         }
-        zgec_free(out);
+        if (!t_frame_parts(cmp, cmp_size, &fh, &f)) {
+            printf("  litref_bound: frame parts failed\n");
+            free(dict);
+            goto out;
+        }
+        if (f.block_count != 4) {
+            printf("  litref_bound: block_count=%u\n", f.block_count);
+            zgec_footer_free(&f);
+            free(dict);
+            goto out;
+        }
+        for (i = 0; i < f.block_count; i++) {
+            /* run = how many exportable predecessors the block has, which
+             * is what bounds the encoder's chain (6.3). */
+            size_t run = 0;
+            size_t j;
+            for (j = i; j > 0; j--) {
+                if ((f.blocks[j - 1].rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0)
+                    break;
+                run++;
+            }
+            if ((size_t)f.blocks[i].lit_ref_depth > run) bad_depth++;
+            if (f.blocks[i].lit_ref_depth > 0) {
+                depth_blocks++;
+                /* Fewer references than available predecessors can only
+                 * mean the P24 prefix bound shrank the region. */
+                if ((size_t)f.blocks[i].lit_ref_depth < run) {
+                    shrunken++;
+                    shrunk_here = 1;
+                }
+            }
+        }
+        if (shrunk_here != 0) {
+            /* Round-trip the configuration that exercised the shrink. A
+             * shrunken depth that named the wrong predecessor set (oldest
+             * instead of newest) surfaces here, not in the footer. */
+            zgec_decoder *d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
+            uint8_t *out = NULL;
+            size_t out_size = 0;
+            err = zgec_decoder_add_external_dict(d, did, dict, dn);
+            if (err == ZGEC_OK)
+                err = zgec_decode_frame(d, cmp, cmp_size, &out, &out_size);
+            zgec_decoder_destroy(d);
+            if (err != ZGEC_OK || out_size != n || memcmp(out, src, n) != 0) {
+                printf("  litref_bound: round-trip failed err=%d size=%zu "
+                       "want=%zu\n", (int)err, out_size, n);
+                zgec_free(out);
+                zgec_footer_free(&f);
+                free(dict);
+                goto out;
+            }
+            zgec_free(out);
+            round_tripped = 1;
+        }
+        zgec_footer_free(&f);
+        free(dict);
+    }
+
+    /* The chain must be used, the bound must have shrunk it somewhere in
+     * the sweep, and no configuration may reference a non-exportable
+     * predecessor. */
+    if (bad_depth != 0 || depth_blocks == 0 || shrunken == 0 ||
+        round_tripped == 0) {
+        printf("  litref_bound: chain unused/bounded wrongly "
+               "(depth_blocks=%d shrunken=%d bad_depth=%d)\n",
+               depth_blocks, shrunken, bad_depth);
+        goto out;
     }
     ok = 1;
 out:
-    zgec_footer_free(&f);
     zgec_free(cmp);
     free(src);
-    free(dict);
     return ok;
 }
 
