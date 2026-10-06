@@ -1186,6 +1186,86 @@ out:
     return ok;
 }
 
+/* Section 10.6 block parallelism. The parallel path writes each block
+ * straight into its slice of the frame output, so RLE, RAW and COMPRESSED
+ * records all have to land in the right place, and the result must match
+ * the serial scan byte for byte. */
+static int zgec_test_block_parallel(void)
+{
+    const size_t bs = 262144u;   /* 256 KiB blocks: 4 of them */
+    size_t n = 4u * bs;
+    uint8_t *src = (uint8_t *)malloc(n);
+    uint8_t *frame = NULL;
+    uint8_t *serial = NULL;
+    uint8_t *par = NULL;
+    size_t frame_size = 0, serial_size = 0, par_size = 0;
+    zgec_params p;
+    zgec_encoder *e;
+    zgec_frame_header fh;
+    zgec_footer f;
+    zgec_err err;
+    uint32_t b;
+    int n_rle = 0;
+    int n_raw = 0;
+    int t;
+    int ok = 0;
+    if (!src) return 0;
+
+    memset(src, 0x5A, bs);                   /* all equal -> RLE */
+    t_noisy_body(src + bs, bs, 100, 7u);     /* incompressible -> RAW */
+    t_text_body(src + 2u * bs, bs, 11u);     /* COMPRESSED */
+    t_text_body(src + 3u * bs, bs, 29u);     /* COMPRESSED */
+
+    zgec_params_default(&p);
+    p.block_log2 = 18;
+    p.use_contexts = 1;
+    p.n_threads = 1;
+    e = zgec_encoder_create(&p);
+    if (!e) goto out;
+    err = zgec_encode_frame(e, src, n, &frame, &frame_size);
+    zgec_encoder_destroy(e);
+    if (err != ZGEC_OK) goto out;
+
+    /* The test only means something if the frame really carries an RLE and
+     * a RAW block, since those are the branches the parallel path redirects. */
+    if (!t_frame_parts(frame, frame_size, &fh, &f)) goto out;
+    for (b = 0; b < f.block_count; b++) {
+        zgec_record_header rh;
+        if (zgec_record_header_parse(&rh, frame + (size_t)f.blocks[b].offset,
+                                     &fh) != ZGEC_OK) {
+            zgec_footer_free(&f);
+            goto out;
+        }
+        if (rh.record_type == ZGEC_REC_RLE) n_rle++;
+        if (rh.record_type == ZGEC_REC_RAW) n_raw++;
+    }
+    zgec_footer_free(&f);
+    if (n_rle < 1 || n_raw < 1) goto out;
+
+    for (t = 0; t < 2; t++) {
+        zgec_limits lim;
+        zgec_decoder *d;
+        uint8_t **dst = (t == 0) ? &serial : &par;
+        size_t *szp = (t == 0) ? &serial_size : &par_size;
+        memset(&lim, 0, sizeof(lim));
+        lim.n_threads = (t == 0) ? 1 : 5;
+        d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, &lim);
+        if (!d) goto out;
+        err = zgec_decode_frame(d, frame, frame_size, dst, szp);
+        zgec_decoder_destroy(d);
+        if (err != ZGEC_OK || *szp != n || memcmp(*dst, src, n) != 0) goto out;
+    }
+    if (serial_size != par_size || memcmp(serial, par, serial_size) != 0)
+        goto out;
+    ok = 1;
+out:
+    zgec_free(frame);
+    zgec_free(serial);
+    zgec_free(par);
+    free(src);
+    return ok;
+}
+
 int main(void)
 {
     int passed = 0;
@@ -1208,6 +1288,7 @@ int main(void)
     if (zgec_test_external_dict()) passed++; else { printf("FAIL external_dict\n"); failed++; }
     if (zgec_test_literal_refs()) passed++; else { printf("FAIL literal_refs\n"); failed++; }
     if (zgec_test_threads()) passed++; else { printf("FAIL threads\n"); failed++; }
+    if (zgec_test_block_parallel()) passed++; else { printf("FAIL block_parallel\n"); failed++; }
     if (zgec_test_litref_all_flags()) passed++; else { printf("FAIL litref_all_flags\n"); failed++; }
     if (zgec_test_litref_bound()) passed++; else { printf("FAIL litref_bound\n"); failed++; }
     if (zgec_test_dict_no_orphan()) passed++; else { printf("FAIL dict_no_orphan\n"); failed++; }

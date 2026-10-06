@@ -83,13 +83,10 @@ static void cli_usage(FILE *f, const char *argv0)
         argv0);
 }
 
-/* Level presets: a level is the previous one plus what measured better
- * on the corpus, so ratio rises monotonically with the number. The
- * speed levels use the fast tier (11.2); lambda stays 0 because on the
- * corpus a positive lambda cost ratio without a measurable decode gain.
- * A literal-reference level keeps its blocks plain and unconditioned
- * (6.3), so levels 6 and 7 hold the same ratio when conditioning would
- * cost the chain, and 7 wins where conditioning is selective. */
+/* Level presets: a level is the previous one plus what measured better on
+ * the corpus, so the compressed size never rises with the number. The speed
+ * levels use the fast tier (11.2); lambda stays 0 because on the corpus a
+ * positive lambda cost ratio without a measurable decode gain. */
 typedef struct {
     zgec_tier tier;
     double    lambda;
@@ -103,21 +100,35 @@ typedef struct {
     int       block_log2;
 } cli_level;
 
-/* The window is the strongest ratio/speed lever, so every level uses the
- * largest block the P24 match-finder profile allows. Levels that keep the
- * literal-reference chain or epoch/external dictionaries need headroom for
- * the dictionary and LITREF prefix in the same 16 MiB virtual buffer, so
- * they use 8 MiB blocks (23); the rest use the full 16 MiB (24). */
+/* A level adds the feature that measured best on the reference corpus, so
+ * the compressed size never rises with the level.
+ *
+ * Two orderings matter. Every level uses the largest block the P24 profile
+ * allows: a dictionary or literal-reference prefix shares the 16 MiB
+ * virtual buffer, and the encoder shrinks the prefix to fit rather than
+ * shrinking the block, which measured better than 8 MiB blocks throughout.
+ * And a literal-reference level carries its own bit set, which suppresses
+ * conditioning (6.3), so conditioning is added after literal references
+ * rather than before them; the level that adds it re-states the flag rather
+ * than dropping one.
+ *
+ * Levels 8 and 9 additionally enable sub-literals, epoch dictionaries and
+ * the pre-filter. On that corpus none of the three changes the output size:
+ * the filter's sampled gate declines, and a dictionary prefix cannot share
+ * the 16 MiB virtual buffer with a full block. They are worth their place on
+ * binary, columnar and heterogeneous data, where a smaller block leaves the
+ * dictionary room and recovers more than it costs; pass --block-log2 23 to
+ * let the dictionary fit on such input. */
 static const cli_level cli_levels[9] = {
     /* 1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 24 },
     /* 2 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 24 },
     /* 3 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 24 },
     /* 4 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 24 },
-    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 0, 0, 0, 0, 0, 24 },
-    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 0, 1, 0, 0, 0, 23 },
-    /* 7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 1, 0, 0, 0, 23 },
-    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 0, 23 },
-    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23 }
+    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 1, 0, 0, 0, 24 },
+    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 1, 1, 0, 0, 0, 24 },
+    /* 7 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 1, 1, 0, 0, 0, 24 },
+    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 0, 24 },
+    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)

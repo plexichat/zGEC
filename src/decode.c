@@ -234,6 +234,7 @@ struct zgec_decoder {
     int hist_ok[3];
     size_t hist_n;
     dec_ext_dict ext[ZGEC_DEC_MAX_EXT];
+    int ext_borrowed; /* a block worker aliases its parent's ext[] bytes */
 };
 
 zgec_decoder *zgec_decoder_create(zgec_level level, const zgec_limits *limits)
@@ -257,7 +258,9 @@ void zgec_decoder_destroy(zgec_decoder *d)
     zgec_mu_destroy(&d->cache_mu);
     zgec_free(d->block_buf);
     for (unsigned i = 0; i < 3u; i++) zgec_free(d->hist_lit[i]);
-    for (unsigned i = 0; i < ZGEC_DEC_MAX_EXT; i++) zgec_free(d->ext[i].data);
+    if (!d->ext_borrowed) {
+        for (unsigned i = 0; i < ZGEC_DEC_MAX_EXT; i++) zgec_free(d->ext[i].data);
+    }
     zgec_free(d);
 }
 
@@ -2219,6 +2222,380 @@ static void hist_push(zgec_decoder *d, const uint8_t *lit, size_t n, int ok)
     d->hist_n++;
 }
 
+/* Defined below (random access, 4.6); the block-parallel path reuses it so
+ * a block decodes identically whether it is read alone or as part of a
+ * frame. */
+static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
+                                     size_t src_size,
+                                     const zgec_frame_header *fh,
+                                     const zgec_footer *f,
+                                     const zgec_footer_block_entry *be,
+                                     uint8_t *ovr, size_t ovr_cap,
+                                     const uint8_t **rdst, size_t *rsz);
+
+/* ---- block-parallel frame decode (10.6, G4) ----
+ *
+ * Blocks are independent (4.6), so whole blocks decode concurrently, one
+ * per worker, each writing straight into its slice of the frame output.
+ * A worker owns its decoder and therefore its dictionary cache, so an
+ * eviction can never free a dictionary another worker is still reading,
+ * and it re-derives its literal-reference region from the predecessor
+ * records (6.3) exactly as a single random-access read does. The source
+ * frame, the parsed footer and the external dictionaries are read-only.
+ *
+ * Frames carrying DICT records are left to the sequential scan, whose
+ * validation of embedded dictionaries (4.4) is exhaustive.
+ */
+
+typedef struct {
+    zgec_decoder *w;
+    const uint8_t *src;
+    size_t src_size;
+    const zgec_frame_header *fh;
+    const zgec_footer *f;
+    const size_t *off;
+    const size_t *sz;
+    uint8_t *out;
+    uint32_t nblk;
+    zgec_mu *mu;        /* guards next/err/err_idx */
+    uint32_t *next;
+    zgec_err *err;
+    uint32_t *err_idx;
+} zgec_dec_block_job;
+
+static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
+{
+    if (jb == NULL) return;
+    for (;;) {
+        uint32_t i;
+        const uint8_t *p = NULL;
+        size_t got = 0;
+        zgec_err e;
+        zgec_mu_lock(jb->mu);
+        i = (*jb->next)++;
+        zgec_mu_unlock(jb->mu);
+        if (i >= jb->nblk) return;
+        e = decode_block_record(jb->w, jb->src, jb->src_size, jb->fh, jb->f,
+                                &jb->f->blocks[i],
+                                jb->out + jb->off[i], jb->sz[i], &p, &got);
+        if (e == ZGEC_OK && (got != jb->sz[i] || p != jb->out + jb->off[i])) {
+            e = ZGEC_ERR_INTERNAL;
+        }
+        if (e != ZGEC_OK) {
+            /* Record the lowest-numbered failure so the reported error
+             * does not depend on which worker reached it first. The other
+             * workers keep going: blocks are independent, and finishing
+             * the scan is what makes the choice deterministic. */
+            zgec_mu_lock(jb->mu);
+            if (*jb->err == ZGEC_OK || i < *jb->err_idx) {
+                *jb->err = e;
+                *jb->err_idx = i;
+            }
+            zgec_mu_unlock(jb->mu);
+        }
+    }
+}
+
+#if defined(_WIN32)
+static DWORD WINAPI zgec_dec_blocks_proc_win(LPVOID arg)
+{
+    zgec_dec_blocks_run((zgec_dec_block_job *)arg);
+    return (DWORD)0;
+}
+#else
+static void *zgec_dec_blocks_proc_posix(void *arg)
+{
+    zgec_dec_blocks_run((zgec_dec_block_job *)arg);
+    return NULL;
+}
+#endif
+
+/* Spawn w workers; a job whose thread cannot start runs inline. */
+static void zgec_dec_blocks_spawn(zgec_dec_block_job *jobs, size_t w)
+{
+#if defined(_WIN32)
+    HANDLE *hs;
+    size_t t;
+    if (jobs == NULL || w == 0u) return;
+    hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
+    if (hs == NULL) {
+        for (t = 0; t < w; t++) zgec_dec_blocks_run(&jobs[t]);
+        return;
+    }
+    for (t = 0; t < w; t++) {
+        hs[t] = CreateThread(NULL, 0, zgec_dec_blocks_proc_win,
+                             (LPVOID)&jobs[t], 0, NULL);
+        if (hs[t] == NULL) zgec_dec_blocks_run(&jobs[t]); /* fallback */
+    }
+    (void)WaitForMultipleObjects((DWORD)w, hs, TRUE, INFINITE);
+    for (t = 0; t < w; t++) {
+        if (hs[t] != NULL) (void)CloseHandle(hs[t]);
+    }
+    zgec_free(hs);
+#else
+    pthread_t *ths;
+    unsigned char *started;
+    size_t t;
+    if (jobs == NULL || w == 0u) return;
+    ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
+    started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
+    if (ths == NULL || started == NULL) {
+        for (t = 0; t < w; t++) zgec_dec_blocks_run(&jobs[t]);
+        zgec_free(ths);
+        zgec_free(started);
+        return;
+    }
+    memset(started, 0, w * sizeof(*started));
+    for (t = 0; t < w; t++) {
+        if (pthread_create(&ths[t], NULL, zgec_dec_blocks_proc_posix,
+                           (void *)&jobs[t]) == 0) {
+            started[t] = 1;
+        } else {
+            zgec_dec_blocks_run(&jobs[t]); /* fallback */
+        }
+    }
+    for (t = 0; t < w; t++) {
+        if (started[t] != 0) (void)pthread_join(ths[t], NULL);
+    }
+    zgec_free(ths);
+    zgec_free(started);
+#endif
+}
+
+/* A block worker: the parent's level and limits, serial inside the block
+ * (the block parallelism is what uses the cores), borrowing the parent's
+ * external dictionaries so the bytes are not copied once per worker. */
+static zgec_decoder *dec_block_worker_create(const zgec_decoder *parent,
+                                             int inner)
+{
+    zgec_limits lim = parent->limits;
+    zgec_decoder *w;
+    lim.n_threads = (inner > 0) ? inner : 1;
+    w = zgec_decoder_create(parent->level, &lim);
+    if (!w) return NULL;
+    memcpy(w->ext, parent->ext, sizeof(w->ext));
+    w->ext_borrowed = 1;
+    return w;
+}
+
+/* Take the block-parallel path when it applies. *took is set to 1 once
+ * this path owns the frame (whether it succeeds or fails), and left 0
+ * when the caller must fall back to the sequential scan. */
+static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
+                                      size_t src_size,
+                                      const zgec_frame_header *fh,
+                                      const zgec_footer *f, size_t scan_end,
+                                      size_t n_workers, int *took,
+                                      uint8_t **dst, size_t *dst_size)
+{
+    uint32_t nblk = f->block_count;
+    size_t *off = NULL;
+    size_t *sz = NULL;
+    uint8_t *out = NULL;
+    zgec_decoder **ws = NULL;
+    zgec_dec_block_job *jobs = NULL;
+    zgec_mu mu;
+    uint32_t next = 0;
+    uint32_t err_idx = nblk;
+    zgec_err werr = ZGEC_OK;
+    zgec_err err = ZGEC_OK;
+    uint64_t total = 0;
+    uint32_t done = 0;
+    size_t off_rec;
+    size_t t;
+    size_t inner;
+    int mu_ok = 0;
+
+    *took = 0;
+    off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
+    sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
+    if (off == NULL || sz == NULL) {
+        err = ZGEC_ERR_NOMEM;
+        goto done;
+    }
+
+    /* Pass 1: walk the records exactly as the sequential scan does, but
+     * only to validate the tiling and size every block; no payload is
+     * decoded here. */
+    off_rec = 32u;
+    while (off_rec + 24u <= scan_end) {
+        zgec_record_header rh;
+        size_t rec_size;
+        err = zgec_record_header_parse(&rh, src + off_rec, fh);
+        if (err != ZGEC_OK) goto done;
+        if ((uint64_t)off_rec + 24u + (uint64_t)rh.payload_size >
+            (uint64_t)scan_end) {
+            err = ZGEC_ERR_TRUNCATED; /* V8 */
+            goto done;
+        }
+        rec_size = 24u + (size_t)rh.payload_size;
+        if ((rh.rflags & ZGEC_RFLAG_FILTERED) != 0 &&
+            rh.record_type != ZGEC_REC_COMPRESSED) {
+            err = ZGEC_ERR_RESERVED; /* V11 */
+            goto done;
+        }
+        if (rh.record_type >= ZGEC_REC_SKIPPABLE) {
+            /* Skippable: ignored via payload_size. */
+        } else if (rh.record_type == ZGEC_REC_DICT) {
+            /* Embedded dictionary: the sequential scan validates it
+             * exhaustively (4.4), so hand the whole frame over to it. */
+            goto done;
+        } else if (rh.record_type == ZGEC_REC_RAW ||
+                   rh.record_type == ZGEC_REC_RLE) {
+            if (rh.record_type == ZGEC_REC_RAW &&
+                rh.payload_size != rh.raw_size) {
+                err = ZGEC_ERR_RECORD_SIZE;
+                goto done;
+            }
+            if (rh.record_type == ZGEC_REC_RLE && rh.payload_size != 1u) {
+                err = ZGEC_ERR_RECORD_SIZE;
+                goto done;
+            }
+            if (dec_check_raw_size(d, fh->block_log2, rh.raw_size) !=
+                ZGEC_OK) {
+                err = ZGEC_ERR_BLOCK_SIZE;
+                goto done;
+            }
+            if ((fh->flags & ZGEC_FLAG_BLOCK_CHECKSUMS) != 0 &&
+                (rh.rflags & ZGEC_RFLAG_HAS_CHECKSUM) == 0) {
+                err = ZGEC_ERR_CHECKSUM; /* V10 */
+                goto done;
+            }
+        } else if (rh.record_type == ZGEC_REC_COMPRESSED) {
+            if (rh.lit_ref_depth > 0 && d->level == ZGEC_LEVEL_CORE) {
+                err = ZGEC_ERR_LITREF_EXPORT; /* V9 */
+                goto done;
+            }
+            if ((fh->flags & ZGEC_FLAG_BLOCK_CHECKSUMS) != 0 &&
+                (rh.rflags & ZGEC_RFLAG_HAS_CHECKSUM) == 0) {
+                err = ZGEC_ERR_CHECKSUM; /* V10 */
+                goto done;
+            }
+        } else {
+            err = ZGEC_ERR_RECORD_TYPE; /* 0x04..0x7F reserved */
+            goto done;
+        }
+        if (rh.record_type < ZGEC_REC_SKIPPABLE &&
+            rh.record_type != ZGEC_REC_DICT) {
+            if (done >= nblk) {
+                err = ZGEC_ERR_CONTENT_SIZE;
+                goto done;
+            }
+            /* The footer index must agree with the record order, since
+             * each worker locates its record through that index. */
+            if (f->blocks[done].offset != (uint64_t)off_rec) {
+                err = ZGEC_ERR_TRUNCATED;
+                goto done;
+            }
+            sz[done] = (size_t)rh.raw_size;
+            off[done] = (size_t)total;
+            total += (uint64_t)rh.raw_size;
+            if (total > (uint64_t)SIZE_MAX) {
+                err = ZGEC_ERR_OUTPUT_SIZE;
+                goto done;
+            }
+            done++;
+        }
+        off_rec += rec_size;
+    }
+    if (off_rec != scan_end) {
+        err = ZGEC_ERR_TRUNCATED; /* V8 */
+        goto done;
+    }
+    if (done != nblk) {
+        err = ZGEC_ERR_CONTENT_SIZE;
+        goto done;
+    }
+    if ((fh->flags & ZGEC_FLAG_CONTENT_SIZE) != 0 &&
+        total != fh->content_size) {
+        err = ZGEC_ERR_CONTENT_SIZE;
+        goto done;
+    }
+    if (fh->block_count != 0 && nblk != fh->block_count) {
+        err = ZGEC_ERR_BLOCK_SIZE;
+        goto done;
+    }
+    if (f->content_size != total) {
+        err = ZGEC_ERR_CONTENT_SIZE;
+        goto done;
+    }
+
+    out = (uint8_t *)zgec_alloc(total ? (size_t)total : 1u, 64);
+    if (out == NULL) {
+        err = ZGEC_ERR_NOMEM;
+        goto done;
+    }
+
+    /* Pass 2: one worker per block, each serial inside its block. */
+    if (n_workers > (size_t)nblk) n_workers = (size_t)nblk;
+    {
+        size_t want = (d->limits.n_threads > 0) ? (size_t)d->limits.n_threads
+                                                : (size_t)zgec_dec_cpu_count();
+        inner = (want > n_workers) ? (want / n_workers) : 1u;
+        if (inner < 1u) inner = 1u;
+    }
+    ws = (zgec_decoder **)zgec_alloc(n_workers * sizeof(*ws),
+                                     _Alignof(zgec_decoder *));
+    jobs = (zgec_dec_block_job *)zgec_alloc(n_workers * sizeof(*jobs),
+                                            _Alignof(zgec_dec_block_job));
+    if (ws == NULL || jobs == NULL) {
+        err = ZGEC_ERR_NOMEM;
+        goto done;
+    }
+    memset(ws, 0, n_workers * sizeof(*ws));
+    for (t = 0; t < n_workers; t++) {
+        ws[t] = dec_block_worker_create(d, (int)inner);
+        if (ws[t] == NULL) {
+            err = ZGEC_ERR_NOMEM;
+            goto done;
+        }
+    }
+    zgec_mu_init(&mu);
+    if (mu.ok == 0) {
+        err = ZGEC_ERR_NOMEM;
+        goto done;
+    }
+    mu_ok = 1;
+    for (t = 0; t < n_workers; t++) {
+        jobs[t].w = ws[t];
+        jobs[t].src = src;
+        jobs[t].src_size = src_size;
+        jobs[t].fh = fh;
+        jobs[t].f = f;
+        jobs[t].off = off;
+        jobs[t].sz = sz;
+        jobs[t].out = out;
+        jobs[t].nblk = nblk;
+        jobs[t].mu = &mu;
+        jobs[t].next = &next;
+        jobs[t].err = &werr;
+        jobs[t].err_idx = &err_idx;
+    }
+    *took = 1;
+    zgec_dec_blocks_spawn(jobs, n_workers);
+    if (werr != ZGEC_OK) {
+        err = werr;
+        goto done;
+    }
+    *dst = out;
+    *dst_size = (size_t)total;
+    out = NULL;
+
+done:
+    if (mu_ok != 0) zgec_mu_destroy(&mu);
+    if (ws != NULL) {
+        for (t = 0; t < n_workers && ws != NULL; t++) {
+            if (ws[t] != NULL) zgec_decoder_destroy(ws[t]);
+        }
+    }
+    zgec_free(ws);
+    zgec_free(jobs);
+    zgec_free(off);
+    zgec_free(sz);
+    zgec_free(out);
+    return err;
+}
+
 zgec_err zgec_decode_frame(zgec_decoder *d,
                             const uint8_t *src, size_t src_size,
                             uint8_t **dst, size_t *dst_size)
@@ -2277,6 +2654,21 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                                   trailer.footer_size) == ZGEC_OK) {
                 have_footer = 1;
                 scan_end = (size_t)trailer.footer_offset;
+            }
+        }
+    }
+
+    /* Block-parallel decode (10.6). Falls back to the scan below when the
+     * frame carries embedded dictionaries or has only one block. */
+    if (have_footer && footer.block_count > 0u) {
+        size_t nw = dec_resolve_workers(d, (size_t)footer.block_count);
+        if (nw > 1u) {
+            int took = 0;
+            err = zgec_dec_frame_blocks(d, src, src_size, &fh, &footer,
+                                        scan_end, nw, &took, dst, dst_size);
+            if (took != 0) {
+                zgec_footer_free(&footer);
+                return err;
             }
         }
     }
@@ -2645,11 +3037,30 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
 
 /* ---- random access (section 4.6) ---- */
 
+/* Block output goes to the caller's buffer when one is supplied and large
+ * enough (the block-parallel frame path, where each worker writes straight
+ * into its slice of the frame output), otherwise to the decoder's own
+ * scratch buffer as for a single random-access read. */
+static uint8_t *dec_block_dst(zgec_decoder *d, uint8_t *ovr, size_t cap,
+                              size_t need)
+{
+    if (ovr != NULL && cap >= need) return ovr;
+    if (d->block_buf_cap < need) {
+        uint8_t *nb = (uint8_t *)zgec_alloc(need ? need : 1, 64);
+        if (!nb) return NULL;
+        zgec_free(d->block_buf);
+        d->block_buf = nb;
+        d->block_buf_cap = need;
+    }
+    return d->block_buf;
+}
+
 static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
                                      size_t src_size,
                                      const zgec_frame_header *fh,
                                      const zgec_footer *f,
                                      const zgec_footer_block_entry *be,
+                                     uint8_t *ovr, size_t ovr_cap,
                                      const uint8_t **rdst, size_t *rsz)
 {
     const uint8_t *rh;
@@ -2682,45 +3093,43 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
         return ZGEC_ERR_RESERVED;
     }
 
+    /* V10: when the frame announces block checksums, every block record
+     * MUST carry one. Checked here so the random-access and block-parallel
+     * paths enforce it exactly as the sequential scan does. */
+    if ((fh->flags & ZGEC_FLAG_BLOCK_CHECKSUMS) != 0 &&
+        (rec.rflags & ZGEC_RFLAG_HAS_CHECKSUM) == 0) {
+        return ZGEC_ERR_CHECKSUM;
+    }
+
     if (rec.record_type == ZGEC_REC_RAW) {
+        uint8_t *bp;
         if (rec.payload_size != rec.raw_size) return ZGEC_ERR_RECORD_SIZE;
         if (dec_check_raw_size(d, fh->block_log2, rec.raw_size) != ZGEC_OK)
             return ZGEC_ERR_BLOCK_SIZE;
-        if (d->block_buf_cap < (size_t)rec.raw_size) {
-            uint8_t *nb = (uint8_t *)zgec_alloc(
-                rec.raw_size ? (size_t)rec.raw_size : 1, 64);
-            if (!nb) return ZGEC_ERR_NOMEM;
-            zgec_free(d->block_buf);
-            d->block_buf = nb;
-            d->block_buf_cap = (size_t)rec.raw_size;
-        }
-        if (rec.raw_size > 0) memcpy(d->block_buf, payload, rec.raw_size);
+        bp = dec_block_dst(d, ovr, ovr_cap, (size_t)rec.raw_size);
+        if (bp == NULL) return ZGEC_ERR_NOMEM;
+        if (rec.raw_size > 0) memcpy(bp, payload, rec.raw_size);
         if ((rec.rflags & ZGEC_RFLAG_HAS_CHECKSUM) != 0) {
-            uint32_t crc = zgec_crc32c(d->block_buf, rec.raw_size, 0u);
+            uint32_t crc = zgec_crc32c(bp, rec.raw_size, 0u);
             if (crc != rec.checksum) return ZGEC_ERR_CHECKSUM; /* V10 */
         }
-        *rdst = d->block_buf;
+        *rdst = bp;
         *rsz = (size_t)rec.raw_size;
         return ZGEC_OK;
     }
     if (rec.record_type == ZGEC_REC_RLE) {
+        uint8_t *bp;
         if (rec.payload_size != 1) return ZGEC_ERR_RECORD_SIZE;
         if (dec_check_raw_size(d, fh->block_log2, rec.raw_size) != ZGEC_OK)
             return ZGEC_ERR_BLOCK_SIZE;
-        if (d->block_buf_cap < (size_t)rec.raw_size) {
-            uint8_t *nb = (uint8_t *)zgec_alloc(
-                rec.raw_size ? (size_t)rec.raw_size : 1, 64);
-            if (!nb) return ZGEC_ERR_NOMEM;
-            zgec_free(d->block_buf);
-            d->block_buf = nb;
-            d->block_buf_cap = (size_t)rec.raw_size;
-        }
-        memset(d->block_buf, payload[0], (size_t)rec.raw_size);
+        bp = dec_block_dst(d, ovr, ovr_cap, (size_t)rec.raw_size);
+        if (bp == NULL) return ZGEC_ERR_NOMEM;
+        memset(bp, payload[0], (size_t)rec.raw_size);
         if ((rec.rflags & ZGEC_RFLAG_HAS_CHECKSUM) != 0) {
-            uint32_t crc = zgec_crc32c(d->block_buf, rec.raw_size, 0u);
+            uint32_t crc = zgec_crc32c(bp, rec.raw_size, 0u);
             if (crc != rec.checksum) return ZGEC_ERR_CHECKSUM; /* V10 */
         }
-        *rdst = d->block_buf;
+        *rdst = bp;
         *rsz = (size_t)rec.raw_size;
         return ZGEC_OK;
     }
@@ -2865,21 +3274,17 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
     }
     zgec_free(litref);
     if (e != ZGEC_OK) return e;
-    if (d->block_buf_cap < ba->raw_size) {
-        uint8_t *nb = (uint8_t *)zgec_alloc(ba->raw_size ? ba->raw_size : 1,
-                                           64);
-        if (!nb) {
+    {
+        uint8_t *bp = dec_block_dst(d, ovr, ovr_cap, ba->raw_size);
+        if (bp == NULL) {
             zgec_block_arrays_free(ba);
             return ZGEC_ERR_NOMEM;
         }
-        zgec_free(d->block_buf);
-        d->block_buf = nb;
-        d->block_buf_cap = ba->raw_size;
+        if (ba->raw_size > 0) memcpy(bp, ba->out, ba->raw_size);
+        *rsz = ba->raw_size;
+        zgec_block_arrays_free(ba);
+        *rdst = bp;
     }
-    if (ba->raw_size > 0) memcpy(d->block_buf, ba->out, ba->raw_size);
-    *rsz = ba->raw_size;
-    zgec_block_arrays_free(ba);
-    *rdst = d->block_buf;
     return ZGEC_OK;
 }
 
@@ -2931,7 +3336,7 @@ zgec_err zgec_decode_block_index(zgec_decoder *d,
         return ZGEC_ERR_BLOCK_SIZE;
     }
     e = decode_block_record(d, src, src_size, &fh, &f,
-                            &f.blocks[block_index], dst, dst_size);
+                            &f.blocks[block_index], NULL, 0, dst, dst_size);
     zgec_footer_free(&f);
     return e;
 }
