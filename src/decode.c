@@ -185,10 +185,14 @@ static void seg_tables_init(seg_tables *t)
 
 static void seg_tables_free(seg_tables *t)
 {
+    int i;
     if (!t) return;
-    for (int i = 0; i < 3; i++) {
-        if (i < t->n_ll && t->ll[i]) zgec_fse_free_dec(t->ll[i]);
-        if (i < t->n_of && t->of[i]) zgec_fse_free_dec(t->of[i]);
+    /* Free by pointer, not by count: n_ll/n_of are set only after the
+     * whole NEW loop succeeds, so a mid-loop failure would otherwise
+     * leak the tables built so far. RLE slots hold NULL, init is zero. */
+    for (i = 0; i < 3; i++) {
+        if (t->ll[i]) zgec_fse_free_dec(t->ll[i]);
+        if (t->of[i]) zgec_fse_free_dec(t->of[i]);
     }
     if (t->ml) zgec_fse_free_dec(t->ml);
     zgec_free(t->lit);
@@ -201,6 +205,10 @@ static zgec_fse_dec_table *fse_clone(const zgec_fse_dec_table *s)
     size_t ts;
     zgec_fse_dec_table *t;
     if (!s) return NULL;
+    /* Clamp corrupt accuracy logs before the shift/alloc below: without
+     * this a corrupt al overflows 1<<al or drives a huge allocation. */
+    if (s->al < ZGEC_MIN_AL || s->al > ZGEC_MAX_AL) return NULL;
+    if (s->nsym <= 0 || s->nsym > ZGEC_NSYM_LIT) return NULL;
     ds = sizeof(zgec_fse_dec_table) + (size_t)s->nsym * sizeof(int);
     ts = ((size_t)1 << (unsigned)s->al) * sizeof(zgec_fse_dec_entry);
     t = (zgec_fse_dec_table *)zgec_alloc(ds + ts, _Alignof(zgec_fse_dec_table));
@@ -603,6 +611,15 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
     pos += n;
     h->header_size = pos;
 
+    /* Early V8: no stream may claim more than the segment itself holds.
+     * Exact tiling is re-checked by the caller; this fails fast on
+     * absurd sizes without changing the tiling error below. */
+    if ((uint64_t)h->lit_size > (uint64_t)size ||
+        (uint64_t)h->ll_size > (uint64_t)size ||
+        (uint64_t)h->ml_size > (uint64_t)size ||
+        (uint64_t)h->of_size > (uint64_t)size)
+        return ZGEC_ERR_STREAM_SIZE;
+
     if (h->n_seq == 0) {
         if (h->ll_size != 0 || h->ml_size != 0 || h->of_size != 0)
             return ZGEC_ERR_STREAM_SIZE; /* V8 */
@@ -621,32 +638,13 @@ static zgec_err build_new_fse(zgec_fse_dec_table **out, const uint8_t **pp,
     int al = 0;
     size_t n;
     zgec_err e;
-    int want;
-    if (need_lit) {
-        e = desc_peek_al(*pp, *rem, 1, &al);
-        if (e != ZGEC_OK) return e;
-        want = ZGEC_NSYM_LIT;
-    } else {
-        e = desc_peek_al(*pp, *rem, 0, &al);
-        if (e != ZGEC_OK) return e;
-        want = max_nsym;
-    }
-    n = zgec_fse_read_counts(counts, &nsym, &al, want, *pp, *rem);
+    /* Literal tables always go through build_new_rans; the old need_lit
+     * path built a rANS table only to discard it, so reject it outright. */
+    if (need_lit) return ZGEC_ERR_TABLE_MODE;
+    e = desc_peek_al(*pp, *rem, 0, &al);
+    if (e != ZGEC_OK) return e;
+    n = zgec_fse_read_counts(counts, &nsym, &al, max_nsym, *pp, *rem);
     if (n == 0) return ZGEC_ERR_FSE_COUNTS; /* V6 */
-    if (need_lit) {
-        zgec_rans_dec_table *rt;
-        if (al != ZGEC_LIT_AL) return ZGEC_ERR_FSE_AL;
-        (void)nsym;
-        rt = (zgec_rans_dec_table *)zgec_alloc(sizeof(*rt), _Alignof(zgec_rans_dec_table));
-        if (!rt) return ZGEC_ERR_NOMEM;
-        e = zgec_rans_build_dec(rt, counts);
-        if (e != ZGEC_OK) { zgec_free(rt); return e; } /* V6 sum check */
-        /* rans table returned via out is a lie; caller uses lit path */
-        zgec_free(rt);
-        *pp += n;
-        *rem -= n;
-        return ZGEC_OK;
-    }
     if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL; /* V6 */
     e = zgec_fse_build_dec(out, counts, ZGEC_NSYM_SEQ, al); /* V6 sum check */
     if (e != ZGEC_OK) return e;
@@ -955,6 +953,15 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
 
 /* ---- Phase A: decode one segment (section 10.2) ---- */
 
+/* Centralised n_lit + slack guard: n_lit is a u32 (<= 0xFFFFFFFF) and
+ * vb_total is capped at 0xFFFFFFFF, which keeps n_lit + ZGEC_LIT_SLACK
+ * in-bounds on 64-bit; on 32-bit SIZE_MAX == 0xFFFFFFFF so the addition
+ * itself could wrap. Every n_lit + SLACK allocation goes through this. */
+static int lit_buf_fits(size_t n_lit)
+{
+    return n_lit <= SIZE_MAX - (size_t)ZGEC_LIT_SLACK;
+}
+
 /* Streams + validation for one segment. The header is already parsed
  * (*hp) and the tables already built (*cur, serial pre-pass); only
  * *seg is written while *hp and *cur stay read-only, so concurrent calls
@@ -980,6 +987,7 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     uint64_t tail = 0;
     size_t i = 0;
     uint8_t *runstart = NULL;
+    int need_rs = 0;
     uint32_t rep0 = 1;
     uint32_t rep1 = 4;
     uint32_t rep2 = 8;
@@ -988,6 +996,7 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         return ZGEC_ERR_INVAL;
     h = *hp; /* shallow copy; class_map stays borrowed, read-only */
     if (h.k > 1 && h.class_map == NULL) return ZGEC_ERR_INTERNAL;
+    need_rs = (h.k > 1 && h.lit_coder != 0);
     memset(seg, 0, sizeof(*seg));
 
     /* V8: streams must tile the segment exactly. */
@@ -1018,6 +1027,14 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         }
     }
     if (seg->n_lit > 0) {
+        if (!lit_buf_fits(seg->n_lit)) {
+            zgec_free(seg->ll);
+            zgec_free(seg->ml);
+            zgec_free(seg->of);
+            zgec_free(seg->rep0_before);
+            seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
+            return ZGEC_ERR_NOMEM;
+        }
         seg->lit = (uint8_t *)zgec_alloc(seg->n_lit + ZGEC_LIT_SLACK, 64);
         if (!seg->lit) {
             zgec_free(seg->ll);
@@ -1115,9 +1132,12 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     }
 
     /* Prefix sums of LL + run-start bitmap (9.3), incl. tail bit.
-     * runstart is non-NULL exactly when n_lit > 0; every index is
-     * range-checked before use (never NULL + offset). */
-    if (seg->n_lit > 0) {
+     * runstart is non-NULL exactly when the rANS context path needs it
+     * (k > 1 with a coded literal stream); for k <= 1 or raw literals
+     * rans_decode takes NULL and the bitmap would only burn memory
+     * traffic, so the allocation (and its writes) are skipped there.
+     * Every index remains range-checked before use. */
+    if (need_rs && seg->n_lit > 0) {
         runstart = (uint8_t *)zgec_alloc(seg->n_lit, 1);
         if (!runstart) return ZGEC_ERR_NOMEM;
         memset(runstart, 0, seg->n_lit);
@@ -1134,11 +1154,17 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         }
         if (seg->ll[i] > 0) {
             size_t start = (size_t)sum_ll - (size_t)seg->ll[i];
-            if (runstart == NULL || start >= seg->n_lit) {
+            if (start >= seg->n_lit) {
                 zgec_free(runstart);
                 return ZGEC_ERR_LL_SUM;
             }
-            runstart[start] = 1;
+            if (need_rs) {
+                if (runstart == NULL) {
+                    zgec_free(runstart);
+                    return ZGEC_ERR_INTERNAL;
+                }
+                runstart[start] = 1;
+            }
         }
     }
     if (sum_ll > (uint64_t)seg->n_lit) {
@@ -1147,11 +1173,17 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     }
     tail = (uint64_t)seg->n_lit - sum_ll;
     if (tail > 0) {
-        if (runstart == NULL || (size_t)sum_ll >= seg->n_lit) {
+        if ((uint64_t)sum_ll >= (uint64_t)seg->n_lit) {
             zgec_free(runstart);
             return ZGEC_ERR_LL_SUM;
         }
-        runstart[(size_t)sum_ll] = 1; /* tail run start (9.3) */
+        if (need_rs) {
+            if (runstart == NULL) {
+                zgec_free(runstart);
+                return ZGEC_ERR_LL_SUM;
+            }
+            runstart[(size_t)sum_ll] = 1; /* tail run start (9.3) */
+        }
     }
 
     /* Literal stream (section 9): raw memcpy or rANS; sub stays as Z. */
@@ -1395,16 +1427,24 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
  * stay byte at a time, because the source can run into the bytes this
  * match is itself producing. src is the VB position of the match; it is
  * never below the virtual buffer because V2 checked off <= Ld + Ll + pos. */
-static void exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
-                        size_t raw_size)
+static zgec_err exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
+                           size_t raw_size, size_t LdLl)
 {
     size_t i = 0;
-    uint8_t *d = dst + pos;
-    const uint8_t *src = d - off;
-    if (len == 0) return;
+    uint8_t *d;
+    const uint8_t *src;
+    if (len == 0) return ZGEC_OK;
+    if (off < 1) return ZGEC_ERR_OFFSET;
+    /* Defensive re-validation (Phase A proved all of this): without these
+     * the pointer arithmetic below is UB before any byte is touched. */
+    if (len > raw_size || pos > raw_size - len) return ZGEC_ERR_RAW_LEN;
+    if ((uint64_t)off > (uint64_t)LdLl + (uint64_t)pos)
+        return ZGEC_ERR_OFFSET;
+    d = dst + pos; /* pos + len <= raw_size: stays inside OUT */
+    src = d - off; /* off <= LdLl + pos: at or after the VB start */
     if (raw_size > 64 && pos + len > raw_size - 64) {
         for (i = 0; i < len; i++) d[i] = src[i]; /* safe scalar tail */
-        return;
+        return ZGEC_OK;
     }
     if (off >= 8) {
         if (len >= 8) {
@@ -1413,20 +1453,23 @@ static void exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
                 i += 8;
             }
             memcpy(d + len - 8, src + len - 8, 8); /* within [0,len) */
-            return;
+            return ZGEC_OK;
         }
         if (len >= 4) {
             memcpy(d, src, 4);
             memcpy(d + len - 4, src + len - 4, 4);
-            return;
+            return ZGEC_OK;
         }
     }
     for (i = 0; i < len; i++) d[i] = src[i];
+    return ZGEC_OK;
 }
 
 static zgec_err exec_block(zgec_block_arrays *ba)
 {
-    size_t out_pos = 0;
+    /* u64 accumulators: on 32-bit a size_t sum_ll could wrap past the
+     * >n_lit check, and out_pos arithmetic must not wrap either. */
+    uint64_t out_pos = 0;
     size_t LdLl;
     size_t s;
     if (ba == NULL || (ba->n_seg > 0 && ba->segs == NULL)) return ZGEC_ERR_INVAL;
@@ -1439,53 +1482,62 @@ static zgec_err exec_block(zgec_block_arrays *ba)
          * advance is range-checked (no NULL + offset, no overrun). */
         const uint8_t *lit_cur = seg->lit;
         size_t lit_rem = seg->n_lit;
-        size_t sum_ll = 0;
-        size_t tail = 0;
+        uint64_t sum_ll = 0;
+        uint64_t tail = 0;
         size_t j;
         if (seg->n_lit > 0 && lit_cur == NULL) return ZGEC_ERR_INTERNAL;
         if (seg->n_seq > 0 &&
             (seg->ll == NULL || seg->ml == NULL || seg->of == NULL ||
-             seg->rep0_before == NULL))
+              seg->rep0_before == NULL))
             return ZGEC_ERR_INTERNAL;
         for (j = 0; j < seg->n_seq; j++) {
             uint32_t ll = seg->ll[j];
             uint32_t ml = seg->ml[j];
             uint32_t off = seg->of[j];
+            zgec_err me;
             if (off < 1) return ZGEC_ERR_OFFSET;
-            sum_ll += (size_t)ll;
-            if (sum_ll > seg->n_lit) return ZGEC_ERR_LL_SUM;
+            sum_ll += (uint64_t)ll;
+            if (sum_ll > (uint64_t)seg->n_lit) return ZGEC_ERR_LL_SUM;
+            if (out_pos + (uint64_t)ll + (uint64_t)ml >
+                (uint64_t)ba->raw_size)
+                return ZGEC_ERR_RAW_LEN;
             if (ll > 0) {
                 if (lit_cur == NULL || (size_t)ll > lit_rem)
                     return ZGEC_ERR_LL_SUM;
                 if (seg->lit_form == 0)
-                    exec_literals_plain(ba->out, lit_cur, (size_t)ll, out_pos,
-                                        ba->raw_size);
+                    exec_literals_plain(ba->out, lit_cur, (size_t)ll,
+                                        (size_t)out_pos, ba->raw_size);
                 else
                     exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)ll,
-                                      seg->rep0_before[j], out_pos, LdLl);
+                                      seg->rep0_before[j], (size_t)out_pos,
+                                      LdLl);
                 lit_cur += (size_t)ll; /* ll <= lit_rem: stays in-bounds */
                 lit_rem -= (size_t)ll;
             }
-            out_pos += (size_t)ll;
-            exec_match(ba->out, (size_t)off, (size_t)ml, out_pos,
-                       ba->raw_size);
-            out_pos += (size_t)ml;
+            out_pos += (uint64_t)ll;
+            me = exec_match(ba->out, (size_t)off, (size_t)ml,
+                            (size_t)out_pos, ba->raw_size, LdLl);
+            if (me != ZGEC_OK) return me;
+            out_pos += (uint64_t)ml;
         }
         /* Tail literals always copied (n_lit - sumLL). */
-        if (sum_ll > seg->n_lit) return ZGEC_ERR_LL_SUM;
-        tail = seg->n_lit - sum_ll;
+        if (sum_ll > (uint64_t)seg->n_lit) return ZGEC_ERR_LL_SUM;
+        tail = (uint64_t)seg->n_lit - sum_ll;
         if (tail > 0) {
-            if (lit_cur == NULL || tail > lit_rem) return ZGEC_ERR_LL_SUM;
+            if (out_pos + tail > (uint64_t)ba->raw_size)
+                return ZGEC_ERR_RAW_LEN;
+            if (lit_cur == NULL || (size_t)tail > lit_rem)
+                return ZGEC_ERR_LL_SUM;
             if (seg->lit_form == 0)
-                exec_literals_plain(ba->out, lit_cur, tail, out_pos,
-                                    ba->raw_size);
+                exec_literals_plain(ba->out, lit_cur, (size_t)tail,
+                                    (size_t)out_pos, ba->raw_size);
             else
-                exec_literals_sub(ba->vb, ba->out, lit_cur, tail,
-                                  seg->rep0_tail, out_pos, LdLl);
+                exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)tail,
+                                  seg->rep0_tail, (size_t)out_pos, LdLl);
             out_pos += tail;
         }
     }
-    if (out_pos != ba->raw_size) return ZGEC_ERR_RAW_LEN;
+    if (out_pos != (uint64_t)ba->raw_size) return ZGEC_ERR_RAW_LEN;
     return ZGEC_OK;
 }
 
@@ -1561,9 +1613,16 @@ static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
                              (LPVOID)&ranges[t], 0, NULL);
         if (hs[t] == NULL) zgec_phaseA_run_range(&ranges[t]); /* fallback */
     }
-    (void)WaitForMultipleObjects((DWORD)w, hs, TRUE, INFINITE);
-    for (t = 0; t < w; t++) {
-        if (hs[t] != NULL) (void)CloseHandle(hs[t]);
+    /* Compact out NULL handles before waiting: a NULL entry makes
+     * WaitForMultipleObjects fail immediately while the other threads
+     * are still writing, which would let Phase B start early. */
+    {
+        DWORD nv = 0;
+        for (t = 0; t < w; t++) {
+            if (hs[t] != NULL) hs[nv++] = hs[t];
+        }
+        if (nv > 0u) (void)WaitForMultipleObjects(nv, hs, TRUE, INFINITE);
+        for (t = 0; t < (size_t)nv; t++) (void)CloseHandle(hs[t]);
     }
     zgec_free(hs);
 #else
@@ -2071,7 +2130,16 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         }
         if (lit_len + (size_t)h.n_lit > lit_cap) {
             size_t nc = lit_len + (size_t)h.n_lit + 1024;
-            uint8_t *nb = (uint8_t *)zgec_alloc(nc ? nc : 1, 64);
+            uint8_t *nb;
+            /* lit_len + n_lit was checked above, but +1024 can still
+             * wrap to a small nc and cause a heap overflow below. */
+            if (nc < lit_len) {
+                zgec_free(ll);
+                zgec_free(runstart);
+                e = ZGEC_ERR_OUTPUT_SIZE;
+                goto efail;
+            }
+            nb = (uint8_t *)zgec_alloc(nc ? nc : 1, 64);
             if (!nb) {
                 zgec_free(ll);
                 zgec_free(runstart);
@@ -2178,6 +2246,10 @@ static zgec_err fetch_dict(zgec_decoder *d, const zgec_frame_header *fh,
                 hh = zgec_xxh64(d->ext[ei].data, d->ext[ei].size, 0);
                 if (hh != en->content_hash) return ZGEC_ERR_DICT_HASH; /* V9 */
             }
+            /* Without a footer any size > 4G would truncate into the u32
+             * raw_size below, under-allocating vb and defeating the V2
+             * off <= Ld + Ll + pos check. Reject it (V9). */
+            if (d->ext[ei].size > 0xFFFFFFFFu) return ZGEC_ERR_DICT_SIZE;
             nd = (zgec_dict *)zgec_alloc(sizeof(*nd), _Alignof(zgec_dict));
             if (!nd) return ZGEC_ERR_NOMEM;
             memset(nd, 0, sizeof(*nd));
@@ -2193,6 +2265,7 @@ static zgec_err fetch_dict(zgec_decoder *d, const zgec_frame_header *fh,
             nd->external = 1;
             nd->content_hash = zgec_xxh64(nd->data, d->ext[ei].size, 0);
             dec_cache_put(d, nd);
+            zgec_free(nd); /* put detached the buffer; the shell is ours */
             hit = dec_cache_get(d, dict_id);
             if (!hit) return ZGEC_ERR_NOMEM;
             *out = hit;
@@ -2233,6 +2306,7 @@ static zgec_err fetch_dict(zgec_decoder *d, const zgec_frame_header *fh,
         if (e != ZGEC_OK) return e;
         nd->dict_id = dict_id;
         dec_cache_put(d, nd);
+        zgec_free(nd); /* put detached the buffer; the shell is ours */
         hit = dec_cache_get(d, dict_id);
         if (!hit) return ZGEC_ERR_NOMEM;
         *out = hit;
@@ -2250,10 +2324,16 @@ static zgec_err fetch_dict(zgec_decoder *d, const zgec_frame_header *fh,
  * the dominant cost of a single-threaded decode of many small blocks.
  * Doubling bounds the total copied bytes to under twice the output. */
 static zgec_err frame_output_append(uint8_t **out, size_t *len, size_t *cap,
-                                     const uint8_t *data, size_t n)
+                                     const uint8_t *data, size_t n,
+                                     uint64_t max_total)
 {
     if (n == 0) return ZGEC_OK;
     if (*len + n < *len) return ZGEC_ERR_OUTPUT_SIZE;
+    /* Incremental total-limit enforcement (§13): many small blocks each
+     * passing the per-block check could otherwise exceed max_total
+     * unbounded before the final content-size check runs. */
+    if (max_total != 0u && (uint64_t)*len + (uint64_t)n > max_total)
+        return ZGEC_ERR_NOMEM;
     if (*len + n > *cap) {
         size_t need = *len + n;
         size_t nc = (*cap != 0) ? *cap : (size_t)1u << 20;
@@ -2271,6 +2351,25 @@ static zgec_err frame_output_append(uint8_t **out, size_t *len, size_t *cap,
     memcpy(*out + *len, data, n);
     *len += n;
     return ZGEC_OK;
+}
+
+/* Adopt an already-allocated literal buffer into the history without
+ * copying it again (the COMPRESSED path builds the buffer anyway). */
+static void hist_push_owned(zgec_decoder *d, uint8_t *lit, size_t n, int ok)
+{
+    unsigned slot = (unsigned)(d->hist_n % 3u);
+    zgec_free(d->hist_lit[slot]);
+    if (lit != NULL && n > 0) {
+        d->hist_lit[slot] = lit;
+        d->hist_sz[slot] = n;
+        d->hist_ok[slot] = ok;
+    } else {
+        zgec_free(lit);
+        d->hist_lit[slot] = NULL;
+        d->hist_sz[slot] = 0;
+        d->hist_ok[slot] = ok;
+    }
+    d->hist_n++;
 }
 
 static void hist_push(zgec_decoder *d, const uint8_t *lit, size_t n, int ok)
@@ -2399,9 +2498,15 @@ static void zgec_dec_blocks_spawn(zgec_dec_block_job *jobs, size_t w)
                              (LPVOID)&jobs[t], 0, NULL);
         if (hs[t] == NULL) zgec_dec_blocks_run(&jobs[t]); /* fallback */
     }
-    (void)WaitForMultipleObjects((DWORD)w, hs, TRUE, INFINITE);
-    for (t = 0; t < w; t++) {
-        if (hs[t] != NULL) (void)CloseHandle(hs[t]);
+    /* Compact out NULL handles: waiting on a NULL entry fails at once
+     * while live workers are still writing into the frame output. */
+    {
+        DWORD nv = 0;
+        for (t = 0; t < w; t++) {
+            if (hs[t] != NULL) hs[nv++] = hs[t];
+        }
+        if (nv > 0u) (void)WaitForMultipleObjects(nv, hs, TRUE, INFINITE);
+        for (t = 0; t < (size_t)nv; t++) (void)CloseHandle(hs[t]);
     }
     zgec_free(hs);
 #else
@@ -2538,6 +2643,20 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
                 err = ZGEC_ERR_LITREF_EXPORT; /* V9 */
                 goto done;
             }
+            /* Mirror the sequential path (decode_compressed): bound the
+             * segment count and the raw size up front so an oversize
+             * raw_size cannot pass Pass 1 and inflate total into a
+             * pre-decode OOM before workers reject it. */
+            if (rh.segment_count < 1u ||
+                rh.segment_count > ZGEC_MAX_SEGMENTS) {
+                err = ZGEC_ERR_SEGMENT_COUNT;
+                goto done;
+            }
+            if (dec_check_raw_size(d, fh->block_log2, rh.raw_size) !=
+                ZGEC_OK) {
+                err = ZGEC_ERR_BLOCK_SIZE;
+                goto done;
+            }
             if ((fh->flags & ZGEC_FLAG_BLOCK_CHECKSUMS) != 0 &&
                 (rh.rflags & ZGEC_RFLAG_HAS_CHECKSUM) == 0) {
                 err = ZGEC_ERR_CHECKSUM; /* V10 */
@@ -2589,6 +2708,13 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     }
     if (f->content_size != total) {
         err = ZGEC_ERR_CONTENT_SIZE;
+        goto done;
+    }
+    /* Frame-level total limit (§13): per-block checks alone cannot bound
+     * a frame of many small blocks. */
+    if (d != NULL && d->limits.max_total != 0u &&
+        total > (uint64_t)d->limits.max_total) {
+        err = ZGEC_ERR_NOMEM;
         goto done;
     }
 
@@ -2756,9 +2882,17 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
     if (have_footer && footer.content_size > 0u) {
         uint64_t bcap = dec_block_cap(fh.block_log2);
         if (bcap != 0u) {
-            uint64_t bound = bcap * (uint64_t)footer.block_count;
+            uint64_t bound;
             uint64_t want = footer.content_size;
+            uint64_t max_total = (uint64_t)d->limits.max_total;
+            /* bcap * block_count in u64 with an overflow guard. */
+            if (footer.block_count != 0u &&
+                bcap > UINT64_MAX / (uint64_t)footer.block_count)
+                bound = UINT64_MAX;
+            else
+                bound = bcap * (uint64_t)footer.block_count;
             if (want > bound) want = bound;
+            if (max_total != 0u && want > max_total) want = max_total;
             if (want > 0u && want <= (uint64_t)SIZE_MAX) {
                 out = (uint8_t *)zgec_alloc((size_t)want, 64);
                 if (out != NULL) out_cap = (size_t)want;
@@ -2821,7 +2955,8 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 }
             }
             err = frame_output_append(&out, &out_len, &out_cap, payload,
-                                      rh.raw_size);
+                                      rh.raw_size,
+                                      (uint64_t)d->limits.max_total);
             if (err != ZGEC_OK) {
                 zgec_free(out);
                 if (have_footer) zgec_footer_free(&footer);
@@ -2867,7 +3002,8 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 }
             }
             err = frame_output_append(&out, &out_len, &out_cap, tmp,
-                                      rh.raw_size);
+                                      rh.raw_size,
+                                      (uint64_t)d->limits.max_total);
             hist_push(d, tmp, rh.raw_size,
                       (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
             zgec_free(tmp);
@@ -2988,11 +3124,16 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 return err;
             }
             err = frame_output_append(&out, &out_len, &out_cap, ba->out,
-                                      ba->raw_size);
+                                      ba->raw_size,
+                                      (uint64_t)d->limits.max_total);
             if (err == ZGEC_OK) {
-                /* Save literal buffer for later litref predecessors. */
+                /* Save literal buffer for later litref predecessors.
+                 * The assembled buffer is adopted by the history
+                 * (no second copy). */
                 size_t tl = 0;
                 size_t s2;
+                int hexp = ((rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0) &&
+                           (exp_ok != 0);
                 for (s2 = 0; s2 < ba->n_seg; s2++)
                     tl += ba->segs[s2].n_lit;
                 if (tl > 0) {
@@ -3006,18 +3147,12 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                                        ba->segs[s2].n_lit);
                             qq += ba->segs[s2].n_lit;
                         }
-                        hist_push(d, lb, tl,
-                                  ((rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) !=
-                                   0) &&
-                                      (exp_ok != 0));
-                        zgec_free(lb);
+                        hist_push_owned(d, lb, tl, hexp);
                     } else {
                         hist_push(d, NULL, 0, 0);
                     }
                 } else {
-                    hist_push(d, NULL, 0,
-                              ((rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0) &&
-                                  (exp_ok != 0));
+                    hist_push(d, NULL, 0, hexp);
                 }
             }
             zgec_block_arrays_free(ba);
@@ -3082,6 +3217,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
             }
             nd->dict_id = rh.dict_id;
             dec_cache_put(d, nd);
+            zgec_free(nd); /* put detached the buffer; the shell is ours */
         } else {
             /* 0x04..0x7F reserved: reject. */
             zgec_free(out);
@@ -3232,102 +3368,132 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
     e = fetch_dict(d, fh, f, 1, rec.dict_id, src, src_size, &dict);
     if (e != ZGEC_OK) return e; /* V9 */
 
-    /* Literal references: export blocks b-D..b-1 (4.6 step 4, 6.3). */
+    /* Literal references: export blocks b-D..b-1 (4.6 step 4, 6.3).
+     * Each predecessor is exported once into a side buffer; the sizes
+     * are pre-summed so the result needs a single allocation and one
+     * copy pass (no per-predecessor realloc + re-copy). */
     if (rec.lit_ref_depth > 0) {
         uint32_t b;
         uint8_t k8;
+        uint8_t depth = rec.lit_ref_depth;
+        uint8_t *parts[ZGEC_MAX_LITREF_DEPTH];
+        size_t part_sz[ZGEC_MAX_LITREF_DEPTH];
         size_t total = 0;
-        size_t pp = 0;
+        size_t wpos = 0;
         if (d->level == ZGEC_LEVEL_CORE) return ZGEC_ERR_LITREF_EXPORT; /* V9 */
+        if (depth > ZGEC_MAX_LITREF_DEPTH) return ZGEC_ERR_LITREF_DEPTH;
         /* Find this block's index: caller passes it via be lookup. */
         b = 0;
         for (b = 0; b < f->block_count; b++) {
             if (f->blocks[b].offset == be->offset) break;
         }
         if (b >= f->block_count) return ZGEC_ERR_INTERNAL;
-        if ((uint32_t)rec.lit_ref_depth > b) return ZGEC_ERR_LITREF_DEPTH;
-        for (k8 = 0; k8 < rec.lit_ref_depth; k8++) {
-            uint32_t pb = b - (uint32_t)rec.lit_ref_depth + (uint32_t)k8;
+        if ((uint32_t)depth > b) return ZGEC_ERR_LITREF_DEPTH;
+        for (k8 = 0; k8 < depth; k8++) {
+            parts[k8] = NULL;
+            part_sz[k8] = 0;
+        }
+        for (k8 = 0; k8 < depth; k8++) {
+            uint32_t pb = b - (uint32_t)depth + (uint32_t)k8;
             const zgec_footer_block_entry *pe = &f->blocks[pb];
             const uint8_t *prh;
             zgec_record_header pr;
             const uint8_t *ppay;
             uint8_t *elb = NULL;
             size_t elsz = 0;
-            if (pe->offset + 24u > (uint64_t)src_size) return ZGEC_ERR_TRUNCATED;
+            uint8_t j8;
+            if (pe->offset + 24u > (uint64_t)src_size) {
+                e = ZGEC_ERR_TRUNCATED;
+                goto litref_fail;
+            }
             prh = src + (size_t)pe->offset;
             e = zgec_record_header_parse(&pr, prh, fh);
-            if (e != ZGEC_OK) return e;
+            if (e != ZGEC_OK) goto litref_fail;
             if (pe->offset + 24u + (uint64_t)pr.payload_size >
-                (uint64_t)src_size)
-                return ZGEC_ERR_TRUNCATED;
+                (uint64_t)src_size) {
+                e = ZGEC_ERR_TRUNCATED;
+                goto litref_fail;
+            }
             if ((pr.rflags & ZGEC_RFLAG_FILTERED) != 0) {
                 /* V11: a FILTERED block is not a literal-reference
                  * predecessor. */
-                zgec_free(litref);
-                return ZGEC_ERR_LITREF_EXPORT;
+                e = ZGEC_ERR_LITREF_EXPORT;
+                goto litref_fail;
             }
-            if ((pr.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0)
-                return ZGEC_ERR_LITREF_EXPORT; /* V9 */
+            if ((pr.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0) {
+                e = ZGEC_ERR_LITREF_EXPORT; /* V9 */
+                goto litref_fail;
+            }
             ppay = prh + 24;
             if (pr.record_type == ZGEC_REC_RAW) {
+                if (pr.payload_size != pr.raw_size) {
+                    e = ZGEC_ERR_RECORD_SIZE;
+                    goto litref_fail;
+                }
                 elsz = (size_t)pr.raw_size;
                 if (elsz > 0) {
                     elb = (uint8_t *)zgec_alloc(elsz, 64);
-                    if (!elb) return ZGEC_ERR_NOMEM;
+                    if (!elb) {
+                        e = ZGEC_ERR_NOMEM;
+                        goto litref_fail;
+                    }
                     memcpy(elb, ppay, elsz);
                 }
             } else if (pr.record_type == ZGEC_REC_RLE) {
+                if (pr.payload_size != 1u) {
+                    e = ZGEC_ERR_RECORD_SIZE;
+                    goto litref_fail;
+                }
                 elsz = (size_t)pr.raw_size;
                 if (elsz > 0) {
                     elb = (uint8_t *)zgec_alloc(elsz, 64);
-                    if (!elb) return ZGEC_ERR_NOMEM;
+                    if (!elb) {
+                        e = ZGEC_ERR_NOMEM;
+                        goto litref_fail;
+                    }
                     memset(elb, ppay[0], elsz);
                 }
             } else if (pr.record_type == ZGEC_REC_COMPRESSED) {
                 e = export_block_literals(ppay, (size_t)pr.payload_size,
                                           pr.segment_count, &elb, &elsz);
-                if (e != ZGEC_OK) {
-                    zgec_free(litref);
-                    return e;
-                }
+                if (e != ZGEC_OK) goto litref_fail;
                 if (elsz == 0) {
                     zgec_free(elb);
-                    elb = (uint8_t *)zgec_alloc(1, 64);
-                    if (!elb) {
-                        zgec_free(litref);
-                        return ZGEC_ERR_NOMEM;
-                    }
+                    elb = NULL;
                 }
             } else {
-                zgec_free(litref);
-                return ZGEC_ERR_RECORD_TYPE;
+                e = ZGEC_ERR_RECORD_TYPE;
+                goto litref_fail;
             }
             if (total + elsz < total) {
                 zgec_free(elb);
-                zgec_free(litref);
-                return ZGEC_ERR_OUTPUT_SIZE;
+                e = ZGEC_ERR_OUTPUT_SIZE;
+                goto litref_fail;
             }
-            if (elsz > 0) {
-                uint8_t *nb =
-                    (uint8_t *)zgec_alloc(total + elsz + 1, 64);
-                if (!nb) {
-                    zgec_free(elb);
-                    zgec_free(litref);
-                    return ZGEC_ERR_NOMEM;
-                }
-                if (total > 0) memcpy(nb, litref, total);
-                memcpy(nb + total, elb, elsz);
-                zgec_free(litref);
-                litref = nb;
-                total += elsz;
-            }
+            parts[k8] = elb;
+            part_sz[k8] = elsz;
+            total += elsz;
+            continue;
+litref_fail:
             zgec_free(elb);
+            for (j8 = 0; j8 < k8; j8++) zgec_free(parts[j8]);
+            return e;
+        }
+        if (total > 0) {
+            litref = (uint8_t *)zgec_alloc(total, 64);
+            if (!litref) {
+                for (k8 = 0; k8 < depth; k8++) zgec_free(parts[k8]);
+                return ZGEC_ERR_NOMEM;
+            }
+            for (k8 = 0; k8 < depth; k8++) {
+                if (part_sz[k8] > 0) {
+                    memcpy(litref + wpos, parts[k8], part_sz[k8]);
+                    wpos += part_sz[k8];
+                }
+                zgec_free(parts[k8]);
+            }
         }
         litref_len = total;
-        if (litref_len == 0) zgec_free(litref);
-        if (litref_len == 0) litref = NULL;
-        (void)pp;
     }
 
     {
