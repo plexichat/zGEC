@@ -8,12 +8,6 @@ static inline uint32_t zgec_frame_block_size(const zgec_frame_header *fh)
     return 1u << fh->block_log2;
 }
 
-/* Whether the frame advertises a footer+trailer (spec 4.1 HAS_FOOTER). */
-static inline int zgec_frame_has_footer(const zgec_frame_header *fh)
-{
-    return (fh->flags & ZGEC_FLAG_HAS_FOOTER) != 0u;
-}
-
 void zgec_frame_header_emit(uint8_t *buf, const zgec_frame_header *h)
 {
     zgec_wr32(buf, ZGEC_MAGIC_U32);

@@ -1,13 +1,18 @@
 /* Fuzz target: encoder/decoder round-trip, and decoder hardening.
  *
- * One core, two entry points:
+ * One core, two binaries, and no macro deciding between them:
  *
  *   zgec_fuzz            standalone and deterministic. Builds its own
  *                        inputs from a seeded xorshift64 PRNG, so it needs
  *                        no corpus and no build flags beyond the library.
- *   zgec_fuzz_libfuzzer  compiled with -DZGEC_FUZZ_LIBFUZZER and Clang's
+ *                        This file, plus fuzz_standalone_main.c, which is
+ *                        the only place `main` is defined.
+ *   zgec_fuzz_libfuzzer  this file on its own, with Clang's
  *                        -fsanitize=fuzzer,address,undefined. libFuzzer
- *                        supplies the bytes and searches them.
+ *                        supplies the bytes and searches them -- and it
+ *                        supplies `main` as well, which is why the
+ *                        standalone main lives in another file instead of
+ *                        behind a macro that every build has to remember.
  *
  * What it asserts (a failure is reported on stderr and turned into a
  * non-zero exit, or a libFuzzer crash):
@@ -445,7 +450,10 @@ static int fuzz_run_case(const uint8_t *data, size_t size)
 
 /* ---- entry points ---- */
 
-#ifdef ZGEC_FUZZ_LIBFUZZER
+/* libFuzzer's entry point. It is present in both shapes: the standalone
+ * harness simply never calls it. Nothing here defines main, so compiling
+ * this file alone and linking the libFuzzer runtime -- which brings its own
+ * main -- produces one definition of each entry point. */
 
 /* Declared before its definition so -Wmissing-prototypes stays quiet. */
 int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size);
@@ -460,7 +468,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
     return 0;
 }
 
-#else /* standalone */
+/* ---- standalone harness ---- */
 
 /* Synthesise a case payload: runs (RLE and long repeats), word soup (the
  * match finder's best case), incompressible bytes (RAW and filter paths),
@@ -521,7 +529,11 @@ static void fuzz_gen(uint8_t *buf, size_t n)
     }
 }
 
-int main(int argc, char **argv)
+/* The standalone entry point. main itself is in fuzz_standalone_main.c so
+ * that this file can be compiled on its own for libFuzzer. */
+int zgec_fuzz_standalone_main(int argc, char **argv);
+
+int zgec_fuzz_standalone_main(int argc, char **argv)
 {
     unsigned long long iterations = 20000ull;
     unsigned long long seed = 1ull;
@@ -569,5 +581,3 @@ int main(int argc, char **argv)
            g_cases, g_roundtrips, g_rejected, g_encode_failures, g_failures);
     return (g_failures != 0ull || g_encode_failures != 0ull) ? 1 : 0;
 }
-
-#endif /* ZGEC_FUZZ_LIBFUZZER */

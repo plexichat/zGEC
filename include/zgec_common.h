@@ -165,9 +165,15 @@ zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
 zgec_err zgec_filter_inverse(uint8_t *buf, size_t n,
                              unsigned mode, unsigned param);
 
-/* ---- little-endian helpers ---- */
+/* ---- little-endian helpers ----
+ * The shifts are done in a type the integer promotions leave alone, and
+ * the result is narrowed explicitly, because | promotes the two uint16_t
+ * halves to int: without the outer cast clang's -Wconversion reads the
+ * return as an int-to-uint16_t narrowing and fails a -Werror build. gcc
+ * happens not to warn there (it range-checks the expression), so this is
+ * the portable spelling. */
 static inline uint16_t zgec_rd16(const uint8_t *p) {
-    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+    return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8));
 }
 static inline uint32_t zgec_rd32(const uint8_t *p) {
     return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);

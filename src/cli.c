@@ -1,3 +1,4 @@
+#define _POSIX_C_SOURCE 200809L
 #include "zgec.h"
 
 #include <stdio.h>
@@ -15,7 +16,12 @@
 
 #define CLI_MAX_DICTS 4
 
-/* Monotonic wall clock, for the throughput line of a c/d/t run. */
+/* Monotonic wall clock, for the throughput line of a c/d/t run.
+ *
+ * CLOCK_MONOTONIC is POSIX, so glibc hides it under the -std=c11 this
+ * project builds with and the declaration above is what puts it back
+ * (macOS likewise, where it needs __DARWIN_C_FULL). It is harmless on
+ * Windows, which ignores the macro and takes the branch below. */
 #if defined(_WIN32)
 #include <windows.h>
 static double cli_now(void)

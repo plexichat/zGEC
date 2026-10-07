@@ -77,18 +77,20 @@ target_link_libraries(zgec_test_block PRIVATE zgec_core)
 add_executable(zgec_bench tests/bench.c)
 target_link_libraries(zgec_bench PRIVATE zgec_core)
 
-# Fuzz target: encoder/decoder round-trip plus decoder hardening. The
-# standalone build is deterministic and needs nothing but the library, so it
-# is always available; the libFuzzer entry point is the same source compiled
-# when the toolchain can link the sanitizer runtime.
-add_executable(zgec_fuzz tools/fuzz/fuzz_roundtrip.c)
+# Fuzz targets: encoder/decoder round-trip plus decoder hardening. Both
+# shapes build the same cases and differ in which files they compile rather
+# than in a macro a caller has to remember: the standalone harness adds the
+# deterministic main, and the libFuzzer binary is the cases alone because
+# the runtime supplies main itself.
+add_executable(zgec_fuzz
+    tools/fuzz/fuzz_roundtrip.c
+    tools/fuzz/fuzz_standalone_main.c)
 target_link_libraries(zgec_fuzz PRIVATE zgec_core)
 
-option(ZGEC_FUZZ_LIBFUZZER "Build the libFuzzer entry point (Clang)" OFF)
+option(ZGEC_FUZZ_LIBFUZZER "Also build the libFuzzer binary (Clang)" OFF)
 if(ZGEC_FUZZ_LIBFUZZER)
     add_executable(zgec_fuzz_libfuzzer tools/fuzz/fuzz_roundtrip.c)
     target_link_libraries(zgec_fuzz_libfuzzer PRIVATE zgec_core)
-    target_compile_definitions(zgec_fuzz_libfuzzer PRIVATE ZGEC_FUZZ_LIBFUZZER)
     target_compile_options(zgec_fuzz_libfuzzer PRIVATE
         -fsanitize=fuzzer,address,undefined
         -fno-omit-frame-pointer)

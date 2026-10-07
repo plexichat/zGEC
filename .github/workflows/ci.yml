@@ -4,11 +4,15 @@
 # a build failure: there is no separate "check for warnings" step to drift out
 # of sync with what the code is compiled with. -pedantic is part of that set.
 #
-# The fuzzer is built twice on purpose. The plain CMake target (`zgec_fuzz`) is
-# a deterministic random fuzzer and is part of the -Werror build above. The
-# sanitizer build is a direct clang invocation instead of the
-# -DZGEC_FUZZ_LIBFUZZER option, because a sanitizer build is not a style gate
-# and should not be able to fail on a warning.
+# The fuzzer is built twice on purpose. The plain CMake target (`zgec_fuzz`)
+# is a deterministic random fuzzer and is part of the -Werror build above; it
+# is fuzz_roundtrip.c plus fuzz_standalone_main.c, which is the only file
+# that defines main. The sanitizer build is a direct clang invocation instead
+# of the ZGEC_FUZZ_LIBFUZZER option, because a sanitizer build is not a style
+# gate and should not be able to fail on a warning. The command below
+# therefore compiles fuzz_roundtrip.c WITHOUT the standalone main: the cases
+# supply LLVMFuzzerTestOneInput and the runtime supplies main, so the link has
+# exactly one of each.
 
 name: ci
 
@@ -89,6 +93,9 @@ jobs:
           sudo apt-get install -y clang
 
       - name: Build with the sanitizers and libFuzzer
+        # No main here: fuzz_roundtrip.c has no main and the libFuzzer
+        # runtime provides one, so this links one definition of each entry
+        # point. Adding the standalone harness source here would collide.
         run: |
           clang -std=c11 -O1 -g -fno-omit-frame-pointer \
             -fsanitize=fuzzer,address,undefined \
