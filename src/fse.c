@@ -7,8 +7,22 @@
 
 void zgec_fb_init(zgec_fwd_bits *f, const uint8_t *p, size_t size)
 {
+    /* A NULL buffer is an empty stream, not "NULL + size": NULL + 0 is
+     * already an undefined pointer, and NULL + size lands on a bogus
+     * non-NULL end, after which the reader's `f->p < f->end` comparison
+     * succeeds and it dereferences NULL. Leaving p and end both NULL makes
+     * every subsequent read report a truncated stream, which is what an
+     * empty buffer is. The signature is fixed by zgec_fse.h, so this cannot
+     * report the invalid case; see fix.md entry 27.
+     *
+     * A non-NULL p still forms p + size unconditionally, so `size` must be
+     * the true length of the object p points at: a larger value forms the
+     * same out-of-range pointer, one branch later. The sibling reader
+     * zgec_lsbr carries a remaining count instead, which is what this would
+     * become if the signature allowed it (review finding 5). */
+    if (!f) return;
     f->p = p;
-    f->end = p + size;
+    f->end = (p == NULL) ? NULL : p + size;
     f->acc = 0;
     f->nacc = 0;
 }
@@ -41,6 +55,10 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
                              const int16_t *counts, int nsym, int al)
 {
     if (!out || !counts) return ZGEC_ERR_INVAL;
+    /* A failed build must not leave the caller holding whatever pointer it
+     * had before (fix.md entry 26), so the out-parameter is cleared before
+     * anything below can fail. */
+    *out = NULL;
     if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
     if (nsym <= 0 || nsym > 256) return ZGEC_ERR_INVAL;
     int S = 1 << al;
@@ -127,6 +145,13 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
     };
 
     if (!dec || !out) return ZGEC_ERR_INVAL;
+    *out = NULL;                        /* fix.md entry 26 */
+    /* Validate the table object before indexing it (fix.md entry 25): al
+     * bounds S below, nsym bounds the rows of the table built here, and e is
+     * dereferenced throughout. */
+    if (dec->al < ZGEC_MIN_AL || dec->al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
+    if (dec->nsym <= 0 || dec->nsym > 256) return ZGEC_ERR_FSE_COUNTS;
+    if (dec->e == NULL) return ZGEC_ERR_FSE_COUNTS;
     int al = dec->al;
     int nsym = dec->nsym;
     int S = 1 << al;
@@ -138,8 +163,14 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
     size_t full_size;
     zgec_fse_enc_table *full;
 
+    /* counts/off/used are 256-entry locals, so a symbol outside the alphabet
+     * has to be caught before it indexes them (fix.md entry 25). */
     memset(counts, 0, sizeof(counts));
-    for (int i = 0; i < S; i++) counts[dec->e[i].symbol]++;
+    for (int i = 0; i < S; i++) {
+        int sym = dec->e[i].symbol;
+        if (sym < 0 || sym >= nsym) return ZGEC_ERR_FSE_SYMBOL;
+        counts[sym]++;
+    }
 
     /* Per-symbol base within the flat scratch. */
     run = 0;
@@ -176,28 +207,94 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
     full_size = (size_t)nsym * (size_t)S * sizeof(zgec_fse_enc_entry);
     full = (zgec_fse_enc_table *)zgec_alloc(sizeof(zgec_fse_enc_table) + full_size, _Alignof(zgec_fse_enc_table));
     if (!full) { zgec_free(occ); return ZGEC_ERR_NOMEM; }
+    /* Zero-fill is load-bearing, not just hygiene: a symbol with zero
+     * occurrences owns a block of S cells that no occurrence writes, and the
+     * encoder relies on those reading as (nb_bits = 0, new_state = 0) rather
+     * than as uninitialised memory. Proving coverage below therefore only
+     * covers symbols that actually occur.
+     *
+     * The zero-fill also supplies the encoder's presence marker. Every cell of
+     * a symbol that does occur is written with pad = 1 below, so an all-zero
+     * cell proves the symbol was absent from the table it is being asked to
+     * encode -- an assumption the old comment stated but nothing checked, and
+     * which zgec_fse_encode could not otherwise test because an untouched cell
+     * and a legitimate zero transition are the same bits. zgec_fse_encode now
+     * refuses such a symbol instead of writing a transition nobody chose
+     * (review finding 1). `pad` is unused elsewhere and this table is built
+     * per stream and never serialised, so this is not a format change. */
     memset(full, 0, sizeof(zgec_fse_enc_table) + full_size);
     full->e = (zgec_fse_enc_entry *)((uint8_t *)full + sizeof(zgec_fse_enc_table));
     full->al = al;
     full->nsym = nsym;
 
-    for (int s = 0; s < nsym; s++) {
-        for (int j = 0; j < counts[s]; j++) {
-            const struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
-            uint8_t nb = o->nb_bits;
-            uint16_t st = o->new_state;
-            uint16_t bl = o->baseline;
-            unsigned range = 1u << nb;
-            int lo = (int)bl;                       /* decoder next-state range is
-                                                       [baseline, baseline+range-1] */
-            int hi = (int)bl + (int)range - 1;
-            for (int stprev = lo; stprev <= hi; stprev++) {
-                if (stprev >= 0 && stprev < S) {
-                    size_t idx = (size_t)s * (size_t)S + (size_t)stprev;
+    /* Fill every cell, proving as we go that every cell of every symbol's
+     * 2^al block is written exactly once. One symbol's occurrence ranges
+     * tile [0, 2^al) (see the note in zgec_fse.h), so a gap would hand the
+     * encoder a transition nobody chose and an overlap would leave two
+     * occurrences disagreeing about the same cell. An overlap is always a
+     * defect, so it is rejected outright. An apparent *gap* is not: it only
+     * means something for a symbol that occurs, so the completeness test below
+     * is guarded by counts[s] > 0 and the table keeps its zero-fill for the
+     * blocks of symbols that never occur (fix.md entry 4, corrected).
+     * `covered` is one bit per state -- 256 bytes, reused per symbol. */
+    {
+        uint8_t covered[(1u << ZGEC_MAX_AL) / 8u];   /* S <= 2048, so 256 bytes */
+        /* Rounded up: the duplicate test below indexes with stprev >> 3, which
+         * reaches byte (S - 1) / 8, so a truncated S / 8 leaves the last byte
+         * uncleared -- and clears nothing at all for S < 8, where the OR test
+         * would then compare against stack garbage. Harmless while
+         * ZGEC_MIN_AL keeps S >= 32, but this ties the clear to the indices
+         * the loop can reach rather than to that constant (review finding 3). */
+        size_t covered_bytes = ((size_t)S + 7u) / 8u;
+
+        for (int s = 0; s < nsym; s++) {
+            int covered_cells = 0;
+            memset(covered, 0, covered_bytes);
+            for (int j = 0; j < counts[s]; j++) {
+                const struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
+                uint8_t nb = o->nb_bits;
+                uint16_t st = o->new_state;
+                uint16_t bl = o->baseline;
+                unsigned range;
+                int lo, hi, stprev;
+
+                /* Defensive only: nb comes from o->nb_bits, which
+                 * zgec_fse_build_dec derives as al - highbit32(ns) and clamps
+                 * to al, so nb <= al holds for every table that builder can
+                 * produce and this branch is unreachable from here (review
+                 * finding 4). It is kept so a future builder cannot widen a
+                 * cell past its row unnoticed. */
+                if ((unsigned)nb > (unsigned)al) {
+                    zgec_free(occ); zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                }
+                range = 1u << nb;
+                lo = (int)bl;                        /* decoder next-state range is
+                                                        [baseline, baseline+range-1] */
+                hi = lo + (int)range - 1;
+                for (stprev = lo; stprev <= hi; stprev++) {
+                    size_t idx, byte;
+                    uint8_t bit;
+                    if (stprev < 0 || stprev >= S) continue;
+                    byte = (size_t)stprev >> 3;
+                    bit = (uint8_t)(1u << ((unsigned)stprev & 7u));
+                    if (covered[byte] & bit) {       /* two occurrences, one cell */
+                        zgec_free(occ); zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                    }
+                    covered[byte] = (uint8_t)(covered[byte] | bit);
+                    covered_cells++;
+                    idx = (size_t)s * (size_t)S + (size_t)stprev;
                     full->e[idx].nb_bits = nb;
                     full->e[idx].new_state = st;
                     full->e[idx].baseline = bl;
+                    full->e[idx].pad = (uint16_t)1;   /* symbol is present */
                 }
+            }
+            /* Only a symbol that occurs has a partition to be complete: the
+             * occurrence ranges of symbol s tile [0, S) exactly, but a symbol
+             * with counts[s] == 0 runs this loop zero times and covers nothing,
+             * which is not a gap -- its block is the zero-fill above. */
+            if (counts[s] > 0 && covered_cells != S) {   /* a cell nobody wrote */
+                zgec_free(occ); zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
             }
         }
     }
@@ -214,23 +311,47 @@ void zgec_fse_free_enc(zgec_fse_enc_table *t)
 
 /* ---- normalised-count serialisation (RFC 8878 section 4.1.1) ---- */
 
-/* LSB-first bit reader over buf (bits consumed low bit first). */
+/* LSB-first bit reader over buf (bits consumed low bit first).
+ *
+ * The bits are now held in a 64-bit accumulator instead of being extracted
+ * one bit at a time: this reader runs once per count field for every table
+ * description in the file, and the old loop spent a bounds test, a load, a
+ * shift and an or on each bit (fix.md entry 7). `bitpos` remains the
+ * authoritative consumed-bit count -- the reported byte length is still
+ * (bitpos + 7) / 8, and the bits returned are the same bits in the same
+ * order -- while `next` is only the load cursor. The bounds test is on the
+ * byte index rather than on `size * 8`, which could overflow size_t
+ * (fix.md entry 6). */
 typedef struct {
     const uint8_t *buf;
     size_t size;
-    size_t bitpos;
+    size_t bitpos;   /* bits consumed so far */
+    size_t next;     /* next byte to load into acc */
+    uint64_t acc;    /* unconsumed bits; bit 0 is the next bit to consume */
+    unsigned nacc;   /* unconsumed bits held in acc (0..64) */
     int ok;
 } zgec_lsbr;
 
+static int zgec_lsbr_ensure(zgec_lsbr *r, unsigned n)
+{
+    while (r->nacc < n && r->nacc <= 56u && r->next < r->size) {
+        r->acc |= (uint64_t)r->buf[r->next] << r->nacc;
+        r->next++;
+        r->nacc += 8u;
+    }
+    return r->nacc >= n;
+}
+
 static uint32_t zgec_lsbr_read(zgec_lsbr *r, unsigned n)
 {
-    uint32_t v = 0;
-    for (unsigned i = 0; i < n; i++) {
-        if (r->bitpos >= r->size * 8u) { r->ok = 0; return 0; }
-        unsigned b = (unsigned)((r->buf[r->bitpos >> 3] >> (r->bitpos & 7)) & 1u);
-        v |= (uint32_t)(b << i);
-        r->bitpos++;
-    }
+    uint32_t v;
+    if (n == 0u) return 0u;
+    if (n > 32u || !zgec_lsbr_ensure(r, n)) { r->ok = 0; return 0u; }
+    v = (n == 32u) ? (uint32_t)r->acc
+                   : (uint32_t)(r->acc & (((uint64_t)1u << n) - 1u));
+    r->acc >>= n;
+    r->nacc -= n;
+    r->bitpos += n;      /* only on success, so a failed read consumes nothing */
     return v;
 }
 
@@ -245,6 +366,9 @@ size_t zgec_fse_read_counts(int16_t *counts, int *nsym, int *al,
     r.buf = buf;
     r.size = size;
     r.bitpos = 0;
+    r.next = 0;
+    r.acc = 0;
+    r.nacc = 0;
     r.ok = 1;
 
     uint32_t low4 = zgec_lsbr_read(&r, 4);
@@ -264,8 +388,9 @@ size_t zgec_fse_read_counts(int16_t *counts, int *nsym, int *al,
     int threshold = tableSize;
     unsigned nbBits = (unsigned)a + 1;
     unsigned cap = probe ? 256u : (unsigned)max_nsym;
-    int16_t tmp[256];
-    memset(tmp, 0, sizeof(tmp));
+    /* Probe mode only wants the reader's verdict, so it no longer keeps a
+     * 512-byte scratch copy of counts it would discard (fix.md entries 8
+     * and 23); the destination is written only when there is one. */
     if (!probe) memset(counts, 0, (size_t)max_nsym * sizeof(int16_t));
 
     unsigned charnum = 0;
@@ -276,11 +401,14 @@ size_t zgec_fse_read_counts(int16_t *counts, int *nsym, int *al,
             for (;;) {
                 uint32_t v = zgec_lsbr_read(&r, 2);
                 if (!r.ok) return 0;
-                if (v == 3) {
-                    charnum += 3;
-                    if (charnum > cap) return 0;
+                if (v == 3u) {
+                    /* Subtraction form: the add cannot wrap, so a long run of
+                     * continuation flags stops at the cap instead of around
+                     * it (fix.md entry 9). */
+                    if (charnum > cap || cap - charnum < 3u) return 0;
+                    charnum += 3u;
                 } else {
-                    charnum += v;
+                    charnum += v;   /* v <= 2 and charnum <= cap here */
                     break;
                 }
             }
@@ -307,8 +435,6 @@ size_t zgec_fse_read_counts(int16_t *counts, int *nsym, int *al,
         count--;   /* 0 on the wire means -1 ("less than one") */
         if (charnum >= cap) return 0;
         if (!probe) counts[charnum] = (int16_t)count;
-        else tmp[charnum] = (int16_t)count;
-        (void)tmp;
         charnum++;
         previous0 = (count == 0);
         if (count >= 0) remaining -= count;
@@ -373,7 +499,7 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
             while (symbol >= start + 24) {
                 start += 24;
                 bitStream += (uint32_t)0xFFFFu << bitCount;
-                if (out > oend - 2) return 0;
+                if ((size_t)(oend - out) < 2u) return 0;
                 out[0] = (uint8_t)bitStream;
                 out[1] = (uint8_t)(bitStream >> 8);
                 out += 2;
@@ -387,7 +513,7 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
             bitStream += (uint32_t)(symbol - start) << bitCount;
             bitCount += 2;
             if (bitCount > 16) {
-                if (out > oend - 2) return 0;
+                if ((size_t)(oend - out) < 2u) return 0;
                 out[0] = (uint8_t)bitStream;
                 out[1] = (uint8_t)(bitStream >> 8);
                 out += 2;
@@ -409,7 +535,7 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
             while (remaining < threshold) { nbBits--; threshold >>= 1; }
         }
         if (bitCount > 16) {
-            if (out > oend - 2) return 0;
+            if ((size_t)(oend - out) < 2u) return 0;
             out[0] = (uint8_t)bitStream;
             out[1] = (uint8_t)(bitStream >> 8);
             out += 2;
@@ -421,15 +547,14 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
     if (remaining != 1) return 0;
     if (symbol > alphabetSize) return 0;
 
+    /* Only the remaining-byte count is inspected: `oend - 2` points before
+     * the object when cap < 2, and forming or comparing it is undefined
+     * (fix.md entry 2). The three old checks reduce to this one, which is
+     * what they already amounted to. */
     size_t tail = (size_t)(bitCount + 7) / 8u;
-    if ((size_t)(oend - out) < 2 && tail > (size_t)(oend - out)) return 0;
-    if (out > oend - 2 && tail > 0) {
-        /* Not enough room for the 2-byte flush window. */
-        if ((size_t)(oend - out) < tail) return 0;
-    }
     if ((size_t)(oend - out) < tail) return 0;
-    out[0] = (uint8_t)bitStream;
-    if (tail > 1) out[1] = (uint8_t)(bitStream >> 8);
+    if (tail >= 1u) out[0] = (uint8_t)bitStream;
+    if (tail >= 2u) out[1] = (uint8_t)(bitStream >> 8);
     out += tail;
     return (size_t)(out - ostart);
 }
@@ -442,7 +567,13 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
  * zero-width read yields 0. Holding the reader in locals instead of in
  * the zgec_br struct is what lets the compiler keep it in registers:
  * reached through the struct, every one of the two reads per symbol went
- * to memory and back. `bad` is the function's error exit. */
+ * to memory and back. `bad` is the function's error exit.
+ *
+ * Every width passed in is at most 32: t->al and e->nb_bits are bounded by
+ * ZGEC_MAX_AL when the decode table is built, and nbits[sym] is checked by
+ * the caller before the take (fix.md entry 1). That bound is this macro's
+ * contract -- a width above 32 would make (64u - _k) underflow and
+ * `acc <<= _k` undefined. */
 #define ZGEC_BRF_TAKE(_nb, _dst) do { \
         unsigned _k = (unsigned)(_nb); \
         if (_k != 0u) { \
@@ -477,6 +608,12 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
     zgec_err err = ZGEC_ERR_BITSTREAM;
 
     if (!t || !br) return ZGEC_ERR_INVAL;
+    /* Validate the table object before indexing it (fix.md entry 25): al
+     * fixes S below, nsym bounds the symbols read out of it, and e is
+     * dereferenced in the loop. */
+    if (t->al < ZGEC_MIN_AL || t->al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
+    if (t->nsym <= 0 || t->nsym > 256) return ZGEC_ERR_FSE_COUNTS;
+    if (t->e == NULL) return ZGEC_ERR_FSE_COUNTS;
     if (n == 0) {
         if (!zgec_br_done(br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
         return ZGEC_OK;
@@ -493,17 +630,33 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
     for (i = 0; i < n; i++) {
         const zgec_fse_dec_entry *e = &t->e[state];
         unsigned sym = 0;
+        unsigned extra_bits = 0;
         uint32_t extra = 0;
         if (e->symbol < 0 || e->symbol >= t->nsym) {
             err = ZGEC_ERR_FSE_SYMBOL;
             goto bad;
         }
         sym = (unsigned)e->symbol;
-        if (syms) syms[i] = (uint8_t)sym;
-
-        if (nbits != NULL && nbits[sym] > 0) {
-            ZGEC_BRF_TAKE(nbits[sym], extra);
+        /* Validate the width before writing anything for this symbol. The
+         * width comes from the caller's table and ZGEC_BRF_TAKE shifts by
+         * (64 - k), so a width above 32 would be an invalid shift; the value
+         * is only 32 bits wide in any case. `sym` is already known to be
+         * below t->nsym here (fix.md entry 1).
+         *
+         * This is a fault in the table, not a short read, so it reports
+         * ZGEC_ERR_FSE_SYMBOL: returning ZGEC_ERR_BITSTREAM made a malformed
+         * table indistinguishable from truncated input, and doing it after
+         * syms[i] was stored left half a result behind (review finding 2).
+         * On any error the caller must ignore out and syms. */
+        if (nbits != NULL) {
+            extra_bits = (unsigned)nbits[sym];
+            if (extra_bits > 32u) {
+                err = ZGEC_ERR_FSE_SYMBOL;
+                goto bad;
+            }
         }
+        if (syms) syms[i] = (uint8_t)sym;
+        if (extra_bits > 0u) ZGEC_BRF_TAKE(extra_bits, extra);
         if (out) {
             out[i] = (base ? base[sym] : (uint32_t)sym) + extra;
         }
@@ -532,40 +685,124 @@ bad:
     return err;
 }
 
+/* One symbol's extra bits: `value - base[sym]`, with the width and the range
+ * both validated. The bit writer keeps only the low n bits of what it is
+ * handed and reports nothing, so an extra field that did not fit -- or a
+ * value below its base, which wraps -- used to be written out as a different
+ * value and still counted as success (fix.md entry 5). A NULL width table
+ * means "no extra bits", which is the case the old code skipped entirely.
+ *
+ * Precondition: `values[]` must have been derived from the section 8.1 code
+ * table (zgec_seq_code_of), so that each value lies inside its symbol's
+ * [base[sym], base[sym] + 2^nbits[sym]) range. Every in-tree caller does this
+ * -- src/seq.c builds syms[i] from values[i] with that mapping -- so the
+ * ZGEC_ERR_FSE_SYMBOL returns below mean "caller bug or damaged table", not
+ * "unsupported input" (review finding 7). */
+static zgec_err zgec_fse_symbol_extra(unsigned sym, uint32_t value,
+                                      const uint32_t *base,
+                                      const uint8_t *nbits,
+                                      uint32_t *extra_out, unsigned *nb_out)
+{
+    uint32_t lo;
+    unsigned nb;
+
+    if (nbits == NULL) {
+        *extra_out = 0u;
+        *nb_out = 0u;
+        return ZGEC_OK;
+    }
+    nb = (unsigned)nbits[sym];
+    if (nb > 32u) return ZGEC_ERR_FSE_SYMBOL;
+    lo = base ? base[sym] : (uint32_t)sym;
+    if (nb == 0u) {
+        /* The symbol carries no extra bits, so the only value it can stand
+         * for is its base: any other value would be dropped silently. */
+        if (value != lo) return ZGEC_ERR_FSE_SYMBOL;
+        *extra_out = 0u;
+        *nb_out = 0u;
+        return ZGEC_OK;
+    }
+    if (value < lo) return ZGEC_ERR_FSE_SYMBOL;
+    {
+        uint32_t extra = value - lo;
+        if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
+        *extra_out = extra;
+        *nb_out = nb;
+        return ZGEC_OK;
+    }
+}
+
 zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
                           const uint32_t *values, const uint8_t *syms, size_t n,
                           const uint32_t *base, const uint8_t *nbits)
 {
+    zgec_err err;
+    uint8_t last_s;
+    uint32_t state;
+
     if (!t || !bw) return ZGEC_ERR_INVAL;
+    /* Validate the table object before indexing it (fix.md entry 25). */
+    if (t->al < ZGEC_MIN_AL || t->al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
+    if (t->nsym <= 0 || t->nsym > 256) return ZGEC_ERR_FSE_COUNTS;
+    if (t->e == NULL) return ZGEC_ERR_FSE_COUNTS;
     if (n == 0) return ZGEC_OK;
     if (!values || !syms) return ZGEC_ERR_INVAL;
-    int S = 1 << t->al;
 
-    uint8_t last_s = syms[n - 1];
+    last_s = syms[n - 1];
     if ((int)last_s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-    zgec_fse_enc_entry first_entry = t->e[(size_t)last_s * (size_t)S + 0];
-    uint32_t state = first_entry.new_state;
+    /* Rows are 2^al entries and every new_state is an occurrence index below
+     * 2^al (see zgec_fse_build_enc, which now proves that while filling), so
+     * `state` stays inside its row. */
+    /* A symbol absent from the table's histogram owns an all-zero row, so
+     * encoding it would write a transition nobody chose and still report
+     * success -- the decoder would then read whichever symbol owns state 0.
+     * zgec_fse_build_enc marks every cell of a symbol that does occur, so an
+     * unmarked cell proves absence (review finding 1). */
+    if ((t->e + ((size_t)last_s << t->al))[0].pad == 0)
+        return ZGEC_ERR_FSE_SYMBOL;
+    state = (t->e + ((size_t)last_s << t->al))[0].new_state;
 
-    if (nbits && nbits[last_s] > 0) {
-        uint32_t extra = values[n - 1] - (base ? base[last_s] : (uint32_t)last_s);
-        zgec_bw_write(bw, extra, (unsigned)nbits[last_s]);
+    {
+        uint32_t extra = 0u;    /* written through the pointer; the
+                                   initialisers keep -Wmaybe-uninitialized
+                                   quiet in a -Werror build */
+        unsigned nb = 0u;
+        err = zgec_fse_symbol_extra(last_s, values[n - 1], base, nbits,
+                                    &extra, &nb);
+        if (err != ZGEC_OK) return err;
+        if (nb > 0u) zgec_bw_write(bw, extra, nb);
     }
 
     for (size_t i = n - 1; i > 0; i--) {
         uint8_t s = syms[i - 1];
+        const zgec_fse_enc_entry *row;
+        zgec_fse_enc_entry entry;
+        uint32_t bits;
+        uint32_t extra = 0u;
+        unsigned nb = 0u;
+
         if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-        zgec_fse_enc_entry entry = t->e[(size_t)s * (size_t)S + state];
-        uint32_t bits = (state >= (uint32_t)entry.baseline)
-                            ? (uint32_t)(state - (uint32_t)entry.baseline)
-                            : 0u;
+        /* Row base first, so the index multiplication is not repeated
+         * (fix.md entry 13). */
+        row = t->e + ((size_t)s << t->al);
+        if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;   /* absent symbol */
+        entry = row[(size_t)state];
+        bits = (state >= (uint32_t)entry.baseline)
+                    ? (uint32_t)(state - (uint32_t)entry.baseline)
+                    : 0u;
         zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
-        if (nbits && nbits[s] > 0) {
-            uint32_t extra = values[i - 1] - (base ? base[s] : (uint32_t)s);
-            zgec_bw_write(bw, extra, (unsigned)nbits[s]);
-        }
+        err = zgec_fse_symbol_extra(s, values[i - 1], base, nbits, &extra, &nb);
+        if (err != ZGEC_OK) return err;
+        if (nb > 0u) zgec_bw_write(bw, extra, nb);
         state = entry.new_state;
     }
 
+    /* The writer records an overflow in its own struct instead of returning
+     * it, so a stream that did not fit used to be reported as encoded
+     * (fix.md entry 14). The flag is sticky, so one test after the loop
+     * covers every write above, and one more covers the state field below. */
+    if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
     zgec_bw_write(bw, state, (unsigned)t->al);
+    if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
     return ZGEC_OK;
 }

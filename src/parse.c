@@ -7,6 +7,18 @@
 
 /* ---- helpers ---- */
 
+/* Checked multiply for this file's allocation sizes. sizeof() and the
+ * capacity doubling both need guarding: a wrapped size allocates short
+ * and is then written past its end. The add-side helper is in
+ * zgec_common.h (zgec_add_overflows). */
+static int parse_mul_overflows(size_t a, size_t b)
+{
+    return a != 0u && b > SIZE_MAX / a;
+}
+
+/* Entropy contribution of one symbol, in bits: count * -log2(p). The
+ * result is positive for any counted symbol, so a sum over a histogram
+ * is the non-negative cost of coding that histogram. */
 static double zgec_bits(double total, double count)
 {
     if (count <= 0 || total <= 0) return 0.0;
@@ -28,7 +40,10 @@ double zgec_seq_cost_bits(const uint32_t *hist)
     if (total == 0) return 0.0;
     double bits = 0.0;
     for (int s = 0; s < ZGEC_NSYM_SEQ; s++) bits += zgec_bits(total, (double)hist[s]);
-    return -bits;
+    /* zgec_bits() already returns a positive contribution, so negating
+     * the total made the "cost" negative and would invert every
+     * comparison the value feeds. */
+    return bits;
 }
 
 double zgec_seq_triple_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
@@ -54,6 +69,12 @@ double zgec_seq_triple_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
             double p = (c + 1.0) / (total + (double)ZGEC_NSYM_SEQ);
             if (p < 1e-12) p = 1e-12;
             cost += -(log(p) / log(2.0));
+        } else {
+            /* No histogram is not the same as a free symbol: charging
+             * only the raw extra bits made every sequence look cheap
+             * while the model is untrained. Price the code at the
+             * uniform rate over the 66 codes instead. */
+            cost += log2((double)ZGEC_NSYM_SEQ);
         }
         cost += (double)nbs[k]; /* extra bits written raw */
     }
@@ -78,19 +99,31 @@ zgec_err zgec_segment(const zgec_parse *p,
         return ZGEC_OK;
     }
 
-    size_t n_seg = (p->n_seq + target_seg_sequences - 1) / target_seg_sequences;
+    /* Ceiling division without the additive form: n_seq + target - 1 can
+     * overflow for a large caller-supplied target, and the wrapped
+     * quotient would then feed the allocation below. */
+    size_t n_seg = p->n_seq / target_seg_sequences;
+    if (p->n_seq % target_seg_sequences != 0) n_seg++;
     if (n_seg == 0) n_seg = 1;
     if (n_seg > ZGEC_MAX_SEGMENTS) n_seg = ZGEC_MAX_SEGMENTS;
 
+    /* n_seg <= ZGEC_MAX_SEGMENTS (4096) past this point, so
+     * (n_seg + 1) * sizeof(size_t) cannot overflow. */
     size_t *b = (size_t *)zgec_alloc((n_seg + 1) * sizeof(size_t), _Alignof(size_t));
     if (!b) return ZGEC_ERR_NOMEM;
 
-    size_t seqs_per_seg = (p->n_seq + n_seg - 1) / n_seg;
+    size_t seqs_per_seg = p->n_seq / n_seg;
+    if (p->n_seq % n_seg != 0) seqs_per_seg++;
     b[0] = 0;
-    for (size_t i = 1; i < n_seg; i++) {
-        size_t pos = i * seqs_per_seg;
-        if (pos > p->n_seq) pos = p->n_seq;
-        b[i] = pos;
+    {
+        /* Built incrementally rather than as i * seqs_per_seg: the
+         * product has no bound the format guarantees. */
+        size_t pos = 0;
+        for (size_t i = 1; i < n_seg; i++) {
+            pos += seqs_per_seg;
+            if (pos > p->n_seq) pos = p->n_seq;
+            b[i] = pos;
+        }
     }
     b[n_seg] = p->n_seq;
 
@@ -99,16 +132,38 @@ zgec_err zgec_segment(const zgec_parse *p,
     return ZGEC_OK;
 }
 
+/* Trusted-input helper. The interface is fixed by the header -- a void
+ * return gives no way to report a malformed argument -- so the contract
+ * is that seq_bounds comes from zgec_segment() or the encoder's greedy
+ * merge, i.e. 0 = seq_bounds[0] <= ... <= seq_bounds[n_segments] with
+ * the last equal to p->n_seq. The clamping below exists so that a bad
+ * bound degrades into a wrong boundary rather than an out-of-range read
+ * of p->seq; it does not validate the contract. */
 void zgec_lit_bounds(const zgec_parse *p,
                      const size_t *seq_bounds,
                      size_t n_segments,
                      size_t *lit_bounds)
 {
+    if (!lit_bounds) return;
+    if (!p || !seq_bounds || n_segments == 0) {
+        /* Nothing to derive. Define the whole array rather than only the
+         * boundary the n_segments == 0 caller reads: a NULL seq_bounds with
+         * n_segments > 0 would otherwise leave lit_bounds[1..n_segments]
+         * indeterminate. The write is the caller's own n_segments+1 array,
+         * and the same size the main path memsets below. With n_segments == 0
+         * this is exactly the old lit_bounds[0] = p->n_lit result. */
+        memset(lit_bounds, 0, (n_segments + 1) * sizeof(size_t));
+        lit_bounds[n_segments] = p ? p->n_lit : 0;
+        return;
+    }
     memset(lit_bounds, 0, (n_segments + 1) * sizeof(size_t));
     size_t lit_pos = 0;
     for (size_t s = 0; s < n_segments; s++) {
         size_t start_seq = seq_bounds[s];
         size_t end_seq = seq_bounds[s + 1];
+        if (start_seq > p->n_seq) start_seq = p->n_seq;
+        if (end_seq > p->n_seq) end_seq = p->n_seq;
+        if (end_seq < start_seq) end_seq = start_seq;
         lit_bounds[s] = lit_pos;
         for (size_t i = start_seq; i < end_seq; i++) {
             lit_pos += p->seq[i].ll;
@@ -146,18 +201,11 @@ static uint32_t parse_min_norep(size_t ip)
     return (ip >= (size_t)262144) ? 6u : 5u;
 }
 
+/* Offbase selection is the shared zgec_reps_encode helper (section 8.2);
+ * kept as a thin wrapper so the call sites read unchanged. */
 static uint32_t parse_offbase(uint32_t off, const zgec_reps *reps)
 {
-    if (off == reps->rep[0]) {
-        return 1u;
-    }
-    if (off == reps->rep[1]) {
-        return 2u;
-    }
-    if (off == reps->rep[2]) {
-        return 3u;
-    }
-    return off + 3u;
+    return zgec_reps_encode(reps, off);
 }
 
 /* Cost in bits of coding the three sequence fields alone, i.e. the
@@ -228,6 +276,17 @@ static double parse_lbar(const uint32_t *lit_hist, size_t total)
     double per;
     int s;
     if (total < 64) return 6.0;
+    /* The prior counts as probability mass, so the smoothed total t is
+     * the denominator: bits accumulates c * (log2(t) - log2(c)) =
+     * t*log2(t) - sum(c*log2(c)), and dividing by t gives the average
+     * cost of one literal under the smoothed model (dividing by the
+     * unsmoothed total would scale it up by t/total).
+     *
+     * log2, not log: this value is compared against sequence costs
+     * measured in bits -- docs/spec.md:853, "Lbar is the running average
+     * cost in bits of a literal". Natural logarithms understate it by
+     * the log(2) factor, ~30%, which makes the price gate reject matches
+     * that would have paid for themselves. */
     t = (double)total + PARSE_LBAR_PRIOR * 256.0;
     for (s = 0; s < 256; s++) {
         double c = (double)lit_hist[s] + PARSE_LBAR_PRIOR;
@@ -247,6 +306,12 @@ static double parse_lbar(const uint32_t *lit_hist, size_t total)
  * cap keeps every position visible to within PARSE_MAX_STEP bytes at
  * a cost that is negligible even on pure noise (2 MiB / 32 probes). */
 #define PARSE_MAX_STEP 32u
+
+/* How many literals of a pending run are folded into lit_hist at a time.
+ * Folding on acceptance only left Lbar describing the literals before the
+ * last accepted match, which is a stale model during a long literal run
+ * (and permanently stale on data where no match is ever accepted). */
+#define PARSE_LIT_FOLD 256u
 
 /* Lazy evaluation is worthwhile only for the short matches that a
  * one-byte lookahead can plausibly beat. The step is a second full
@@ -276,26 +341,63 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                           const uint8_t *litref, size_t litref_size,
                           zgec_tier tier, double lambda)
 {
-    if (!out || (!src && raw_size > 0)) return ZGEC_ERR_INVAL;
+    if (!out) return ZGEC_ERR_INVAL;
+    /* Never leave a stale pointer behind on the failure paths below. */
+    *out = NULL;
+    if ((!src && raw_size > 0)) return ZGEC_ERR_INVAL;
+    /* A size without a pointer would leave the [dict) region of the
+     * virtual buffer below uninitialised and exposed to the matcher, so
+     * reject the pair instead of copying nothing into it. */
+    if (!dict && dict_size > 0) return ZGEC_ERR_INVAL;
     if ((!litref && litref_size > 0)) return ZGEC_ERR_INVAL;
+    /* raw_size is recorded in 32 bits, so a larger input would be
+     * truncated into every allocation and bounds decision that uses it.
+     * Guarded on SIZE_MAX because on a 32-bit target size_t cannot exceed
+     * UINT32_MAX, which makes the comparison always false and trips gcc's
+     * -Wtype-limits in this -Werror build. No cast in the #if: the
+     * preprocessor evaluates type names as 0. */
+#if SIZE_MAX > UINT32_MAX
+    if (raw_size > (size_t)UINT32_MAX) return ZGEC_ERR_INVAL;
+#endif
 
     /* Lambda is the speed/ratio dial (section 11.7):
      * 0 maximises ratio, larger values raise the
      * price-gate bar slightly towards fewer, longer
      * matches (faster decode). Clamped small so the
      * effect stays a slight threshold scale. */
+    /* A non-finite lambda survives the clamp below unchanged, because
+     * every comparison against NaN is false: lscale and every score
+     * would be NaN, the "cur_score > 0.0" gate would reject every match,
+     * and the block would come out as pure literals. Fall back to the
+     * ratio endpoint rather than silently disabling match emission. */
+    if (!isfinite(lambda)) lambda = 0.0;
     double lam = (lambda < 0.0) ? 0.0 : ((lambda > 4.0) ? 4.0 : lambda);
     double lscale = 1.0 + 0.25 * lam;
+
+    /* Sequence capacity from the input rather than a flat 65536 records:
+     * at 12 bytes a record that is ~768 KiB, allocated even for a 64-byte
+     * block. The shortest match is 4 bytes, so raw_size/16 is a safe
+     * under-estimate that the growth path below extends on demand. */
+    size_t seq_cap = raw_size / 16u + 16u;
+    if (seq_cap < 256u) seq_cap = 256u;
+    if (seq_cap > 65536u) seq_cap = 65536u;
+    if (parse_mul_overflows(seq_cap, sizeof(zgec_sequence)))
+        return ZGEC_ERR_NOMEM;
 
     zgec_parse *p = (zgec_parse *)zgec_alloc(sizeof(*p), _Alignof(zgec_parse));
     if (!p) return ZGEC_ERR_NOMEM;
     memset(p, 0, sizeof(*p));
 
-    size_t seq_cap = 65536;
     p->seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
     if (!p->seq) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
 
-    p->lit = (uint8_t *)zgec_alloc(raw_size + ZGEC_LIT_SLACK + 64, 64);
+    /* Checked before allocating: a wrapped size allocates short, and the
+     * literal copies below then run past its end. */
+    if (zgec_add_overflows(raw_size, (size_t)ZGEC_LIT_SLACK + 64u)) {
+        zgec_parse_free(p);
+        return ZGEC_ERR_NOMEM;
+    }
+    p->lit = (uint8_t *)zgec_alloc(raw_size + (size_t)ZGEC_LIT_SLACK + 64u, 64);
     if (!p->lit) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
     p->raw_size = (uint32_t)raw_size;
     p->n_seq = 0;
@@ -306,16 +408,30 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         return ZGEC_OK;
     }
 
-    /* Virtual buffer [dict][litref][src] (section 6.1). */
+    /* Virtual buffer [dict][litref][src] (section 6.1). Every size here
+     * is checked before use: an unchecked sum can wrap to a small value,
+     * pass the P24 guard below, and be used as a memcpy length. */
+    if (zgec_add_overflows(dict_size, litref_size)) {
+        zgec_parse_free(p);
+        return ZGEC_ERR_INVAL;
+    }
     size_t prefix = dict_size + litref_size;
-    size_t vb_size = prefix + raw_size;
-    uint8_t *vb;
-    zgec_matcher *m;
     if (prefix > (size_t)(1u << 24)) {
         zgec_parse_free(p);
         return ZGEC_ERR_INVAL;
     }
-    vb = (uint8_t *)zgec_alloc(vb_size + 64, 64);
+    if (zgec_add_overflows(prefix, raw_size)) {
+        zgec_parse_free(p);
+        return ZGEC_ERR_INVAL;
+    }
+    size_t vb_size = prefix + raw_size;
+    uint8_t *vb;
+    zgec_matcher *m;
+    if (zgec_add_overflows(vb_size, 64u)) {
+        zgec_parse_free(p);
+        return ZGEC_ERR_NOMEM;
+    }
+    vb = (uint8_t *)zgec_alloc(vb_size + 64u, 64);
     if (!vb) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
     if (dict && dict_size > 0) {
         memcpy(vb, dict, dict_size);
@@ -455,26 +571,11 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (cur_len > 0u) {
             uint32_t ml = cur_len;
             uint32_t off = cur_off;
-            uint32_t ob;
             uint8_t nb = 0;
-
-            if (off == reps.rep[0]) {
-                ob = 1;
-            } else if (off == reps.rep[1]) {
-                ob = 2;
-                reps.rep[1] = reps.rep[0];
-                reps.rep[0] = off;
-            } else if (off == reps.rep[2]) {
-                ob = 3;
-                reps.rep[2] = reps.rep[1];
-                reps.rep[1] = reps.rep[0];
-                reps.rep[0] = off;
-            } else {
-                ob = off + 3u;
-                reps.rep[2] = reps.rep[1];
-                reps.rep[1] = reps.rep[0];
-                reps.rep[0] = off;
-            }
+            /* Shared MTF update (section 8.2): encode then resolve applies
+             * the same move-to-front step the decoder performs. */
+            uint32_t ob = zgec_reps_encode(&reps, off);
+            (void)zgec_reps_resolve(&reps, ob);
 
             if (ll > 0) {
                 uint32_t u;
@@ -485,8 +586,20 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             }
 
             if (p->n_seq >= seq_cap) {
-                size_t new_cap = seq_cap * 2;
-                zgec_sequence *new_seq = (zgec_sequence *)zgec_alloc(new_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
+                size_t new_cap;
+                zgec_sequence *new_seq;
+                /* The doubling and the byte size are both checked: a
+                 * wrapped capacity allocates short and the writes past it
+                 * corrupt the heap. sizeof(zgec_sequence) > 1, so the
+                 * product test also rules the doubling itself out. */
+                if (parse_mul_overflows(seq_cap, 2u * sizeof(zgec_sequence))) {
+                    zgec_matcher_destroy(m);
+                    zgec_free(vb);
+                    zgec_parse_free(p);
+                    return ZGEC_ERR_NOMEM;
+                }
+                new_cap = seq_cap * 2u;
+                new_seq = (zgec_sequence *)zgec_alloc(new_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
                 if (!new_seq) {
                     zgec_matcher_destroy(m);
                     zgec_free(vb);

@@ -53,6 +53,11 @@ zgec_err zgec_lit_runstart(uint8_t *runstart, size_t n_lit,
  * start[0..7] receives the start index of each lane. */
 void zgec_lit_lane_starts(size_t start[ZGEC_NLANES], size_t n_lit);
 
+/* Compute lane starts and lengths (section 9.2). Shared by the rANS
+ * decode/encode/histogram paths so the q/r/start/len math lives once. */
+void zgec_lit_lane_geom(size_t start[ZGEC_NLANES], size_t len[ZGEC_NLANES],
+                        size_t n_lit);
+
 /* Apply sub-literal reconstruction (section 9.6): turn the
  * residual buffer Z into the actual literal bytes, using
  * the repeat offset in effect before each sequence.

@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "zgec_common.h"
+#include "zgec_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -76,21 +77,50 @@ const char *zgec_strerror(zgec_err e)
    is [ original pointer ][ padding ][ aligned data ].
    The original pointer is stored immediately before
    the aligned data so zgec_free can recover it.
-   Works for any alignment that is a power of two. */
+   Works for any alignment that is a power of two.
+
+   Both size computations are guarded. The prefix
+   (sizeof(void *) + align - 1) and the total (n + prefix) can each
+   wrap size_t for attacker-influenced sizes, and a wrapped total
+   would hand the caller a block smaller than the n bytes it believes
+   it owns -- heap corruption on the next write. The UINTPTR_MAX test
+   is defensive rather than presently reachable (user-space bases sit
+   far below it), but it keeps the alignment arithmetic total. */
 void *zgec_alloc(size_t n, size_t align)
 {
+    size_t prefix;
+    size_t total;
+    void *raw;
+    uintptr_t base;
+    uintptr_t aligned;
+
     if (n == 0) n = 1;
     if (align <= sizeof(void *)) align = sizeof(void *);
     /* align must be a power of two for the mask */
     if ((align & (align - 1)) != 0) return NULL;
-    size_t prefix = sizeof(void *) + align - 1;
-    void *raw = malloc(n + prefix);
+    if (zgec_add_overflows(sizeof(void *), align - 1)) return NULL;
+    prefix = sizeof(void *) + align - 1;
+    if (zgec_add_overflows(n, prefix)) return NULL;
+    total = n + prefix;
+    raw = malloc(total);
     if (!raw) return NULL;
-    uintptr_t aligned = ((uintptr_t)raw + prefix) & ~(uintptr_t)(align - 1);
+    base = (uintptr_t)raw;
+    if (base > UINTPTR_MAX - prefix) {
+        free(raw);
+        return NULL;
+    }
+    aligned = (base + prefix) & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
     return (void *)aligned;
 }
 
+/* Paired with zgec_alloc, and valid only for NULL or a pointer that
+   zgec_alloc returned. The original malloc pointer lives in the word
+   immediately before p, so any other argument -- including a pointer
+   from plain malloc -- reads out of bounds and then frees a garbage
+   address. Such a pointer must not be passed to free() either:
+   zgec_alloc over-allocates and returns an interior pointer, not the
+   malloc result. Do not mix the two allocators. */
 void zgec_free(void *p)
 {
     if (!p) return;
@@ -123,6 +153,19 @@ zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
     if (v != ZGEC_OK) return v;
     if (n == 0) return ZGEC_OK;
     if (dst == NULL || src == NULL) return ZGEC_ERR_INVAL;
+    /* The transform is defined out of place: delta reads src[i - 1]
+       while writing dst[i], so dst == src -- or any partial overlap --
+       makes later iterations read bytes this loop already rewrote. The
+       header only documents the no-overlap contract; enforce it, so a
+       caller that does not read the header gets an error instead of
+       silently wrong output. The unsigned difference idiom is used
+       rather than pointer comparisons so neither subtraction can
+       overrun. */
+    {
+        uintptr_t d = (uintptr_t)dst;
+        uintptr_t s = (uintptr_t)src;
+        if (d - s < n || s - d < n) return ZGEC_ERR_INVAL;
+    }
     if (mode == ZGEC_FILTER_DELTA) {
         size_t i;
         dst[0] = src[0];
@@ -130,13 +173,32 @@ zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
             dst[i] = (uint8_t)((unsigned)src[i] - (unsigned)src[i - 1]);
         }
     } else {
+        /* Column c is every N-th byte from src + c. docs/spec.md:514 defines
+           N = filter_param and R = ceil(n / N), iterating c = 0 to N - 1 and,
+           for each c, r = 0 to R - 1 with r*N + c < n. full_rows is the floor
+           of n / N, i.e. R minus one while c is inside the remainder, so a
+           column holds full_rows + 1 bytes for c < rem and full_rows
+           otherwise. That length is known before the loop, so the condition
+           carries no multiply and the theoretical r * N overflow cannot
+           arise. Lengths come from the shared zgec_filter_shuffle_count
+           helper so apply and inverse agree.
+
+           The loop steps an integer index rather than a pointer: advancing a
+           pointer by N after the final store would form a value up to N - 1
+           bytes past one-past-the-end, which is undefined by C11 6.5.6p8 even
+           though the value is never dereferenced. */
         size_t N = (size_t)param;
+        size_t full_rows = n / N;
+        size_t rem = n % N;
         size_t c;
         size_t k = 0;
         for (c = 0; c < N; c++) {
+            size_t count = zgec_filter_shuffle_count(full_rows, rem, c);
+            size_t i = c;
             size_t r;
-            for (r = 0; r * N + c < n; r++) {
-                dst[k++] = src[r * N + c];
+            for (r = 0; r < count; r++) {
+                dst[k++] = src[i];
+                i += N;
             }
         }
     }
@@ -156,16 +218,27 @@ zgec_err zgec_filter_inverse(uint8_t *buf, size_t n,
             buf[i] = (uint8_t)((unsigned)buf[i] + (unsigned)buf[i - 1]);
         }
     } else {
+        /* Inverse of the apply shuffle: the same per-column lengths
+           (docs/spec.md:514), with the destination walked by an index
+           stepping N rather than by a pointer, for the reason given in
+           zgec_filter_apply above. The temporary stays for now -- removing it
+           needs a caller-supplied scratch buffer, i.e. a new signature
+           for a function decode.c already calls. */
         size_t N = (size_t)param;
+        size_t full_rows = n / N;
+        size_t rem = n % N;
         size_t c;
         size_t k = 0;
         uint8_t *tmp = (uint8_t *)zgec_alloc(n, 64);
         if (!tmp) return ZGEC_ERR_NOMEM;
         memcpy(tmp, buf, n);
         for (c = 0; c < N; c++) {
+            size_t count = zgec_filter_shuffle_count(full_rows, rem, c);
+            size_t i = c;
             size_t r;
-            for (r = 0; r * N + c < n; r++) {
-                buf[r * N + c] = tmp[k++];
+            for (r = 0; r < count; r++) {
+                buf[i] = tmp[k++];
+                i += N;
             }
         }
         zgec_free(tmp);

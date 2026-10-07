@@ -8,6 +8,8 @@
 #include "zgec_seq.h"
 #include "zgec_xxhash.h"
 
+#include "zgec_internal.h"
+
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -22,6 +24,10 @@
 
 /* ---- simple LRU cache ---- */
 
+/* C17: a cache has no internal locking and is not reentrant. That is the
+ * contract already stated in zgec_dict.h ("Shared between worker threads (the
+ * caller serialises access or uses one cache per worker)"); this note restates
+ * it where the implementation lives so the two cannot drift apart. */
 typedef struct zgec_dict_node {
     zgec_dict dict;
     struct zgec_dict_node *next;
@@ -82,6 +88,16 @@ void zgec_dict_cache_put(zgec_dict_cache *c, zgec_dict *d)
     if (c->capacity == 0) c->capacity = 8;
     /* Zero-size / NULL-data guard: a non-empty dict must own a buffer. */
     if (d->raw_size > 0 && d->data == NULL) return;
+    /* C6: reserve the node before touching the list. Previously the
+       allocation came after both the duplicate eviction and the capacity
+       eviction, so an allocation failure both dropped a cache entry and
+       destroyed the caller's dictionary, leaving the caller no way to tell
+       the two outcomes apart. Now the only failure path leaves the cache
+       untouched. The documented contract ("takes ownership of data",
+       zgec_dict.h) is unchanged: the caller's buffer is still released. */
+    zgec_dict_node *n = (zgec_dict_node *)zgec_alloc(sizeof(*n), _Alignof(zgec_dict_node));
+    if (!n) { zgec_dict_free(d); return; }
+    memset(n, 0, sizeof(*n));
     zgec_dict_node *prev = NULL;
     zgec_dict_node *cur = c->head;
     while (cur) {
@@ -106,9 +122,6 @@ void zgec_dict_cache_put(zgec_dict_cache *c, zgec_dict *d)
         zgec_free(old);
         c->size--;
     }
-    zgec_dict_node *n = (zgec_dict_node *)zgec_alloc(sizeof(*n), _Alignof(zgec_dict_node));
-    if (!n) { zgec_dict_free(d); return; }
-    memset(n, 0, sizeof(*n));
     /* Copy the entry and detach the source's buffer ownership.
        The caller may pass a stack object (see tests/test.c usage),
        so the container itself must NOT be freed here; only the
@@ -173,7 +186,10 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
 {
     uint8_t *dst = vb + pos;
     if (lit_form == 0) {
-        for (size_t i = 0; i < n; i++) dst[i] = src[i];
+        /* C14: src is the segment's literal buffer and dst is the dictionary's
+         * virtual buffer — separate allocations, so the plain case is a block
+         * copy rather than a byte loop. */
+        if (n > 0) memcpy(dst, src, n);
         return;
     }
     for (size_t i = 0; i < n; i++) {
@@ -189,6 +205,14 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
 static void zgec_dict_copy_match(uint8_t *dst, size_t off, size_t len)
 {
     const uint8_t *src = dst - off;
+    /* C13: when off >= len the source range [src, src + len) ends at or before
+     * dst, so the two ranges cannot overlap and a block copy is exact. The
+     * overlapping case must stay a forward byte loop: an LZ match replicates
+     * the bytes just written, which neither a snapshot nor a bulk copy gives. */
+    if (off >= len) {
+        if (len > 0) memcpy(dst, src, len);
+        return;
+    }
     for (size_t i = 0; i < len; i++) dst[i] = src[i];
 }
 
@@ -261,10 +285,8 @@ static void zgec_dict_prev_free(zgec_dict_prev *p)
 
 static zgec_err zgec_dict_check_sentinel(const uint8_t *s, size_t n)
 {
-    if (s == NULL && n > 0) return ZGEC_ERR_TRUNCATED;
-    if (n == 0) return ZGEC_ERR_STREAM_SIZE;
-    if (s[n - 1] == 0) return ZGEC_ERR_BITSTREAM_SENTINEL;
-    return ZGEC_OK;
+    /* Shared V5 sentinel check (see zgec_internal.h). */
+    return zgec_check_stream_sentinel(s, n);
 }
 
 static zgec_err zgec_dict_seq_one(uint32_t *out, size_t n,
@@ -413,9 +435,11 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
     int n_of = 1;
     zgec_seg_header sh;
     size_t hdr_size = 0;
-    memset(seg, 0, sizeof(*seg));
+    /* C1: guard before the store. The previous order wrote through a NULL
+     * seg on every call that passed one. */
     if (seg == NULL || seg_buf == NULL || bp == NULL || prev == NULL)
         return ZGEC_ERR_INVAL;
+    memset(seg, 0, sizeof(*seg));
     if (seg_size < 2) return ZGEC_ERR_SEGMENT_SIZE;
     /* Peek lit_form to select the context descriptor before parsing. */
     lit_form = (int)(seg_buf[0] & 1u);
@@ -444,9 +468,23 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
     if ((uint64_t)sh.n_lit > ZGEC_DICT_P24_MAX) {
         /* P24 warn-only: decodable; kept silent (no stderr). */
     }
-    if (hdr_size + (size_t)sh.lit_size + (size_t)sh.ll_size +
-        (size_t)sh.ml_size + (size_t)sh.of_size != seg_size)
-        return ZGEC_ERR_SEGMENT_SIZE;
+    /* C3: subtraction-based accumulation. Adding the four 32-bit stream
+     * sizes into a size_t can wrap on a 32-bit build, which would let a
+     * malformed descriptor satisfy the equality this replaces. */
+    {
+        size_t rem_bytes;
+        if (hdr_size > seg_size) return ZGEC_ERR_SEGMENT_SIZE;
+        rem_bytes = seg_size - hdr_size;
+        if ((uint64_t)sh.lit_size > (uint64_t)rem_bytes) return ZGEC_ERR_SEGMENT_SIZE;
+        rem_bytes -= (size_t)sh.lit_size;
+        if ((uint64_t)sh.ll_size > (uint64_t)rem_bytes) return ZGEC_ERR_SEGMENT_SIZE;
+        rem_bytes -= (size_t)sh.ll_size;
+        if ((uint64_t)sh.ml_size > (uint64_t)rem_bytes) return ZGEC_ERR_SEGMENT_SIZE;
+        rem_bytes -= (size_t)sh.ml_size;
+        if ((uint64_t)sh.of_size > (uint64_t)rem_bytes) return ZGEC_ERR_SEGMENT_SIZE;
+        rem_bytes -= (size_t)sh.of_size;
+        if (rem_bytes != 0) return ZGEC_ERR_SEGMENT_SIZE;
+    }
 
     lit_coder = (unsigned)(((unsigned)sh.segment_flags >> 1) & 3u);
     if (lit_coder != 0 && lit_coder != 1) return ZGEC_ERR_LIT_CODER;
@@ -488,8 +526,13 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         }
     }
     if (seg->n_lit > 0) {
-        if ((uint64_t)seg->n_lit + ZGEC_LIT_SLACK > (uint64_t)SIZE_MAX / 2)
+        if ((uint64_t)seg->n_lit + ZGEC_LIT_SLACK > (uint64_t)SIZE_MAX / 2) {
+            /* Extra finding (not one of the 24): this return used to leak
+             * the four sequence arrays allocated immediately above, which
+             * every sibling failure path releases. */
+            zgec_dict_seg_release(seg);
             return ZGEC_ERR_NOMEM;
+        }
         seg->lit = (uint8_t *)zgec_alloc(seg->n_lit + ZGEC_LIT_SLACK, 64);
         if (!seg->lit) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
     }
@@ -993,7 +1036,9 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
         return ZGEC_ERR_SEGMENT_SIZE;
     if (segment_count < 1 || segment_count > ZGEC_MAX_SEGMENTS)
         return ZGEC_ERR_SEGMENT_COUNT;
-    if (comp_size < params_len + (size_t)segment_count * 8)
+    /* C3: subtraction-based, so the segment_count * 8 term cannot wrap. */
+    if (params_len > comp_size ||
+        (size_t)segment_count > (comp_size - params_len) / 8u)
         return ZGEC_ERR_TRUNCATED;
 
     zgec_seg_dir_entry *dir = (zgec_seg_dir_entry *)zgec_alloc(
@@ -1022,7 +1067,8 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
     zgec_dict_prev prev;
     zgec_dict_prev_init(&prev);
     for (uint32_t i = 0; i < segment_count; i++) {
-        if (dir[i].comp_len == 0 || seg_offset + dir[i].comp_len > comp_size) {
+        if (dir[i].comp_len == 0 || seg_offset > comp_size ||
+            (size_t)dir[i].comp_len > comp_size - seg_offset) {
             zgec_dict_prev_free(&prev);
             zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_SEGMENT_SIZE;
         }
@@ -1099,8 +1145,26 @@ zgec_err zgec_dict_decode(zgec_dict **out,
                            uint32_t raw_size, uint64_t content_hash,
                            const zgec_frame_header *fh)
 {
-    (void)fh;
     if (!out || !payload || payload_size < 24) return ZGEC_ERR_INVAL;
+    /* C2: section 3.3 caps a dictionary at 2^26 bytes. raw_size reaches here
+     * from the caller and, on the frame path, from the record header, so a
+     * malformed input could otherwise ask for a multi-gigabyte allocation
+     * in the RAW, RLE and COMPRESSED paths below. */
+    if ((uint64_t)raw_size > ZGEC_DICT_RAW_MAX) return ZGEC_ERR_DICT_SIZE;
+    /* D2 (round 3): section 3.3 also caps a dictionary at 2^max_dict_log2, the
+     * per-frame limit the header declares (spec 158: "No dictionary exceeds
+     * 2^max_dict_log2 bytes; range 0 to 26 (0 means no dictionaries)"). frame.c
+     * applies it while parsing a DICT record header, but this entry point is
+     * reachable directly, so the frame's own limit is enforced here too when
+     * the caller supplies the header. The field is a uint8_t, so it is clamped
+     * to the format maximum before the shift is taken -- shifting by an
+     * unvalidated byte would be an out-of-range shift, not a large limit. */
+    if (fh != NULL && fh->max_dict_log2 != 0u) {
+        uint64_t dcap = (fh->max_dict_log2 > ZGEC_MAX_DICT_LOG2)
+                            ? ZGEC_DICT_RAW_MAX
+                            : ((uint64_t)1u << fh->max_dict_log2);
+        if ((uint64_t)raw_size > dcap) return ZGEC_ERR_DICT_SIZE;
+    }
     uint8_t type = payload[0];
     uint8_t rflags = payload[1];
     uint16_t inner_dict_id = zgec_rd16(payload + 2);
@@ -1159,7 +1223,20 @@ zgec_err zgec_dict_decode(zgec_dict **out,
 
 /* ---- dictionary training ---- */
 
-typedef struct { uint64_t hash; uint32_t pos; uint32_t len; } zgec_chunk;
+/* C4: pos is an offset into an input of size_t length, so it is kept at
+ * size_t width. Storing it in a uint32_t truncated inputs above 4 GiB and
+ * made every later read of the chunk select the wrong source region. len is
+ * bounded by max_chunk (4 KiB) and stays 32-bit.
+ *
+ * D6 (round 3): the price of that correctness is recorded here because it is
+ * invisible in the type change. `{ uint64_t, size_t, uint32_t }` pads to 24
+ * bytes where the old `{ uint64_t, uint32_t, uint32_t }` packed to 16 -- +50%
+ * on the trainer's largest array, and `len` is already the narrow field so no
+ * reordering recovers it. zgec_sel_entry likewise goes 24 to 32. For corpora
+ * below 4 GiB the alternative is to keep the 32-bit field and reject
+ * `data_size > UINT32_MAX` outright; that trades coverage for footprint, and
+ * this note exists to put that decision on the record. */
+typedef struct { uint64_t hash; size_t pos; uint32_t len; } zgec_chunk;
 
 static uint64_t zgec_rolling_hash(uint64_t h, uint8_t byte)
 {
@@ -1184,7 +1261,9 @@ static int zgec_chunk_high_entropy(const uint8_t *data, size_t len)
     return 0;
 }
 
-typedef struct { uint32_t idx; uint64_t score; uint32_t pos; uint32_t len; } zgec_sel_entry;
+/* C4: idx and pos are input-relative and match zgec_chunk.pos in width;
+ * `score` must not be narrower than the best_score it is compared against. */
+typedef struct { size_t idx; uint64_t score; size_t pos; uint32_t len; } zgec_sel_entry;
 
 static int zgec_sel_cmp_asc(const void *a, const void *b)
 {
@@ -1197,13 +1276,72 @@ static int zgec_sel_cmp_asc(const void *a, const void *b)
     return 0;
 }
 
+/* C22: position-sorted index entry. Selected chunk positions are strictly
+ * increasing in the source and therefore distinct, so each selection has at
+ * most one successor by position and this index replaces the linear scan with
+ * a binary search without changing which successor is chosen.
+ *
+ * D5 (round 3): that distinctness is load-bearing and its source is the
+ * chunker in zgec_dict_train -- `chunk_start` advances to `i + 1` after every
+ * emitted chunk, so chunk positions increase monotonically and no two selected
+ * chunks can share a position. The search below takes the single
+ * lowest-positioned entry it finds and gives up when that one is already used,
+ * where the linear scan it replaces would have continued past a used match to
+ * an unused duplicate. A chunker that ever allowed equal positions would
+ * therefore change the trained dictionary silently, so the invariant is
+ * recorded here rather than left implicit in the chunk-emission loop. */
+typedef struct { size_t pos; size_t idx; } zgec_pos_entry;
+
+static int zgec_pos_cmp(const void *a, const void *b)
+{
+    const zgec_pos_entry *x = (const zgec_pos_entry *)a;
+    const zgec_pos_entry *y = (const zgec_pos_entry *)b;
+    if (x->pos < y->pos) return -1;
+    if (x->pos > y->pos) return 1;
+    return 0;
+}
+
+/* Grow the chunk array so that index n_chunks can be written.
+ * C5: both the doubling and the byte-size product are checked. An unchecked
+ * `cap * 2` can wrap to zero, after which the allocation asks for nothing and
+ * the next store runs off the end of the buffer. */
+static zgec_err zgec_chunk_reserve(zgec_chunk **chunks, size_t *cap,
+                                   size_t n_chunks)
+{
+    zgec_chunk *tmp;
+    size_t nc;
+    if (n_chunks < *cap) return ZGEC_OK;
+    if (*cap > SIZE_MAX / 2 || *cap * 2 > SIZE_MAX / sizeof(**chunks))
+        return ZGEC_ERR_NOMEM;
+    nc = *cap * 2;
+    tmp = (zgec_chunk *)zgec_alloc(nc * sizeof(*tmp), _Alignof(zgec_chunk));
+    if (!tmp) return ZGEC_ERR_NOMEM;
+    memcpy(tmp, *chunks, n_chunks * sizeof(*tmp));
+    zgec_free(*chunks);
+    *chunks = tmp;
+    *cap = nc;
+    return ZGEC_OK;
+}
+
 zgec_err zgec_dict_train(uint8_t **out, size_t *out_size,
                           const uint8_t *data, size_t data_size,
                           size_t dict_size)
 {
     if (!out || !out_size) return ZGEC_ERR_INVAL;
-    if (!data) { *out = NULL; *out_size = 0; return ZGEC_OK; }
-    if (data_size == 0 || dict_size == 0) { *out = NULL; *out_size = 0; return ZGEC_OK; }
+    /* D4 (round 3): set once, here, so every failure path below leaves the
+     * caller with a determinate value. Only the two "nothing to do" paths used
+     * to assign it, so a caller that freed *out after a documented failure --
+     * an allocation failure, the overflow guards further down, or a
+     * zgec_chunk_reserve failure -- freed whatever the output buffer happened
+     * to hold at that point. */
+    *out = NULL;
+    if (!data) { *out_size = 0; return ZGEC_OK; }
+    if (data_size == 0 || dict_size == 0) { *out_size = 0; return ZGEC_OK; }
+    /* C2: the trainer emits dictionaries for the format, and section 3.3 caps
+     * a dictionary at 2^26 bytes, so a larger budget is clamped rather than
+     * honoured — otherwise the caller is handed a dictionary the decoder will
+     * reject with ZGEC_ERR_DICT_SIZE. */
+    if (dict_size > (size_t)ZGEC_DICT_RAW_MAX) dict_size = (size_t)ZGEC_DICT_RAW_MAX;
     size_t mask = 0x1FF;
     size_t min_chunk = 64;
     size_t max_chunk = 4096;
@@ -1220,16 +1358,11 @@ zgec_err zgec_dict_train(uint8_t **out, size_t *out_size,
         rolling = zgec_rolling_hash(rolling, data[i]);
         if (((rolling & mask) == 0 || i - chunk_start >= max_chunk - 1) && i - chunk_start >= min_chunk) {
             if (n_chunks >= chunks_cap) {
-                size_t nc = chunks_cap * 2;
-                zgec_chunk *tmp = (zgec_chunk *)zgec_alloc(nc * sizeof(*tmp), _Alignof(zgec_chunk));
-                if (!tmp) { zgec_free(chunks); return ZGEC_ERR_NOMEM; }
-                memcpy(tmp, chunks, n_chunks * sizeof(*chunks));
-                zgec_free(chunks);
-                chunks = tmp;
-                chunks_cap = nc;
+                zgec_err ce = zgec_chunk_reserve(&chunks, &chunks_cap, n_chunks);
+                if (ce != ZGEC_OK) { zgec_free(chunks); return ce; }
             }
             chunks[n_chunks].hash = zgec_xxh64(data + chunk_start, i - chunk_start + 1, 0);
-            chunks[n_chunks].pos = (uint32_t)chunk_start;
+            chunks[n_chunks].pos = chunk_start;
             chunks[n_chunks].len = (uint32_t)(i - chunk_start + 1);
             n_chunks++;
             chunk_start = i + 1;
@@ -1240,25 +1373,34 @@ zgec_err zgec_dict_train(uint8_t **out, size_t *out_size,
         size_t len = data_size - chunk_start;
         if (len > max_chunk) len = max_chunk;
         if (n_chunks >= chunks_cap) {
-            size_t nc = chunks_cap * 2;
-            zgec_chunk *tmp = (zgec_chunk *)zgec_alloc(nc * sizeof(*tmp), _Alignof(zgec_chunk));
-            if (!tmp) { zgec_free(chunks); return ZGEC_ERR_NOMEM; }
-            memcpy(tmp, chunks, n_chunks * sizeof(*chunks));
-            zgec_free(chunks);
-            chunks = tmp;
-            chunks_cap = nc;
+            zgec_err ce = zgec_chunk_reserve(&chunks, &chunks_cap, n_chunks);
+            if (ce != ZGEC_OK) { zgec_free(chunks); return ce; }
         }
         chunks[n_chunks].hash = zgec_xxh64(data + chunk_start, len, 0);
-        chunks[n_chunks].pos = (uint32_t)chunk_start;
+        chunks[n_chunks].pos = chunk_start;
         chunks[n_chunks].len = (uint32_t)len;
         n_chunks++;
     }
 
-    size_t table_cap = 1;
-    while (table_cap < n_chunks * 2) table_cap <<= 1;
-    if (table_cap < 64) table_cap = 64;
     struct zgec_dict_table_entry { uint64_t hash; uint32_t count; };
     typedef struct zgec_dict_table_entry zgec_dict_table_entry;
+    /* C5: guarded power-of-two sizing. `n_chunks * 2` and the shifting loop
+     * can both wrap, and a table_cap of 0 would turn `& (table_cap - 1)` into
+     * an all-ones mask whose probe loop never terminates. 64 is the floor. The
+     * first guard bounds the *count*; D3 (round 3) adds the byte-size product
+     * this comment used to claim was already checked -- table_cap is the next
+     * power of two above n_chunks * 2, so it can approach 4x n_chunks, and only
+     * the product is the size actually requested. */
+    if (n_chunks > (SIZE_MAX / 2) / sizeof(zgec_dict_table_entry)) {
+        zgec_free(chunks);
+        return ZGEC_ERR_NOMEM;
+    }
+    size_t table_cap = 64;
+    while (table_cap < n_chunks * 2) table_cap <<= 1;
+    if (table_cap > SIZE_MAX / sizeof(zgec_dict_table_entry)) {
+        zgec_free(chunks);
+        return ZGEC_ERR_NOMEM;
+    }
     zgec_dict_table_entry *table = (zgec_dict_table_entry *)zgec_alloc(table_cap * sizeof(*table), _Alignof(zgec_dict_table_entry));
     if (!table) { zgec_free(chunks); return ZGEC_ERR_NOMEM; }
     memset(table, 0, table_cap * sizeof(*table));
@@ -1281,22 +1423,52 @@ zgec_err zgec_dict_train(uint8_t **out, size_t *out_size,
     for (size_t i = 0; i < n_chunks; i++) {
         if (zgec_chunk_high_entropy(data + chunks[i].pos, chunks[i].len)) state[i] = 2;
     }
+    /* C20: a chunk's score is (occurrences - 1) * length, and with the table
+     * above complete the occurrence count is fixed, so it is resolved once
+     * here rather than re-probing the hash table for every candidate of every
+     * selection. D1 (round 3): the array holds the 32-bit occurrence count,
+     * not the 64-bit product, because the product also depends on this chunk's
+     * length and is two instructions at the point of comparison. That halves
+     * what this fix adds to the trainer's peak -- 4 bytes per chunk instead of
+     * 8 -- in the one function the original review flagged for peak memory.
+     * The comparison still sees exactly (occ - 1) * len, and only for
+     * occurrences >= 2, so the selection order and its first-wins tie-break are
+     * unchanged and the trained dictionary is byte-for-byte what the probing
+     * version produced. */
+    if (n_chunks > SIZE_MAX / sizeof(uint32_t)) {
+        zgec_free(state); zgec_free(table); zgec_free(chunks);
+        return ZGEC_ERR_NOMEM;
+    }
+    uint32_t *occurrences = (uint32_t *)zgec_alloc(
+        (n_chunks ? n_chunks : 1) * sizeof(*occurrences), _Alignof(uint32_t));
+    if (!occurrences) {
+        zgec_free(state); zgec_free(table); zgec_free(chunks);
+        return ZGEC_ERR_NOMEM;
+    }
+    for (size_t i = 0; i < n_chunks; i++) {
+        uint64_t h = chunks[i].hash;
+        uint32_t occ = 0;
+        if (h == 0) h = 1;
+        {
+            size_t idx = (size_t)(h & (uint64_t)(table_cap - 1));
+            for (;;) {
+                if (table[idx].hash == h) { occ = table[idx].count; break; }
+                idx = (idx + 1) & (table_cap - 1);
+            }
+        }
+        occurrences[i] = occ;
+    }
     size_t total = 0;
     for (;;) {
         size_t best = (size_t)-1;
         uint64_t best_score = 0;
         for (size_t i = 0; i < n_chunks; i++) {
+            uint64_t sc;
             if (state[i] != 0) continue;
-            uint64_t h = chunks[i].hash;
-            if (h == 0) h = 1;
-            size_t idx = (size_t)(h & (uint64_t)(table_cap - 1));
-            uint32_t occ = 0;
-            for (;;) {
-                if (table[idx].hash == h) { occ = table[idx].count; break; }
-                idx = (idx + 1) & (table_cap - 1);
-            }
-            uint64_t score = (occ >= 2) ? (uint64_t)(occ - 1) * chunks[i].len : 0;
-            if (score > best_score) { best_score = score; best = i; }
+            sc = (occurrences[i] >= 2u)
+                     ? (uint64_t)(occurrences[i] - 1u) * chunks[i].len
+                     : 0u;
+            if (sc > best_score) { best_score = sc; best = i; }
         }
         if (best == (size_t)-1 || best_score == 0) break;
         if (total + chunks[best].len > dict_size) break;
@@ -1310,66 +1482,84 @@ zgec_err zgec_dict_train(uint8_t **out, size_t *out_size,
     size_t n_sel = 0;
     for (size_t i = 0; i < n_chunks; i++) if (state[i] == 1) n_sel++;
     uint8_t *outbuf = (uint8_t *)zgec_alloc(total + ZGEC_OUTPUT_SLACK, 64);
-    if (!outbuf) { zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
+    if (!outbuf) { zgec_free(occurrences); zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
     if (n_sel > 0) {
         zgec_sel_entry *sel = (zgec_sel_entry *)zgec_alloc(n_sel * sizeof(*sel), _Alignof(zgec_sel_entry));
-        if (!sel) { zgec_free(outbuf); zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
+        if (!sel) { zgec_free(occurrences); zgec_free(outbuf); zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
         size_t k = 0;
         for (size_t i = 0; i < n_chunks; i++) {
             if (state[i] != 1) continue;
-            uint64_t h = chunks[i].hash;
-            if (h == 0) h = 1;
-            size_t idx = (size_t)(h & (uint64_t)(table_cap - 1));
-            uint32_t occ = 0;
-            for (;;) {
-                if (table[idx].hash == h) { occ = table[idx].count; break; }
-                idx = (idx + 1) & (table_cap - 1);
-            }
-            sel[k].idx = (uint32_t)i;
-            sel[k].score = (occ >= 2) ? (uint64_t)(occ - 1) * chunks[i].len : 0;
+            sel[k].idx = i;
+            sel[k].score = (occurrences[i] >= 2u)
+                               ? (uint64_t)(occurrences[i] - 1u) * chunks[i].len
+                               : 0u;
             sel[k].pos = chunks[i].pos;
             sel[k].len = chunks[i].len;
             k++;
         }
+        /* C23: ascending is required, not incidental — section 5.7 step 5
+         * orders the selected chunks by ascending score so the best content
+         * ends up at the end, and zgec_dict.h repeats it. High-score chunks
+         * are therefore emitted last, nearest the dictionary tail. */
         qsort(sel, n_sel, sizeof(*sel), zgec_sel_cmp_asc);
         /* Preserve adjacency: greedily chain chunks that were adjacent
            in source so longer matches survive. Walk ascending-score
            order; after emitting a chunk, immediately emit any unused
            successor that starts where it ends. */
         uint8_t *used = (uint8_t *)zgec_alloc(n_sel ? n_sel : 1, 1);
-        if (!used) { zgec_free(sel); zgec_free(outbuf); zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
+        if (!used) { zgec_free(occurrences); zgec_free(sel); zgec_free(outbuf); zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
         memset(used, 0, n_sel);
+        /* C22: build the position-sorted index here rather than rescanning
+         * every selected entry for each successor (O(n_sel) per step, and
+         * O(n_sel^2) in the worst case). */
+        zgec_pos_entry *by_pos = (zgec_pos_entry *)zgec_alloc(
+            n_sel * sizeof(*by_pos), _Alignof(zgec_pos_entry));
+        if (!by_pos) { zgec_free(used); zgec_free(occurrences); zgec_free(sel); zgec_free(outbuf); zgec_free(state); zgec_free(table); zgec_free(chunks); return ZGEC_ERR_NOMEM; }
+        for (size_t i = 0; i < n_sel; i++) {
+            by_pos[i].pos = sel[i].pos;
+            by_pos[i].idx = i;
+        }
+        qsort(by_pos, n_sel, sizeof(*by_pos), zgec_pos_cmp);
         size_t off = 0;
         for (size_t i = 0; i < n_sel; i++) {
             if (used[i]) continue;
             size_t cur = i;
             used[cur] = 1;
             {
-                uint32_t ci = sel[cur].idx;
+                size_t ci = sel[cur].idx;
                 memcpy(outbuf + off, data + chunks[ci].pos, chunks[ci].len);
                 off += chunks[ci].len;
             }
             for (;;) {
                 uint64_t want = (uint64_t)sel[cur].pos + sel[cur].len;
                 size_t nxt = (size_t)-1;
-                for (size_t j = 0; j < n_sel; j++) {
-                    if (used[j]) continue;
-                    if ((uint64_t)sel[j].pos == want) { nxt = j; break; }
+                size_t lo = 0;
+                size_t hi = n_sel;
+                while (lo < hi) {
+                    size_t mid = lo + (hi - lo) / 2;
+                    if ((uint64_t)by_pos[mid].pos < want) lo = mid + 1;
+                    else hi = mid;
+                }
+                if (lo < n_sel && (uint64_t)by_pos[lo].pos == want) {
+                    size_t cand = by_pos[lo].idx;
+                    if (!used[cand]) nxt = cand;
                 }
                 if (nxt == (size_t)-1) break;
                 used[nxt] = 1;
                 {
-                    uint32_t ci = sel[nxt].idx;
+                    size_t ci = sel[nxt].idx;
                     memcpy(outbuf + off, data + chunks[ci].pos, chunks[ci].len);
                     off += chunks[ci].len;
                 }
                 cur = nxt;
             }
         }
+        zgec_free(by_pos);
         zgec_free(used);
         zgec_free(sel);
     }
 
+    zgec_free(occurrences);
     zgec_free(state);
     zgec_free(table);
     zgec_free(chunks);

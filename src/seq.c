@@ -1,4 +1,5 @@
 #include "zgec_seq.h"
+#include "zgec_internal.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -65,6 +66,29 @@ zgec_err zgec_seq_stream_decode(uint32_t *out, size_t n,
 
 /* ---- stream encode ---- */
 
+/* Validate that `value` lies in the range the symbol encodes and yield its
+ * extra bits (section 8.1): base(sym) is the smallest value the symbol
+ * encodes and its range is 2^nbits values wide. A value outside that range
+ * makes the unsigned subtraction wrap or overflow nbits, and zgec_bw_write
+ * keeps only the low n bits, so the stream would decode to a different value
+ * (entries 1 and 5). nbits is validated here because it is a caller-supplied
+ * array. */
+static int zgec_seq_get_extra(uint32_t value, uint8_t symbol,
+                              const uint32_t *base, const uint8_t *nbits,
+                              uint32_t *extra_out)
+{
+    unsigned nb = (unsigned)nbits[symbol];
+    uint32_t b = base[symbol];
+    uint32_t extra;
+
+    if (nb > 32) return 0;
+    if (value < b) return 0;
+    extra = value - b;
+    if (nb < 32 && extra >= (UINT32_C(1) << nb)) return 0;
+    *extra_out = extra;
+    return 1;
+}
+
 size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
                               const zgec_fse_enc_table *t,
                               int rle_symbol,
@@ -81,15 +105,36 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
         if ((unsigned)rle_symbol >= (unsigned)ZGEC_NSYM_SEQ) return 0;
         if (!values) return 0;
         unsigned nb = (unsigned)nbits[rle_symbol];
-        if (nb > 0) {
-            /* Backward bitstream: consumption order is the reverse of write
-               order, so values are written last-to-first; the decoder then
-               reads them out[0..n-1] in order (section 8.5). */
-            uint32_t bval = base[rle_symbol];
-            for (size_t i = n; i > 0; i--) {
-                uint32_t extra = values[i - 1] - bval;
-                zgec_bw_write(bw, extra, nb);
+        /* Validate every value against rle_symbol before the first write, so
+           a rejection leaves the caller's bitstream untouched rather than
+           holding the n - k values already written with bw->ptr advanced
+           (finding 3). Callers normally guarantee membership through
+           zgec_seq_rle_symbol(), but the encoder does not rely on that
+           contract (entry 1). */
+        {
+            uint32_t probe;
+            for (size_t i = 0; i < n; i++) {
+                if (!zgec_seq_get_extra(values[i], (uint8_t)rle_symbol,
+                                        base, nbits, &probe))
+                    return 0;
             }
+        }
+        /* Backward bitstream: consumption order is the reverse of write
+           order, so values are written last-to-first; the decoder then
+           reads them out[0..n-1] in order (section 8.5). */
+        for (size_t i = n; i > 0; i--) {
+            uint32_t extra;
+            /* The pre-pass above already guarantees every value belongs to
+               rle_symbol -- including the nb == 0 case, where a value outside
+               the symbol's single base value used to be dropped without a
+               trace (entry 1). Kept as a guard against future edits. */
+            if (!zgec_seq_get_extra(values[i - 1], (uint8_t)rle_symbol,
+                                    base, nbits, &extra))
+                return 0;
+            if (nb > 0) zgec_bw_write(bw, extra, nb);
+            /* zgec_bw_write latches overflow and stops storing, so this is
+               an early exit, not a safety net (entry 11). */
+            if (bw->overflow) return 0;
         }
         if (zgec_bw_finish(bw) == 0) return 0;
         return (size_t)(bw->ptr - bw->start);
@@ -124,10 +169,10 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
                                    const uint32_t *base,
                                    const uint8_t *nbits)
 {
-    uint8_t *syms;
     size_t i;
     int al;
     unsigned S;
+    int nsym;
     uint8_t last_s;
     unsigned last_cls;
     zgec_fse_enc_entry first_entry;
@@ -139,50 +184,101 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         if (zgec_bw_finish(bw) == 0) return 0;
         return (size_t)(bw->ptr - bw->start);
     }
+    /* One table's state indexes the next, so a damaged table must be
+       rejected before it can drive a shift or an index out of range
+       (entries 2, 3 and 4). al is bounded exactly as every other table
+       check in the tree bounds it, which also makes 1u << al defined. */
+    if (!enc[0]->e || !enc[1]->e || !enc[2]->e) return 0;
     al = enc[0]->al;
+    if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return 0;
     if (enc[1]->al != al || enc[2]->al != al) return 0;
+    if (enc[1]->nsym != enc[0]->nsym || enc[2]->nsym != enc[0]->nsym)
+        return 0;
+    nsym = enc[0]->nsym;
+    if (nsym <= 0 || nsym > ZGEC_NSYM_SEQ) return 0;
     S = 1u << (unsigned)al;
 
-    syms = (uint8_t *)zgec_alloc(n, 1);
-    if (!syms) return 0;
+    /* The symbols are derived on the fly rather than materialised in an
+       n-byte array (entry 10): this validator pass costs no allocation and
+       still rejects a value outside the alphabet before anything is
+       written, so a failed encode leaves the bitstream untouched. */
     for (i = 0; i < n; i++) {
         uint8_t nb;
-        syms[i] = zgec_seq_code_of(values[i], &nb);
-        if ((int)syms[i] >= enc[0]->nsym) { zgec_free(syms); return 0; }
+        uint8_t code = zgec_seq_code_of(values[i], &nb);
+        uint32_t extra;
+        if ((int)code >= nsym) return 0;
+        /* Bound the value against its symbol's range here too, not only in
+           the write loop below: the range test can reject for a custom
+           base/nbits pair, and doing it here is what keeps the promise that
+           a failed encode leaves the bitstream untouched (finding 3). The
+           accepted set is identical to the loop's, so this rejects nothing
+           the loop would have accepted. */
+        if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra))
+            return 0;
     }
 
-    last_s = syms[n - 1];
+    {
+        uint8_t nb;
+        last_s = zgec_seq_code_of(values[n - 1], &nb);
+    }
     last_cls = use_prev ? ((n >= 2) ? zgec_mlclass(ml[n - 2]) : 0u)
                         : zgec_mlclass(ml[n - 1]);
-    if ((int)last_s >= enc[last_cls]->nsym) { zgec_free(syms); return 0; }
+    /* zgec_mlclass() is total on 0..2, but the index must not depend on
+       that staying true (entry 3). */
+    if (last_cls >= 3u) return 0;
     first_entry = enc[last_cls]->e[(size_t)last_s * (size_t)S];
     state = first_entry.new_state;
+    if (state >= S) return 0;
     if (nbits[last_s] > 0) {
-        uint32_t extra = values[n - 1] - base[last_s];
+        uint32_t extra;
+        if (!zgec_seq_get_extra(values[n - 1], last_s, base, nbits, &extra))
+            return 0;
         zgec_bw_write(bw, extra, (unsigned)nbits[last_s]);
+        if (bw->overflow) return 0;
     }
 
     for (i = n - 1; i > 0; i--) {
-        uint8_t s = syms[i - 1];
-        unsigned c = use_prev ? ((i >= 2) ? zgec_mlclass(ml[i - 2]) : 0u)
-                              : zgec_mlclass(ml[i - 1]);
+        uint8_t s;
+        unsigned c;
         zgec_fse_enc_entry entry;
         uint32_t bits;
-        if ((int)s >= enc[c]->nsym) { zgec_free(syms); return 0; }
+        {
+            uint8_t nb;
+            s = zgec_seq_code_of(values[i - 1], &nb);
+        }
+        c = use_prev ? ((i >= 2) ? zgec_mlclass(ml[i - 2]) : 0u)
+                     : zgec_mlclass(ml[i - 1]);
+        if (c >= 3u) return 0;
+        if ((int)s >= enc[c]->nsym) return 0;
         entry = enc[c]->e[(size_t)s * (size_t)S + (size_t)state];
         bits = (state >= (uint32_t)entry.baseline)
                    ? (uint32_t)(state - (uint32_t)entry.baseline)
                    : 0u;
+        /* The transition is representable only if it fits nb_bits. For a
+           table built by zgec_fse_build_enc the occurrence whose range covers
+           `state` guarantees bits < 2^nb_bits, but that invariant is
+           constructed and never checked, and zgec_bw_write() masks its value
+           to the low n bits rather than reporting the ones it lost -- so an
+           inconsistent baseline/nb_bits pair would emit a stream that decodes
+           to a different value and still return a byte count as on success
+           (finding 1). nb_bits < 32 so the shift below is defined. */
+        if ((unsigned)entry.nb_bits < 32u &&
+            bits >= (UINT32_C(1) << (unsigned)entry.nb_bits))
+            return 0;
         zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
         if (nbits[s] > 0) {
-            uint32_t extra = values[i - 1] - base[s];
+            uint32_t extra;
+            if (!zgec_seq_get_extra(values[i - 1], s, base, nbits, &extra))
+                return 0;
             zgec_bw_write(bw, extra, (unsigned)nbits[s]);
         }
+        if (bw->overflow) return 0;
         state = entry.new_state;
+        if (state >= S) return 0;
     }
 
     zgec_bw_write(bw, state, (unsigned)al);
-    zgec_free(syms);
+    if (bw->overflow) return 0;
     if (zgec_bw_finish(bw) == 0) return 0;
     return (size_t)(bw->ptr - bw->start);
 }
@@ -199,8 +295,19 @@ int zgec_seq_rle_symbol(const uint32_t *values, size_t n)
     return (int)code0;
 }
 
-static void zgec_normalize_counts(int16_t *counts, const uint32_t *hist, int nsym, int al)
+/* Normalise a histogram to Annex A counts summing to 2^al. Returns 0 when
+ * no valid distribution exists. `al` is bounded first so that both the shift
+ * and the int16_t counts are exact: ZGEC_MAX_AL is 11, so S <= 2048 and the
+ * cast below cannot overflow (entry 7's al == 15 is unreachable). Every
+ * observed symbol needs at least one state, so a histogram with more
+ * observed symbols than states has no representation at all (entry 6); that
+ * case used to produce effective counts exceeding S, which only
+ * zgec_fse_build_dec() rejected later. Canonical shared implementation
+ * (see zgec_internal.h); previously duplicated in encode.c. */
+int zgec_normalize_counts(int16_t *counts, const uint32_t *hist,
+                          int nsym, int al)
 {
+    if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return 0;
     int S = 1 << al;
     uint64_t total = 0;
     int n_non_zero = 0;
@@ -208,10 +315,11 @@ static void zgec_normalize_counts(int16_t *counts, const uint32_t *hist, int nsy
         total += hist[s];
         if (hist[s] > 0) n_non_zero++;
     }
+    if (n_non_zero > S) return 0;
     if (total == 0 || n_non_zero == 0) {
         counts[0] = (int16_t)S;
         for (int s = 1; s < nsym; s++) counts[s] = 0;
-        return;
+        return 1;
     }
 
     int remaining = S;
@@ -257,6 +365,17 @@ static void zgec_normalize_counts(int16_t *counts, const uint32_t *hist, int nsy
             }
         }
     }
+    /* The correction loop above can exit with `remaining != 0` (it has two
+       breaks for the cases where no candidate can absorb the surplus), so the
+       contract is enforced here by checking the sum rather than by asserting
+       it. Effective counts are the normalised ones, with -1 meaning "one
+       state" -- the same convention zgec_fse_build_dec() reads. */
+    {
+        int sum = 0;
+        for (int s = 0; s < nsym; s++)
+            sum += (counts[s] < 0) ? 1 : (int)counts[s];
+        return sum == S;
+    }
 }
 
 zgec_err zgec_seq_build_tables(zgec_fse_dec_table **dec,
@@ -266,7 +385,16 @@ zgec_err zgec_seq_build_tables(zgec_fse_dec_table **dec,
     if (!dec || !enc || !hist) return ZGEC_ERR_INVAL;
     if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
     int16_t counts[ZGEC_NSYM_SEQ];
-    zgec_normalize_counts(counts, hist, ZGEC_NSYM_SEQ, al);
+    /* No valid distribution: either more observed symbols than the state
+       space has states, or its normalised counts do not sum to 2^al (entry 6;
+       the sum is verified in zgec_normalize_counts() itself).
+       ZGEC_ERR_FSE_AL is the nearest code the enum offers -- the true fault is
+       "accuracy log too small for this alphabet", which is not the same as a
+       log outside [ZGEC_MIN_AL, ZGEC_MAX_AL] that the same code otherwise
+       reports. A distinct member would have to be added to
+       include/zgec_common.h (outside this slice). */
+    if (!zgec_normalize_counts(counts, hist, ZGEC_NSYM_SEQ, al))
+        return ZGEC_ERR_FSE_AL;
 
     zgec_err err = zgec_fse_build_dec(dec, counts, ZGEC_NSYM_SEQ, al);
     if (err != ZGEC_OK) return err;

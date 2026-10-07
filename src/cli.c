@@ -16,6 +16,42 @@
 
 #define CLI_MAX_DICTS 4
 
+/* An external dictionary is a prefix region, so it competes for the per-worker
+ * virtual buffer with the block itself (12.3, P24). The format's raw
+ * dictionary maximum is 64 MiB; refusing a larger file before it is copied
+ * keeps a mistyped path from costing that much resident memory. */
+#define CLI_DICT_MAX_BYTES ((uint64_t)1 << 26)
+
+/* No size limit at all, for the input file. */
+#define CLI_NO_SIZE_LIMIT UINT64_MAX
+
+/* The three commands, resolved once by exact string comparison and before any
+ * file is read. A first-character test would accept "cat" as compress and
+ * "destroy" as decompress, and would only reject them after the input and the
+ * dictionaries had already been loaded. */
+typedef enum {
+    CLI_COMPRESS,
+    CLI_DECOMPRESS,
+    CLI_TEST
+} cli_command;
+
+static int cli_command_of(const char *s, cli_command *out)
+{
+    if (strcmp(s, "c") == 0 || strcmp(s, "C") == 0) {
+        *out = CLI_COMPRESS;
+        return 1;
+    }
+    if (strcmp(s, "d") == 0 || strcmp(s, "D") == 0) {
+        *out = CLI_DECOMPRESS;
+        return 1;
+    }
+    if (strcmp(s, "t") == 0 || strcmp(s, "T") == 0) {
+        *out = CLI_TEST;
+        return 1;
+    }
+    return 0;
+}
+
 /* Monotonic wall clock, for the throughput line of a c/d/t run.
  *
  * CLOCK_MONOTONIC is POSIX, so glibc hides it under the -std=c11 this
@@ -24,67 +60,155 @@
  * Windows, which ignores the macro and takes the branch below. */
 #if defined(_WIN32)
 #include <windows.h>
+/* The counter frequency is a property of the machine, not of the call, so it
+ * is queried once and cached instead of on every timestamp. The cache is
+ * plain static state, which is safe only because every timestamp in this file
+ * is taken on the main thread -- the codec's workers never call this. If a
+ * timestamp is ever taken around anything that spawns, this becomes a race
+ * and the frequency has to be resolved once in main and passed down.
+ *
+ * 0.0 is the "clock unavailable" sentinel, not a time: cli_timing() reports
+ * it as an absence instead of turning it into a fabricated 0.0 MiB/s. */
 static double cli_now(void)
 {
-    LARGE_INTEGER c, f;
+    static LARGE_INTEGER freq;
+    static int have_freq = 0;
+    LARGE_INTEGER c;
+    if (!have_freq) {
+        QueryPerformanceFrequency(&freq);
+        have_freq = (freq.QuadPart > 0);
+    }
+    if (!have_freq) return 0.0;
     QueryPerformanceCounter(&c);
-    QueryPerformanceFrequency(&f);
-    return (double)c.QuadPart / (double)f.QuadPart;
+    return (double)c.QuadPart / (double)freq.QuadPart;
 }
 #else
 #include <time.h>
 static double cli_now(void)
 {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    /* This branch needs no cached state, but a failed read uses the same 0.0
+     * sentinel as the Windows one so both behave alike. The old code ignored
+     * clock_gettime's result and returned whatever ts happened to hold. */
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0.0;
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 #endif
 
-/* MiB per second over a wall-clock interval; 0 when the interval is empty. */
+/* MiB per second over a wall-clock interval; 0 when the interval is empty.
+ * The divisor is binary, so the label this file prints for the value is MiB/s
+ * and never the decimal MB/s. That rule is this file's alone: tests/bench.c
+ * and tools/bench/report.py divide identically but still label the result
+ * MB/s, so the tree carries two unit names for one computation. */
 static double cli_mbs(size_t bytes, double sec)
 {
     if (sec <= 0.0) return 0.0;
     return ((double)bytes / 1048576.0) / sec;
 }
 
-static zgec_err zgec_read_file(const char *path, uint8_t **out, size_t *out_size)
+/* Whether a wall-clock interval is a usable measurement.
+ *
+ * cli_now() returns 0.0 for a clock it could not read, and that is not a
+ * duration: printing it produced "0.0 ms  0.0 MiB/s", a plausible-looking
+ * throughput that was never measured and carried no sign that timing was
+ * broken. Callers print the fields only when this is true, and otherwise say
+ * the timing is unavailable. */
+static int cli_timed(double sec)
 {
-    FILE *f = fopen(path, "rb");
+    return sec > 0.0;
+}
+
+/* Read a whole file into a fresh buffer.
+ *
+ * Every step is checked: both seeks and the tell can fail, the size has to be
+ * representable as a size_t, and the allocation is sized for exactly the bytes
+ * that will be read. max_bytes bounds what is accepted, so a caller that
+ * limits external dictionaries rejects an oversized file before allocating
+ * for it; pass CLI_NO_SIZE_LIMIT for the input. */
+static zgec_err zgec_read_file(const char *path, uint64_t max_bytes,
+                               uint8_t **out, size_t *out_size)
+{
+    FILE *f;
+    long sz;
+    size_t want;
+    size_t rd;
+    uint8_t *buf;
+
+    f = fopen(path, "rb");
     if (!f) return ZGEC_ERR_INVAL;
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return ZGEC_ERR_INVAL; }
+    sz = ftell(f);
     if (sz < 0) { fclose(f); return ZGEC_ERR_INVAL; }
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = (uint8_t *)zgec_alloc((size_t)sz + 1, 64);
+    if (fseek(f, 0, SEEK_SET) != 0) { fclose(f); return ZGEC_ERR_INVAL; }
+    /* A long can be narrower than a size_t on some targets; reject a file
+     * this build cannot address rather than truncating the conversion. A file
+     * that is too large to *read* is an input fault, not an output one:
+     * returning ZGEC_ERR_OUTPUT_SIZE sent a caller whose 64 MiB dictionary was
+     * refused looking at the output end of the pipeline. zgec_err has no I/O
+     * code, so the generic invalid-argument code is the honest one. */
+    if ((uintmax_t)sz > (uintmax_t)SIZE_MAX ||
+        (uintmax_t)sz > (uintmax_t)max_bytes) {
+        fclose(f);
+        return ZGEC_ERR_INVAL;
+    }
+    want = (size_t)sz;
+    /* A zero-byte file still needs a non-NULL buffer to hand to the codec,
+     * so the request is one byte for it. Sizing the allocation at exactly
+     * `want` (not want + 1) also removes the overflow site the old
+     * `(size_t)sz + 1` had on sz. */
+    buf = (uint8_t *)zgec_alloc(want ? want : 1, 64);
     if (!buf) { fclose(f); return ZGEC_ERR_NOMEM; }
-    size_t rd = (size_t)fread(buf, 1, (size_t)sz, f);
-    fclose(f);
-    if (rd < (size_t)sz) { zgec_free(buf); return ZGEC_ERR_TRUNCATED; }
+    rd = fread(buf, 1, want, f);
+    if (rd < want) {
+        /* Separate an I/O error from a file that shrank or was never that
+         * long; both are fatal, but only the second is a truncation. */
+        zgec_err e = ferror(f) ? ZGEC_ERR_INTERNAL : ZGEC_ERR_TRUNCATED;
+        fclose(f);
+        zgec_free(buf);
+        return e;
+    }
+    if (fclose(f) != 0) { zgec_free(buf); return ZGEC_ERR_INTERNAL; }
     *out = buf;
     *out_size = rd;
     return ZGEC_OK;
 }
 
+/* Write a whole buffer, looping rather than trusting one fwrite.
+ *
+ * A failure here is an I/O failure (a full disk, a quota, a broken
+ * destination), not an allocation failure, so it no longer reports NOMEM.
+ * zgec_err has no I/O code, so the generic code is used. ferror() is tested
+ * as well as the byte count, because an error can be raised on a write whose
+ * count still looks complete, and the flush inside fclose() can raise one
+ * after the last write, so fclose() is part of the result. */
 static zgec_err zgec_write_file(const char *path, const uint8_t *data, size_t size)
 {
-    FILE *f = fopen(path, "wb");
+    FILE *f;
+    size_t off = 0;
+
+    f = fopen(path, "wb");
     if (!f) return ZGEC_ERR_INVAL;
-    size_t wr = fwrite(data, 1, size, f);
-    fclose(f);
-    if (wr < size) return ZGEC_ERR_NOMEM;
+    while (off < size) {
+        size_t wr = fwrite(data + off, 1, size - off, f);
+        if (wr == 0) { fclose(f); return ZGEC_ERR_INTERNAL; }
+        off += wr;
+    }
+    if (ferror(f) != 0) { fclose(f); return ZGEC_ERR_INTERNAL; }
+    if (fclose(f) != 0) return ZGEC_ERR_INTERNAL;
     return ZGEC_OK;
 }
 
 static void cli_usage(FILE *f, const char *argv0)
 {
     fprintf(f,
-        "usage: %s <c|d|t> [options] input output\n"
+        "usage: %s <c|d> [options] input output\n"
+        "       %s  t   [options] input\n"
         "\n"
         "commands:\n"
         "  c   compress input into output\n"
         "  d   decompress input into output\n"
-        "  t   compress, decompress and verify (writes no file)\n"
+        "  t   compress, decompress and verify (writes no file, so it\n"
+        "      takes no output path)\n"
         "\n"
         "options:\n"
         "  -l, --level N       1 (fastest) .. 9 (best ratio); default 3\n"
@@ -113,7 +237,7 @@ static void cli_usage(FILE *f, const char *argv0)
         "      --quiet         suppress the size summary\n"
         "  -h, --help          this text\n"
         "  -V, --version       version string\n",
-        argv0);
+        argv0, argv0);
 }
 
 /* Level presets: a level is the previous one plus what measured better on
@@ -262,7 +386,10 @@ int main(int argc, char **argv)
     size_t in_size = 0;
     uint8_t *out = NULL;
     size_t out_size = 0;
-    const char *cmd;
+    /* Initialised so that no path can read it before cli_command_of()
+     * has set it, even though every path that reaches a use has a value. */
+    cli_command cmd = CLI_COMPRESS;
+    const char *cmd_name;
     const char *inpath;
     const char *outpath = NULL;
     zgec_err err;
@@ -396,16 +523,31 @@ int main(int argc, char **argv)
         cli_usage(stderr, argv[0]);
         return 1;
     }
-    cmd = pos[0];
-    inpath = pos[1];
-    if (npos > 2) outpath = pos[2];
-    if (cmd[0] != 't' && cmd[0] != 'T' && outpath == NULL) {
-        fprintf(stderr, "zgec: %s needs an output path\n", cmd);
+    cmd_name = pos[0];
+    if (!cli_command_of(cmd_name, &cmd)) {
+        fprintf(stderr, "zgec: unknown command %s\n", cmd_name);
         cli_usage(stderr, argv[0]);
         return 1;
     }
+    inpath = pos[1];
+    /* c and d write a file, so they take exactly one output path; t writes
+     * nothing, so an output path there is a mistake rather than an argument
+     * to silently ignore. */
+    if (cmd == CLI_TEST) {
+        if (npos > 2) {
+            fprintf(stderr, "zgec: t takes no output path\n");
+            cli_usage(stderr, argv[0]);
+            return 1;
+        }
+    } else if (npos < 3) {
+        fprintf(stderr, "zgec: %s needs an output path\n", cmd_name);
+        cli_usage(stderr, argv[0]);
+        return 1;
+    } else {
+        outpath = pos[2];
+    }
 
-    err = zgec_read_file(inpath, &in, &in_size);
+    err = zgec_read_file(inpath, CLI_NO_SIZE_LIMIT, &in, &in_size);
     if (err != ZGEC_OK) {
         fprintf(stderr, "zgec: cannot read %s\n", inpath);
         return 1;
@@ -416,14 +558,22 @@ int main(int argc, char **argv)
         dict_ids[i] = (uint16_t)(i + 1);
         dict_sizes[i] = 0;
         dict_data[i] = NULL;
-        err = zgec_read_file(dict_paths[i], &dict_data[i], &dict_sizes[i]);
+        err = zgec_read_file(dict_paths[i], CLI_DICT_MAX_BYTES,
+                             &dict_data[i], &dict_sizes[i]);
         if (err != ZGEC_OK) {
-            fprintf(stderr, "zgec: cannot read dictionary %s\n", dict_paths[i]);
+            /* Name the limit as well as the code. A dictionary that is too
+             * large and a dictionary that is missing share one code, and the
+             * size limit (5.8) is the reason a real file gets refused, so
+             * the message has to say which limit was hit. */
+            fprintf(stderr,
+                    "zgec: cannot read dictionary %s: %s (limit %llu MiB, 5.8)\n",
+                    dict_paths[i], zgec_strerror(err),
+                    (unsigned long long)(CLI_DICT_MAX_BYTES >> 20));
             goto done;
         }
     }
 
-    if (cmd[0] == 'c' || cmd[0] == 'C' || cmd[0] == 't' || cmd[0] == 'T') {
+    if (cmd == CLI_COMPRESS || cmd == CLI_TEST) {
         zgec_params p;
         zgec_encoder *e;
         zgec_params_default(&p);
@@ -440,6 +590,53 @@ int main(int argc, char **argv)
         if (f_filter >= 0) p.use_filter = f_filter;
         if (f_ck >= 0) p.block_checksums = f_ck;
 
+        /* Literal references keep their predecessor block plain and
+         * unconditioned (6.3), so --litref replaces --sub-lit and
+         * --conditioning. The encoder suppresses those two itself, so
+         * clearing the flags here is belt-and-braces, not what makes the run
+         * correct, and it is not what makes the reported configuration true
+         * either (neither flag is reported anywhere).
+         *
+         * The warning is therefore keyed on the user's own request (f_sub and
+         * f_cond, which are -1 when the flag was never given), not on the
+         * resolved parameters. Testing the parameters fired on every higher
+         * level, because the presets enable sub-literals and conditioning on
+         * their own: `zgec c -l 9 --litref in out` announced that its options
+         * had been replaced when the preset had chosen them. */
+        if (p.use_litref != 0) {
+            if (!quiet && (f_sub == 1 || f_cond == 1))
+                fprintf(stderr, "zgec: --litref replaces sub-literals and "
+                                "sequence conditioning (6.3)\n");
+            p.use_sublit = 0;
+            p.use_conditioning = 0;
+        }
+
+        /* A block is the unit of parallelism (10.6), so more workers than
+         * the input has blocks only multiplies per-worker state for no gain.
+         * The ceiling division is written without an add so that it cannot
+         * overflow for an input close to SIZE_MAX. */
+        if (p.n_threads > 1 && in_size > 0 && p.block_log2 > 0) {
+            size_t block_size = (size_t)1 << p.block_log2;
+            size_t n_blocks = in_size / block_size
+                            + (in_size % block_size != 0 ? 1u : 0u);
+            if ((size_t)p.n_threads > n_blocks) {
+                /* Reported even under --quiet: -T is a measurement input, and
+                 * the benchmark that varies it labels each row with the count
+                 * it requested (tools/bench/run_bench.py:452-464), so a silent
+                 * clamp would publish a thread-scaling curve that was never
+                 * measured. Both numbers are on the line, so the effective
+                 * count is recoverable from stderr alone. */
+                fprintf(stderr, "zgec: threads requested %d, using %zu "
+                                "(one per block)\n",
+                        p.n_threads, n_blocks);
+                p.n_threads = (int)n_blocks;
+            }
+        }
+        /* No separate banner here. It was one more unconditional stderr line
+         * on every non-quiet run, and it duplicated information that is
+         * already reported: the input size appears in the encode summary
+         * below, and the worker count appears there and in the clamp notice
+         * above whenever it differs from what was requested. */
         e = zgec_encoder_create(&p);
         if (e == NULL) {
             fprintf(stderr, "zgec: out of memory\n");
@@ -468,21 +665,30 @@ int main(int argc, char **argv)
         if (!quiet) {
             double ratio = (out_size > 0)
                 ? (double)in_size / (double)out_size : 0.0;
-            fprintf(stderr,
-                    "zgec: level %d, %zu -> %zu bytes (%.4fx)  %.1f ms  "
-                    "%.1f MB/s\n",
-                    level, in_size, out_size, ratio, enc_sec * 1000.0,
-                    cli_mbs(in_size, enc_sec));
+            /* enc_sec is zgec_encode_frame() alone: context creation,
+             * dictionary registration and worker creation are outside the
+             * interval, so the figure is the frame encode. */
+            if (cli_timed(enc_sec))
+                fprintf(stderr,
+                        "zgec: level %d, %zu -> %zu bytes (%.4fx)  "
+                        "%.1f ms  %.1f MiB/s\n",
+                        level, in_size, out_size, ratio, enc_sec * 1000.0,
+                        cli_mbs(in_size, enc_sec));
+            else
+                fprintf(stderr,
+                        "zgec: level %d, %zu -> %zu bytes (%.4fx)  "
+                        "timing unavailable\n",
+                        level, in_size, out_size, ratio);
         }
     }
 
-    if (cmd[0] == 'c' || cmd[0] == 'C') {
+    if (cmd == CLI_COMPRESS) {
         err = zgec_write_file(outpath, out, out_size);
         if (err != ZGEC_OK) {
             fprintf(stderr, "zgec: cannot write %s\n", outpath);
             goto done;
         }
-    } else if (cmd[0] == 'd' || cmd[0] == 'D') {
+    } else if (cmd == CLI_DECOMPRESS) {
         zgec_limits lim;
         zgec_decoder *d;
         memset(&lim, 0, sizeof(lim));
@@ -513,16 +719,23 @@ int main(int argc, char **argv)
             goto done;
         }
         if (!quiet) {
-            fprintf(stderr, "zgec: %zu -> %zu bytes  %.1f ms  %.1f MB/s\n",
-                    in_size, out_size, dec_sec * 1000.0,
-                    cli_mbs(out_size, dec_sec));
+            /* dec_sec is zgec_decode_frame() alone, as for the encode. */
+            if (cli_timed(dec_sec))
+                fprintf(stderr,
+                        "zgec: %zu -> %zu bytes  %.1f ms  %.1f MiB/s\n",
+                        in_size, out_size, dec_sec * 1000.0,
+                        cli_mbs(out_size, dec_sec));
+            else
+                fprintf(stderr,
+                        "zgec: %zu -> %zu bytes  timing unavailable\n",
+                        in_size, out_size);
         }
         err = zgec_write_file(outpath, out, out_size);
         if (err != ZGEC_OK) {
             fprintf(stderr, "zgec: cannot write %s\n", outpath);
             goto done;
         }
-    } else if (cmd[0] == 't' || cmd[0] == 'T') {
+    } else if (cmd == CLI_TEST) {
         /* Compress and decompress in memory, then compare. */
         zgec_limits lim;
         zgec_decoder *d;
@@ -545,7 +758,9 @@ int main(int argc, char **argv)
                 goto done;
             }
         }
+        dec_t0 = cli_now();
         err = zgec_decode_frame(d, out, out_size, &back, &back_size);
+        dec_sec = cli_now() - dec_t0;
         zgec_decoder_destroy(d);
         if (err != ZGEC_OK) {
             fprintf(stderr, "zgec: t decompress failed: %s\n",
@@ -559,11 +774,20 @@ int main(int argc, char **argv)
             goto done;
         }
         zgec_free(back);
+        if (!quiet) {
+            /* Test mode times its decode step too, so one run reports the
+             * encode and the decode speed side by side. */
+            if (cli_timed(dec_sec))
+                fprintf(stderr, "zgec: decode %zu -> %zu bytes  %.1f ms  "
+                                "%.1f MiB/s\n",
+                        out_size, back_size, dec_sec * 1000.0,
+                        cli_mbs(back_size, dec_sec));
+            else
+                fprintf(stderr, "zgec: decode %zu -> %zu bytes  "
+                                "timing unavailable\n",
+                        out_size, back_size);
+        }
         printf("round-trip ok\n");
-    } else {
-        fprintf(stderr, "zgec: unknown command %s\n", cmd);
-        cli_usage(stderr, argv[0]);
-        goto done;
     }
 
     rc = 0;

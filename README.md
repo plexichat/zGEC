@@ -32,11 +32,16 @@ zgec -h                 # all options, levels and feature flags
 ```
 
 Run `zgec -h` for compression levels (`-l 1..9`), thread count (`-T`) and the
-individual feature toggles.
+individual feature toggles. See `docs/cli.md` for the full CLI guide with
+examples (levels table, threads, dictionaries, verification).
 
 ## Documentation
 
 The bitstream format is specified in `docs/spec.md`.
+`docs/cli.md` is the command-line usage guide.
+`docs/architecture.md` maps the shared vs encoder-only vs decoder-only
+split (including the intentional `dict.c`/`decode.c` fork).
+`docs/testing.md` describes the test suites and how to add tests.
 
 ## License
 

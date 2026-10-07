@@ -10,6 +10,10 @@ static inline uint32_t zgec_frame_block_size(const zgec_frame_header *fh)
 
 void zgec_frame_header_emit(uint8_t *buf, const zgec_frame_header *h)
 {
+    /* Review entry 8: the signature carries no destination capacity and
+       returns nothing, so it cannot report an error; a NULL pointer must
+       still not be dereferenced. */
+    if (buf == NULL || h == NULL) return;
     zgec_wr32(buf, ZGEC_MAGIC_U32);
     buf[4] = h->version_major;
     buf[5] = h->version_minor;
@@ -28,6 +32,23 @@ zgec_err zgec_frame_header_parse(zgec_frame_header *h, const uint8_t *buf)
 {
     if (h == NULL || buf == NULL) return ZGEC_ERR_INVAL;
     if (zgec_rd32(buf) != ZGEC_MAGIC_U32) return ZGEC_ERR_MAGIC;
+    /* Review entry 9: verify the header CRC before interpreting any field. A
+       corrupt header is then rejected without the version, flag and range
+       checks and without a partial fill of *h, which does less work on random
+       data. Bytes 0..27 are untouched by the reorder, so every caller sees
+       the same accept/reject decision as before.
+
+       Contract note, because the reorder changed it: *h is modified only on
+       the success path. At baseline a CRC failure returned after all eleven
+       fields had been written, so a caller reading *h on error saw the corrupt
+       parsed values; now it reads back exactly what it passed in. In-tree
+       callers never read *h after a failure (src/decode.c:2815 returns the
+       error immediately, tests/test.c:481 returns 0), which is why no test
+       pins either behaviour. The same note belongs on the declaration in
+       include/zgec_frame.h for external callers; that header is outside this
+       slice. */
+    if (zgec_crc32c(buf, 28u, 0u) != zgec_rd32(buf + 28))
+        return ZGEC_ERR_HEADER_CRC;
     h->version_major = buf[4];
     /* Spec 4.1/14: reject a larger major version. Minor versions only add
        features gated by flag bits, which are rejected below if unknown. */
@@ -45,15 +66,19 @@ zgec_err zgec_frame_header_parse(zgec_frame_header *h, const uint8_t *buf)
     if (zgec_rd32(buf + 24) != 0u) return ZGEC_ERR_RESERVED;
     if (h->block_log2 < ZGEC_BLOCK_LOG2_MIN ||
         h->block_log2 > ZGEC_BLOCK_LOG2_MAX) return ZGEC_ERR_BLOCK_SIZE;
-    if (h->max_dict_log2 > ZGEC_MAX_DICT_LOG2) return ZGEC_ERR_BLOCK_SIZE;
+    /* Review entry 10: max_dict_log2 out of range is a dictionary-size fault
+       and seg_hint_log2 is a segment-size hint (spec 4.1), so report the
+       specific existing code and leave ZGEC_ERR_BLOCK_SIZE for block_log2,
+       which is the only one of the three that is actually a block size. */
+    if (h->max_dict_log2 > ZGEC_MAX_DICT_LOG2) return ZGEC_ERR_DICT_SIZE;
     if (h->seg_hint_log2 < ZGEC_SEG_HINT_LOG2_MIN ||
-        h->seg_hint_log2 > ZGEC_SEG_HINT_LOG2_MAX) return ZGEC_ERR_BLOCK_SIZE;
-    if (zgec_crc32c(buf, 28u, 0u) != zgec_rd32(buf + 28)) return ZGEC_ERR_HEADER_CRC;
+        h->seg_hint_log2 > ZGEC_SEG_HINT_LOG2_MAX) return ZGEC_ERR_SEGMENT_SIZE;
     return ZGEC_OK;
 }
 
 void zgec_record_header_emit(uint8_t *buf, const zgec_record_header *r)
 {
+    if (buf == NULL || r == NULL) return; /* review entry 8 */
     buf[0] = r->record_type;
     buf[1] = r->rflags;
     zgec_wr16(buf + 2, r->dict_id);
@@ -120,6 +145,67 @@ zgec_err zgec_record_header_parse(zgec_record_header *r, const uint8_t *buf,
     return ZGEC_OK;
 }
 
+/* Spec 4.2/4.4: the invariants a block index entry must satisfy. The footer
+ * parser and the footer emitter share this one definition so that both sides
+ * apply one definition of the *index* invariants, which is not the same as a
+ * valid frame -- see the note on zgec_footer_emit() for what a 16-byte index
+ * entry cannot express (review entries 6 and 8). `prev` is the preceding
+ * entry, or NULL for the first one. */
+static zgec_err zgec_footer_block_check(const zgec_footer_block_entry *e,
+                                        const zgec_footer_block_entry *prev)
+{
+    if (e->lit_ref_depth > ZGEC_MAX_LITREF_DEPTH) return ZGEC_ERR_LITREF_DEPTH;
+    if ((e->rflags & (uint8_t)~ZGEC_RFLAG_ALL_KNOWN) != 0u)
+        return ZGEC_ERR_RESERVED;
+    /* Spec 7.5/V11: FILTERED and a literal-reference duty are mutually
+       exclusive -- "a FILTERED block MUST have lit_ref_depth 0 and MUST NOT
+       set LIT_EXPORTABLE". Both fields live in this index entry, so the
+       combination is decidable here instead of only from the record header a
+       layer further in. The encoder cannot trip it: the LITREF re-encode is
+       skipped outright for a filtered block, so its depth stays 0
+       (src/encode.c:3604), and the two flags are set as an if/else
+       (src/encode.c:3724-3727). */
+    if ((e->rflags & ZGEC_RFLAG_FILTERED) != 0u &&
+        (e->lit_ref_depth != 0u ||
+         (e->rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0u)) {
+        return ZGEC_ERR_RESERVED;
+    }
+    /* The offset is the record header's offset from the start of the frame, so
+       it can never fall inside the 32-byte frame header (spec 4.1, 4.7). */
+    if (e->offset < 32u) return ZGEC_ERR_OFFSET;
+    /* record_size is 24 + payload_size (spec 4.2). */
+    if (e->record_size < 24u) return ZGEC_ERR_RECORD_SIZE;
+    /* Bound the offset + record_size range later stages compute. */
+    if (e->offset > UINT64_MAX - (uint64_t)e->record_size)
+        return ZGEC_ERR_OFFSET;
+    /* Entry b describes block b in file order (spec 4.4) and every record is at
+       least 24 bytes, so the offsets strictly increase. */
+    if (prev != NULL && e->offset <= prev->offset) return ZGEC_ERR_OFFSET;
+    return ZGEC_OK;
+}
+
+/* Spec 4.4: dictionary entry invariants. Embedded entries carry the offset of
+ * the DICT record header, external entries carry zero. Shared by the parser
+ * and the emitter. */
+static zgec_err zgec_footer_dict_check(const zgec_footer_dict_entry *e)
+{
+    if (e->reserved != 0u) return ZGEC_ERR_RESERVED;
+    /* kind is a mode field (0 embedded, 1 external) and dict_id is an
+       identity, so report them separately: a bad mode is a value this format
+       does not define, the same fault class the flag-mask check and
+       src/dict.c:1165 report as ZGEC_ERR_RESERVED, whereas a bad identity is
+       specifically ZGEC_ERR_DICT_ID. Collapsing the two (as the baseline did)
+       reports an undefined mode as an identity fault. */
+    if (e->kind > 1u) return ZGEC_ERR_RESERVED;
+    if (e->dict_id == 0u) return ZGEC_ERR_DICT_ID;
+    if (e->kind == 1u) {
+        if (e->offset != 0u) return ZGEC_ERR_OFFSET;
+    } else if (e->offset < 32u) {
+        return ZGEC_ERR_OFFSET;
+    }
+    return ZGEC_OK;
+}
+
 size_t zgec_footer_size(uint32_t block_count, uint32_t dict_count)
 {
     size_t b = (size_t)block_count;
@@ -131,22 +217,30 @@ size_t zgec_footer_size(uint32_t block_count, uint32_t dict_count)
 
 zgec_err zgec_footer_parse(zgec_footer *f, const uint8_t *buf, size_t size)
 {
+    zgec_footer_block_entry *blocks = NULL;
+    zgec_footer_dict_entry *dicts = NULL;
+    zgec_err err = ZGEC_OK; /* only read on the `fail` path, which sets it */
+
     if (f == NULL || buf == NULL) return ZGEC_ERR_INVAL;
     if (size < 24u) return ZGEC_ERR_TRUNCATED;
     if (zgec_rd32(buf) != ZGEC_FOOTER_MAGIC_U32) return ZGEC_ERR_MAGIC;
     uint32_t block_count = zgec_rd32(buf + 4);
     uint32_t dict_count = zgec_rd32(buf + 8);
     uint64_t content_size = zgec_rd64(buf + 12);
-    /* Spec 13: bound allocations from hostile counts before malloc. */
-    if (block_count > (1u << 24) || dict_count > (1u << 24))
+    /* Spec 13: bound the counts from the caller-supplied size before any
+       allocation arithmetic (review entry 5). A block entry is 16 bytes and a
+       dictionary entry 24, so a count that cannot fit in `size` is
+       incoherent; the exact-size test below is then the tighter bound, which
+       is what really pins the counts to the buffer the caller handed over. */
+    if ((uint64_t)block_count > ((uint64_t)size - 24u) / 16u)
+        return ZGEC_ERR_TRUNCATED;
+    if ((uint64_t)dict_count > ((uint64_t)size - 24u) / 24u)
         return ZGEC_ERR_TRUNCATED;
     size_t need = zgec_footer_size(block_count, dict_count);
     if (need == 0 || need != size) return ZGEC_ERR_TRUNCATED;
     if (zgec_crc32c(buf, size - 4u, 0u) != zgec_rd32(buf + size - 4u))
         return ZGEC_ERR_FOOTER_CRC;
 
-    zgec_footer_block_entry *blocks = NULL;
-    zgec_footer_dict_entry *dicts = NULL;
     if (block_count > 0u) {
         blocks = (zgec_footer_block_entry *)zgec_alloc(
             (size_t)block_count * sizeof(zgec_footer_block_entry),
@@ -158,8 +252,8 @@ zgec_err zgec_footer_parse(zgec_footer *f, const uint8_t *buf, size_t size)
             (size_t)dict_count * sizeof(zgec_footer_dict_entry),
             _Alignof(zgec_footer_dict_entry));
         if (dicts == NULL) {
-            zgec_free(blocks);
-            return ZGEC_ERR_NOMEM;
+            err = ZGEC_ERR_NOMEM;
+            goto fail;
         }
     }
 
@@ -171,18 +265,12 @@ zgec_err zgec_footer_parse(zgec_footer *f, const uint8_t *buf, size_t size)
         blocks[i].lit_ref_depth = p[14];
         blocks[i].rflags = p[15];
         p += 16;
-        /* Footer copies of the record header fields get the same range
-           checks as the record header itself (spec 4.2/4.4). */
-        if (blocks[i].lit_ref_depth > ZGEC_MAX_LITREF_DEPTH) {
-            zgec_free(blocks);
-            zgec_free(dicts);
-            return ZGEC_ERR_LITREF_DEPTH;
-        }
-        if ((blocks[i].rflags & (uint8_t)~ZGEC_RFLAG_ALL_KNOWN) != 0u) {
-            zgec_free(blocks);
-            zgec_free(dicts);
-            return ZGEC_ERR_RESERVED;
-        }
+        /* Footer copies of the record header fields get the same range checks
+           as the record header itself (spec 4.2/4.4), plus the index
+           invariants of review entry 6. */
+        err = zgec_footer_block_check(&blocks[i],
+                                      (i > 0u) ? &blocks[i - 1u] : NULL);
+        if (err != ZGEC_OK) goto fail;
     }
     for (uint32_t i = 0; i < dict_count; i++) {
         dicts[i].dict_id = zgec_rd16(p);
@@ -192,32 +280,65 @@ zgec_err zgec_footer_parse(zgec_footer *f, const uint8_t *buf, size_t size)
         dicts[i].offset = zgec_rd64(p + 8);
         dicts[i].content_hash = zgec_rd64(p + 16);
         p += 24;
-        if (dicts[i].reserved != 0u) {
-            zgec_free(blocks);
-            zgec_free(dicts);
-            return ZGEC_ERR_RESERVED;
-        }
-        if (dicts[i].kind > 1u || dicts[i].dict_id == 0u) {
-            zgec_free(blocks);
-            zgec_free(dicts);
-            return ZGEC_ERR_DICT_ID;
-        }
+        err = zgec_footer_dict_check(&dicts[i]);
+        if (err != ZGEC_OK) goto fail;
     }
 
-    f->block_count = block_count;
-    f->dict_count = dict_count;
-    f->content_size = content_size;
-    f->blocks = blocks;
-    f->dicts = dicts;
+    /* Review entry 7: fill a local and install it only on success, so a
+       failed parse leaves *f exactly as the caller passed it and nothing
+       stays allocated.
+
+       The caller's previous content is NOT released here, deliberately: *f
+       is whatever the caller passed in, and callers legitimately hand over an
+       uninitialised stack object (tests/test.c:475 t_frame_parts is called
+       with a fresh `zgec_footer` and the result is freed afterwards, e.g.
+       tests/test.c:796). Releasing it would free indeterminate pointers -- it
+       segfaulted under gdb on Windows with the caller's stack garbage.
+       Ownership stays with the caller: free and clear *f (tests/test.c:803
+       and :804) before parsing a second time into the same object. */
+    {
+        zgec_footer tmp;
+        tmp.block_count = block_count;
+        tmp.dict_count = dict_count;
+        tmp.content_size = content_size;
+        tmp.blocks = blocks;
+        tmp.dicts = dicts;
+        *f = tmp;
+    }
     return ZGEC_OK;
+
+fail:
+    zgec_free(blocks);
+    zgec_free(dicts);
+    return err;
 }
 
 size_t zgec_footer_emit(uint8_t *buf, const zgec_footer *f)
 {
+    /* Review entry 8: the name reads as a public entry point, so it checks its
+       own inputs instead of trusting the caller's structures. It shares the
+       parser's index-invariant helpers, which is the set of properties the two
+       sides must agree on -- not an equivalence. The parser additionally
+       requires need == size and a valid footer CRC, and the record headers
+       carry constraints a 16-byte index entry cannot express at all: FILTERED
+       only on a COMPRESSED record, and 1 <= raw_size <= 2^block_log2
+       (src/frame.c:90-120). A footer accepted here is therefore a valid index,
+       not a proof that the frame decodes. A rejected footer writes nothing and
+       returns 0. */
+    if (buf == NULL || f == NULL) return 0;
     size_t total = zgec_footer_size(f->block_count, f->dict_count);
     if (total == 0) return 0;
     if ((f->block_count > 0u && f->blocks == NULL) ||
         (f->dict_count > 0u && f->dicts == NULL)) return 0;
+    for (uint32_t i = 0; i < f->block_count; i++) {
+        if (zgec_footer_block_check(&f->blocks[i],
+                                    (i > 0u) ? &f->blocks[i - 1u] : NULL) !=
+            ZGEC_OK)
+            return 0;
+    }
+    for (uint32_t i = 0; i < f->dict_count; i++) {
+        if (zgec_footer_dict_check(&f->dicts[i]) != ZGEC_OK) return 0;
+    }
     zgec_wr32(buf, ZGEC_FOOTER_MAGIC_U32);
     zgec_wr32(buf + 4, f->block_count);
     zgec_wr32(buf + 8, f->dict_count);
@@ -257,6 +378,7 @@ void zgec_footer_free(zgec_footer *f)
 
 void zgec_trailer_emit(uint8_t *buf, const zgec_trailer *t)
 {
+    if (buf == NULL || t == NULL) return; /* review entry 8 */
     zgec_wr64(buf, t->footer_offset);
     zgec_wr32(buf + 8, t->footer_size);
     zgec_wr32(buf + 12, ZGEC_TRAILER_MAGIC_U32);

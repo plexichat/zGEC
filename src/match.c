@@ -5,21 +5,25 @@
  * buffer. Three tiers select the bucket width and
  * the table size:
  *
- *   tier   short buckets   lanes   short size   long size
- *   fast   2^16            4       1 MiB        256 KiB
- *   main   2^16            8       2 MiB        256 KiB
- *   high   2^18            16      16 MiB       1 MiB
+ *   tier   short buckets   lanes   short size   long size   per-thread total
+ *   fast   2^16            4       1 MiB        256 KiB     1.3125 MiB
+ *   main   2^16            8       2 MiB        1 MiB       3.0625 MiB
+ *   high   2^18            16      16 MiB       1 MiB       17.25 MiB
  *
- * Table sizes are the section 11.2 starting point
- * (2^16 buckets for fast/main, 2^18 for high, and
- * measurement decides). Per-thread cap note: with
- * one worker per core the per-thread total SHOULD
- * stay near 1-1.5 MiB so the sum across threads
- * does not exceed the shared L3; the main tier
- * (2.25 MiB with both tables) already exceeds it
- * and the high tier (17 MiB) far exceeds it, so a
- * threaded build SHOULD shard workers, use fewer
- * match threads than cores, or fall back a tier.
+ * A per-thread total counts the short table, the per-bucket ring heads
+ * (2^16 B for fast/main, 2^18 B for high) and the long table, ignoring
+ * allocator metadata and alignment waste; the earlier "2.25 MiB" figure
+ * for main was written before the main long table moved to 2^18 buckets
+ * and is 3.0625 MiB. Table sizes are the section 11.2 starting point
+ * (2^16 buckets for fast/main, 2^18 for high, and measurement decides);
+ * the main long table sits at 2^18 rather than the spec's 2^16 because
+ * halving it costs ratio (see the geometry note under the macros).
+ * Per-thread cap note: with one worker per core the per-thread total
+ * SHOULD stay near 1-1.5 MiB so the sum across threads does not exceed
+ * the shared L3; only the fast tier meets that budget (1.3125 MiB), the
+ * main tier (3.0625 MiB) already exceeds it and the high tier
+ * (17.25 MiB) far exceeds it, so a threaded build SHOULD shard workers,
+ * use fewer match threads than cores, or fall back a tier.
  *
  * Two separate structures (section 11.2):
  *   short table: hashes 5 bytes (4 bytes for data
@@ -34,11 +38,24 @@
  * Each entry packs a 24-bit virtual-buffer position
  * and an 8-bit tag from the spare hash bits. The
  * position is stored as pos + 1, so an all-zero
- * entry is unambiguously empty. Because the position
- * field is 24 bits (profile P24), storable positions
- * are limited to 2^24 - 2 and zgec_matcher_create
- * rejects a virtual buffer capacity above 2^24
- * (16 MiB).
+ * entry is unambiguously empty. The 24-bit field
+ * (profile P24) makes three different quantities
+ * easy to confuse, and the code below distinguishes
+ * them explicitly:
+ *   - the largest virtual-buffer byte count a
+ *     matcher may be created for is ZGEC_MF_POS_LIMIT
+ *     = 2^24 = 16 MiB;
+ *   - the largest storable position is 2^24 - 2 =
+ *     16,777,214, because the stored value pos + 1
+ *     must fit 24 bits, and pos = 2^24 - 1 would wrap
+ *     onto the empty sentinel;
+ *   - the largest match offset is not a property of
+ *     the field at all: it is bounded by the position
+ *     of the query (off <= ip) and by vb_capacity.
+ * zgec_matcher_create rejects a virtual buffer
+ * capacity above 2^24 (16 MiB), and mf_insert_pos
+ * drops positions at or above the storable limit
+ * rather than packing them.
  *
  * Tables and buffers are allocated 2 MiB aligned
  * with zgec_alloc as the huge-page intent
@@ -107,6 +124,10 @@
 #ifndef ZGEC_MF_HIGH_LANES
 #define ZGEC_MF_HIGH_LANES   16u
 #endif
+
+/* mf_bucket_hits() packs one hit bit per lane into a uint32_t, so no
+ * tier may declare more lanes than this. */
+#define ZGEC_MF_MAX_LANES 32u
 
 /* Probes: how many tag hits of a short bucket are scored per find.
  *
@@ -270,7 +291,10 @@ static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
     uint32_t *b = &m->short_tab[(size_t)bucket * (size_t)m->nlanes];
     uint32_t h = (uint32_t)m->short_head[bucket];
-    mf_prefetch_bucket((const void *)b);
+    /* No prefetch here. The store below needs the line immediately, so the
+     * write-allocate fetch has to complete first and a hint issued one
+     * instruction ahead cannot hide the latency; the lookup path keeps its
+     * prefetch, where there is independent work to overlap. */
     b[h] = entry;
     m->short_head[bucket] = (uint8_t)((h + 1u) & (m->nlanes - 1u));
 }
@@ -425,6 +449,13 @@ static void mf_candidate(uint32_t d, uint32_t len, zgec_match *best)
     }
 }
 
+/* The geometry macros above are overridable, so the invariants the bucket
+ * and lane masks rely on are checked at create time rather than assumed. */
+static int mf_is_pow2_u32(uint32_t x)
+{
+    return x != 0u && (x & (x - 1u)) == 0u;
+}
+
 zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
 {
     zgec_matcher *m;
@@ -469,8 +500,25 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
         zgec_free(m);
         return NULL;
     }
+    /* Buckets and lanes must be nonzero powers of two for the `- 1u` masks
+     * and the ring indexing, and nlanes must fit the 32-bit lane hit mask. */
+    if (!mf_is_pow2_u32(m->nbuckets) || !mf_is_pow2_u32(m->long_buckets) ||
+        !mf_is_pow2_u32(m->nlanes) || m->nlanes > ZGEC_MF_MAX_LANES) {
+        zgec_free(m);
+        return NULL;
+    }
+    /* Overflow-proof size products, for the short table and the long one. */
+    if ((size_t)m->nlanes > SIZE_MAX / (size_t)m->nbuckets) {
+        zgec_free(m);
+        return NULL;
+    }
     short_n = (size_t)m->nbuckets * (size_t)m->nlanes;
     long_n = (size_t)m->long_buckets;
+    if (short_n > SIZE_MAX / sizeof(uint32_t) ||
+        long_n > SIZE_MAX / sizeof(uint32_t)) {
+        zgec_free(m);
+        return NULL;
+    }
     m->short_tab = (uint32_t *)zgec_alloc(short_n * sizeof(uint32_t), ZGEC_MF_TABLE_ALIGN);
     if (!m->short_tab) {
         zgec_free(m);
@@ -517,8 +565,14 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
     if (!m) {
         return;
     }
-    m->vb = vb;
-    m->vb_size = vb_size;
+    /* Clear the tables *before* deciding whether to attach, so that a
+     * detached matcher is also an empty one. Returning early with the
+     * previous block's packed positions still in short_tab/short_head/
+     * long_tab left "detached" and "empty" as two states differing in
+     * memory contents, and the safety of every entry point below then rested
+     * entirely on the identity test running first: any future entry point
+     * that checked only the size (which passes, since vb_size == 0 admits
+     * only ip == 0) would read positions into a buffer no longer attached. */
     short_n = (size_t)m->nbuckets * (size_t)m->nlanes;
     long_n = (size_t)m->long_buckets;
     if (m->short_tab) {
@@ -530,12 +584,67 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
     if (m->long_tab) {
         memset(m->long_tab, 0, long_n * sizeof(uint32_t));
     }
+    /* This interface returns void, so inconsistent state is rejected by
+     * refusing to attach a buffer rather than by reporting an error. Every
+     * entry point below starts with a vb_size bound check, so a detached
+     * matcher performs no reads at all: a null buffer with a nonzero size,
+     * or a size above the capacity this matcher was created for, leaves the
+     * matcher unusable instead of hashable. The detach is unreachable from
+     * the only in-tree caller, so it buys safety against a caller that does
+     * not exist yet -- and it still does so silently, because the interface
+     * has no way to report it. */
+    if ((vb_size != 0 && vb == NULL) || vb_size > m->vb_capacity) {
+        m->vb = NULL;
+        m->vb_size = 0;
+        m->is_binary = 0;
+        return;
+    }
+    m->vb = vb;
+    m->vb_size = vb_size;
+    /* Classify the block, not a dictionary prefix: the caller lays vb out as
+     * [dictionary][literal references][block], and a dictionary is usually
+     * longer than the 4 KiB sample, so sampling from vb[0] would describe
+     * the dictionary instead of the data being compressed. Only the
+     * dictionary offset is known here (the literal-reference region is
+     * not), so the sample starts after the dictionary.
+     *
+     * `dict_size`, not `dict`, is the layout fact this keys off: the
+     * dictionary bytes are vb[0 .. dict_size) whatever the `dict` pointer
+     * says, and the caller passes dict_size unconditionally while passing
+     * `dict` only when both are nonzero, so testing the pointer would sample
+     * the dictionary if that pair ever arrived as (NULL, >0).
+     *
+     * What is still not fixed: cls_len spans to the end of vb, so it covers
+     * the literal-reference region -- another block's literals -- and
+     * whenever that region exceeds the 4 KiB sample this still classifies
+     * data the block does not contain. Narrowing it needs the
+     * literal-reference length, which the frozen signature cannot carry.
+     * So the change removes the dictionary case and leaves the litref case,
+     * which is the same defect behind a different prefix and is not
+     * marginal. Because is_binary selects the short-hash width (4 vs 5
+     * bytes) and which positions are insertable, this flips the emitted
+     * matches for every dictionary-compressed block: the read is provably
+     * inside [dict_size, vb_size), so it is safe, but the direction of the
+     * ratio change is unmeasured and needs a corpus before it is called an
+     * improvement rather than a difference. */
+    {
+        size_t cls_off = 0;
+        size_t cls_len = vb_size;
+        if (dict_size != 0 && dict_size < vb_size) {
+            cls_off = dict_size;
+            cls_len = vb_size - dict_size;
+        }
+        m->is_binary = mf_classify_binary(vb ? vb + cls_off : NULL, cls_len);
+    }
     /* Section 11.8 intent: hash the dictionary once
      * into a table snapshot and copy it (memcpy)
      * into each worker's table at block start; the
      * loop below is the per-worker fill from that
      * snapshot layout. */
-    m->is_binary = mf_classify_binary(vb, vb_size);
+    /* `dict` is only a non-null flag: the dictionary bytes are the first
+     * dict_size bytes of vb, so there is no second pointer to read through
+     * and the argument is redundant with dict_size. It stays in the
+     * interface because include/zgec_match.h declares it. */
     if (!vb || vb_size == 0 || !dict || dict_size == 0) {
         return;
     }
@@ -576,11 +685,23 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
 
     best.offset = 0;
     best.length = 0;
-    if (!m || !vb || ip >= m->vb_size) {
+    /* The position bounds below are checked against m->vb_size, so the reads
+     * must be of the very buffer those bounds describe: a caller that passes
+     * a shorter or unrelated buffer gets no match rather than an
+     * out-of-bounds read. */
+    if (!m || !vb || vb != m->vb || ip >= m->vb_size) {
         return best;
     }
 
-    min_match = (min_len < 3u) ? 3u : min_len;
+    /* Section 11.2: a 5-byte short hash cannot find a 4-byte match, so 5 is
+     * the minimum for hash (non-repeat) candidates. The floor of 4 is for
+     * repeat offsets, and rests on stated policy rather than on the hash
+     * argument: include/zgec_match.h says "The minimum non-repeat match is
+     * 5, with 4 permitted for repeat offsets", and docs/spec.md:836 says the
+     * same. Three is not a legal matcher length in either case, even though
+     * the format's decoder rule V3 only requires ML >= 3, which is laxer
+     * than the encoder policy applied here. */
+    min_match = (min_len < 4u) ? 4u : min_len;
     if (max_len < min_match) {
         return best;
     }
@@ -644,15 +765,13 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         }
     }
 
-    /* 3. Short bucket probe, newest entry first. The
-     * tags compare as one SIMD operation (16 tags in
-     * one 128-bit compare on x86); here the scalar
-     * loop builds the hit mask the same way. The
-     * first hits are extracted with tzcnt plus
-     * clear-lowest-bit; an empty mask yields zero
-     * hits through the loop bound, so a padded dummy
-     * slot is selected implicitly and no
-     * data-dependent branch is needed. */
+    /* 3. Short bucket probe, newest entry first. Tags are compared by
+     * mf_bucket_hits(): on AVX2 that is 32-bit-lane compares, two 256-bit
+     * vectors for a 16-lane high-tier bucket, with any leftover lanes
+     * scalar, so there is no 128-bit tag compare here. The returned hit
+     * mask is then walked in newest-first physical lane order, so no tzcnt
+     * is used to extract lanes and an empty mask simply ends the loop
+     * after zero iterations. */
     {
         size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
                                    : (size_t)ZGEC_MF_HASH_BYTES;
@@ -707,7 +826,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
 void zgec_matcher_insert(zgec_matcher *m, const uint8_t *vb, size_t ip)
 {
     size_t need;
-    if (!m || !vb || !m->short_tab || !m->long_tab) {
+    if (!m || !vb || vb != m->vb || !m->short_tab || !m->long_tab) {
         return;
     }
     /* The position must fit the 24-bit field; the
@@ -721,7 +840,7 @@ void zgec_matcher_insert(zgec_matcher *m, const uint8_t *vb, size_t ip)
 
 void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start, size_t len)
 {
-    if (!m || !vb || !m->short_tab || !m->long_tab || len == 0) {
+    if (!m || !vb || vb != m->vb || !m->short_tab || !m->long_tab || len == 0) {
         return;
     }
     if (start >= m->vb_size) {
@@ -732,9 +851,13 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
         len = m->vb_size - start;
     }
     /* Insertion policy: visited positions only (the
-     * parse drives inserts); inside a match the fast
-     * and main tiers insert 2-3 sampled positions,
-     * the high tier inserts every position. */
+     * parse drives inserts); the high tier inserts
+     * every position. Section 11.2 names 2-3 sampled
+     * positions for fast and main, but main samples
+     * ZGEC_MF_MATCH_SAMPLES (16 by default, see the
+     * note at that macro) because the spec's figure
+     * measured worse in ratio here; the fast tier
+     * keeps 3 through ZGEC_MF_MATCH_SAMPLES_FAST. */
     if (m->tier == ZGEC_TIER_HIGH) {
         /* Every position in the range, sampled if the
          * match is very long. */

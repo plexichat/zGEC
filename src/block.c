@@ -1,13 +1,11 @@
 #define _POSIX_C_SOURCE 200809L
 #include "zgec_block.h"
+#include "zgec_fse.h"
+#include "zgec_lit.h"
 
 #include <stddef.h>
 #include <string.h>
 #include <stdint.h>
-
-/* Forward declarations for FSE count reader. */
-size_t zgec_fse_read_counts(int16_t *counts, int *nsym, int *al,
-                            int max_nsym, const uint8_t *buf, size_t size);
 
 /* ================================================================
  * Block parameters (section 7.1)
@@ -28,16 +26,11 @@ static size_t zgec_ctx_desc_parse(zgec_ctx_desc *desc, const uint8_t *buf, size_
     desc->ctx_mode = ctx_mode;
     desc->ctx_count = ctx_count;
     if (ctx_count > 1) {
-        const uint8_t *cm = buf + 2;
-        for (int g = 0; g < 8; g++) {
-            const uint8_t *p = cm + g * 3;
-            uint32_t val24 = (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16);
-            for (int j = 0; j < 8; j++) {
-                uint8_t entry = (uint8_t)((val24 >> (j * 3)) & 7u);
-                if (entry >= ctx_count) return 0;        /* ZGEC_ERR_CLASS_MAP */
-                desc->class_map[g * 8 + j] = entry;
-            }
-        }
+        /* Shared 3-bit codec (see zgec_lit.h); keeps the 24-byte layout
+         * identical between block params and literal class maps. */
+        if (zgec_class_map_decode(desc->class_map, buf + 2,
+                                  (int)ctx_count) != ZGEC_OK)
+            return 0;
     } else {
         memset(desc->class_map, 0, 64);
     }
@@ -57,19 +50,11 @@ static size_t zgec_ctx_desc_emit(uint8_t *buf, size_t cap, const zgec_ctx_desc *
     buf[0] = desc->ctx_mode;
     buf[1] = desc->ctx_count;
     if (desc->ctx_count > 1) {
-        uint8_t *cm = buf + 2;
-        memset(cm, 0, 24);
-        for (int g = 0; g < 8; g++) {
-            uint8_t *p = cm + g * 3;
-            uint32_t val24 = 0;
-            for (int j = 0; j < 8; j++) {
-                if (desc->class_map[g * 8 + j] >= desc->ctx_count) return 0; /* ZGEC_ERR_CLASS_MAP */
-                val24 |= ((uint32_t)(desc->class_map[g * 8 + j] & 7u)) << (j * 3);
-            }
-            p[0] = (uint8_t)(val24 & 0xFFu);
-            p[1] = (uint8_t)((val24 >> 8) & 0xFFu);
-            p[2] = (uint8_t)((val24 >> 16) & 0xFFu);
+        /* Validate before the unchecked trusted-input encode. */
+        for (int i = 0; i < 64; i++) {
+            if (desc->class_map[i] >= desc->ctx_count) return 0;
         }
+        zgec_class_map_encode(buf + 2, desc->class_map);
     }
     return needed;
 }
@@ -185,6 +170,17 @@ static size_t zgec_seq_rle_bytes(const uint8_t *buf, size_t avail)
  * literal tables as 0=new, 1=repeat only; RLE exists solely for the
  * 66-symbol sequence alphabets. decode.c rejects literal RLE too. */
 
+/* Accumulate n into *acc, refusing to wrap. Every caller here already
+ * guarantees n <= the bytes left in the buffer, so this cannot fire today;
+ * it makes the size accumulators formally safe (review entry 10) instead of
+ * depending on that argument holding for every future caller. */
+static int zgec_size_add(size_t *acc, size_t n)
+{
+    if (n > SIZE_MAX - *acc) return 0;
+    *acc += n;
+    return 1;
+}
+
 /*
  * Count the total descriptor bytes for a segment header.
  * lit_coder: 0 = raw (no literal tables), 1 = rANS.
@@ -225,36 +221,40 @@ static size_t zgec_seg_desc_bytes_count(uint8_t table_modes,
                 size_t a = (avail > total) ? (avail - total) : 0;
                 size_t n = zgec_lit_new_bytes(buf + total, a);
                 if (n == 0) return (size_t)-1;
-                total += n;
+                if (!zgec_size_add(&total, n)) return (size_t)-1;
             }
         }
     }
 
     if (n_seq == 0) return total;
 
-    /* LL: 1 normally, 3 when seq_ctx_ll. */
+    /* LL: 1 normally, 3 when seq_ctx_ll. The mode test is loop-invariant
+       (review entry 11), so it is hoisted out of the loop: the RLE form
+       always consumes one byte per table, the NEW form one description per
+       table, and REPEAT consumes nothing. */
     {
         uint8_t ll_mode = (uint8_t)((table_modes >> 2) & ZGEC_TBL_MASK);
-        if (ll_mode != ZGEC_TBL_REPEAT) {
-            int n_ll = seq_ctx_ll ? 3 : 1;
+        int n_ll = seq_ctx_ll ? 3 : 1;
+        if (ll_mode == ZGEC_TBL_RLE) {
+            for (int i = 0; i < n_ll; i++) {
+                size_t a = (avail > total) ? (avail - total) : 0;
+                size_t n = zgec_seq_rle_bytes(buf + total, a);
+                if (n == 0) return (size_t)-1;
+                if (!zgec_size_add(&total, n)) return (size_t)-1;
+            }
+        } else if (ll_mode == ZGEC_TBL_NEW) {
             int first_al = -1;
             for (int i = 0; i < n_ll; i++) {
                 size_t a = (avail > total) ? (avail - total) : 0;
-                size_t n = 0;
-                if (ll_mode == ZGEC_TBL_RLE) {
-                    n = zgec_seq_rle_bytes(buf + total, a);
-                } else if (ll_mode == ZGEC_TBL_NEW) {
-                    int al = 0;
-                    n = zgec_seq_new_bytes(buf + total, a, &al);
-                    if (n == 0) return (size_t)-1;
-                    if (i == 0) first_al = al;
-                    else if (al != first_al) return (size_t)-1;
-                } else {
-                    return (size_t)-1;
-                }
+                int al = 0;
+                size_t n = zgec_seq_new_bytes(buf + total, a, &al);
                 if (n == 0) return (size_t)-1;
-                total += n;
+                if (i == 0) first_al = al;
+                else if (al != first_al) return (size_t)-1;
+                if (!zgec_size_add(&total, n)) return (size_t)-1;
             }
+        } else if (ll_mode != ZGEC_TBL_REPEAT) {
+            return (size_t)-1;
         }
     }
 
@@ -272,33 +272,34 @@ static size_t zgec_seg_desc_bytes_count(uint8_t table_modes,
                 return (size_t)-1;
             }
             if (n == 0) return (size_t)-1;
-            total += n;
+            if (!zgec_size_add(&total, n)) return (size_t)-1;
         }
     }
 
-    /* OF: 1 normally, 3 when seq_ctx_of. */
+    /* OF: 1 normally, 3 when seq_ctx_of. Same hoist as LL (entry 11). */
     {
         uint8_t of_mode = (uint8_t)((table_modes >> 6) & ZGEC_TBL_MASK);
-        if (of_mode != ZGEC_TBL_REPEAT) {
-            int n_of = seq_ctx_of ? 3 : 1;
+        int n_of = seq_ctx_of ? 3 : 1;
+        if (of_mode == ZGEC_TBL_RLE) {
+            for (int i = 0; i < n_of; i++) {
+                size_t a = (avail > total) ? (avail - total) : 0;
+                size_t n = zgec_seq_rle_bytes(buf + total, a);
+                if (n == 0) return (size_t)-1;
+                if (!zgec_size_add(&total, n)) return (size_t)-1;
+            }
+        } else if (of_mode == ZGEC_TBL_NEW) {
             int first_al = -1;
             for (int i = 0; i < n_of; i++) {
                 size_t a = (avail > total) ? (avail - total) : 0;
-                size_t n = 0;
-                if (of_mode == ZGEC_TBL_RLE) {
-                    n = zgec_seq_rle_bytes(buf + total, a);
-                } else if (of_mode == ZGEC_TBL_NEW) {
-                    int al = 0;
-                    n = zgec_seq_new_bytes(buf + total, a, &al);
-                    if (n == 0) return (size_t)-1;
-                    if (i == 0) first_al = al;
-                    else if (al != first_al) return (size_t)-1;
-                } else {
-                    return (size_t)-1;
-                }
+                int al = 0;
+                size_t n = zgec_seq_new_bytes(buf + total, a, &al);
                 if (n == 0) return (size_t)-1;
-                total += n;
+                if (i == 0) first_al = al;
+                else if (al != first_al) return (size_t)-1;
+                if (!zgec_size_add(&total, n)) return (size_t)-1;
             }
+        } else if (of_mode != ZGEC_TBL_REPEAT) {
+            return (size_t)-1;
         }
     }
 
@@ -376,7 +377,11 @@ size_t zgec_seg_header_parse_ex(zgec_seg_header *sh,
                                                       buf + pos,
                                                       avail);
         if (desc_bytes == (size_t)-1) return 0;       /* bad descriptor */
-        if (pos + desc_bytes > size) return 0;        /* ZGEC_ERR_TRUNCATED */
+        /* Written as a subtraction rather than pos + desc_bytes > size: pos
+           is <= size here (each varint above consumed at most size - pos), so
+           this cannot wrap, whereas the addition could with a large
+           desc_bytes. Same predicate, entry 10's hardening. */
+        if (desc_bytes > size - pos) return 0;        /* ZGEC_ERR_TRUNCATED */
 
         /* Copy raw descriptor bytes to caller's buffer. A short
            caller buffer is an error (no silent truncation) so that
@@ -422,6 +427,30 @@ size_t zgec_seg_header_parse_ex(zgec_seg_header *sh,
         pos += n;
     }
 
+    /* ---- Cross-field validation (review entry 12) ----
+       The three format invariants the header alone can be held to, matching
+       the rules decode.c applies to the same bytes (V8, spec:769) so the two
+       parsers accept exactly the same headers. Spec 7.3 sets the three
+       sequence stream sizes to 0 when there are no sequences; spec 9.1 makes
+       a raw literal stream exactly the n_lit bytes of Z, so lit_size == n_lit
+       whenever lit_coder is 0; and spec 9.5 makes n_lit == 0 the empty stream
+       with lit_size == 0, which the first two do not cover for a coded (rANS)
+       literal stream -- the reachable gap review finding 1 identified. A
+       header that violates any of them describes streams that cannot exist;
+       every consumer sizes buffers from these fields, so they are rejected
+       here rather than downstream.
+
+       On a 0 return both `descriptors` and `*descriptors_size` are
+       unspecified: the sizes compared here are parsed after the descriptor
+       run, so that copy has already happened (review finding 5). Spec 7.3
+       fixes the field order, so the checks cannot be hoisted above it. */
+    if (n_seq == 0 && (ll_size != 0 || ml_size != 0 || of_size != 0)) return 0;
+    if (n_lit == 0 && lit_size != 0) return 0;                  /* V8 */
+    {
+        uint8_t lit_coder = (uint8_t)((segment_flags >> 1) & 0x03u);
+        if (lit_coder == 0 && lit_size != n_lit) return 0;
+    }
+
     /* ---- Fill output struct ---- */
     sh->segment_flags  = segment_flags;
     sh->table_modes    = table_modes;
@@ -451,12 +480,41 @@ size_t zgec_seg_header_parse(zgec_seg_header *sh,
     return zgec_seg_header_parse_ex(sh, buf, size, descriptors, descriptors_cap, descriptors_size, 1);
 }
 
+/* Encode one size varint into buf at *pos, testing the capacity first.
+ * zgec_varint_encode() has no capacity parameter and writes up to 5 bytes
+ * unconditionally, so encoding straight into buf would store before the
+ * bounds test could reject it (review finding 2). *pos <= cap must hold on
+ * entry; every caller below maintains that. Returns 0 (no write) on error. */
+static int zgec_seg_emit_varint(uint8_t *buf, size_t cap, size_t *pos,
+                               uint32_t v)
+{
+    uint8_t scratch[5];
+    size_t n = zgec_varint_encode(scratch, v);
+    if (n > cap - *pos) return 0;
+    memcpy(buf + *pos, scratch, n);
+    *pos += n;
+    return 1;
+}
+
 size_t zgec_seg_header_emit(uint8_t *buf, size_t cap,
                             const zgec_seg_header *sh,
                             const uint8_t *descriptors,
                             size_t descriptors_size)
 {
     if (!buf || !sh || cap < 2) return 0;
+
+    /* Mirror the parser's cross-field rules so emit and parse stay inverses
+       (review finding 3): a header this function accepts must be readable by
+       zgec_seg_header_parse_ex. These are the same three the parser rejects
+       below, so no conformant stream is refused and an encoder regression
+       fails loudly here instead of writing a self-inconsistent header. */
+    if (sh->n_seq == 0 &&
+        (sh->ll_size != 0 || sh->ml_size != 0 || sh->of_size != 0)) return 0;
+    if (sh->n_lit == 0 && sh->lit_size != 0) return 0;          /* V8 */
+    {
+        uint8_t lit_coder = (uint8_t)((sh->segment_flags >> 1) & 0x03u);
+        if (lit_coder == 0 && sh->lit_size != sh->n_lit) return 0;
+    }
 
     /* Validate fixed fields. */
     {
@@ -482,52 +540,30 @@ size_t zgec_seg_header_emit(uint8_t *buf, size_t cap,
     buf[pos++] = sh->table_modes;
 
     /* n_seq varint */
-    {
-        size_t n = zgec_varint_encode(buf + pos, sh->n_seq);
-        if (n == 0 || pos + n > cap) return 0;
-        pos += n;
-    }
+    if (!zgec_seg_emit_varint(buf, cap, &pos, sh->n_seq)) return 0;
 
     /* n_lit varint */
-    {
-        size_t n = zgec_varint_encode(buf + pos, sh->n_lit);
-        if (n == 0 || pos + n > cap) return 0;
-        pos += n;
-    }
+    if (!zgec_seg_emit_varint(buf, cap, &pos, sh->n_lit)) return 0;
 
-    /* Descriptors verbatim. */
-    if (pos + descriptors_size > cap) return 0;
+    /* Descriptors verbatim. Subtracting rather than adding: pos <= cap here,
+       but pos + descriptors_size can wrap for a huge descriptors_size and let
+       the memcpy below run past the buffer (entry 10's family). */
+    if (descriptors_size > cap - pos) return 0;
     if (descriptors && descriptors_size > 0)
         memcpy(buf + pos, descriptors, descriptors_size);
     pos += descriptors_size;
 
     /* lit_size varint */
-    {
-        size_t n = zgec_varint_encode(buf + pos, sh->lit_size);
-        if (n == 0 || pos + n > cap) return 0;
-        pos += n;
-    }
+    if (!zgec_seg_emit_varint(buf, cap, &pos, sh->lit_size)) return 0;
 
     /* ll_size varint */
-    {
-        size_t n = zgec_varint_encode(buf + pos, sh->ll_size);
-        if (n == 0 || pos + n > cap) return 0;
-        pos += n;
-    }
+    if (!zgec_seg_emit_varint(buf, cap, &pos, sh->ll_size)) return 0;
 
     /* ml_size varint */
-    {
-        size_t n = zgec_varint_encode(buf + pos, sh->ml_size);
-        if (n == 0 || pos + n > cap) return 0;
-        pos += n;
-    }
+    if (!zgec_seg_emit_varint(buf, cap, &pos, sh->ml_size)) return 0;
 
     /* of_size varint */
-    {
-        size_t n = zgec_varint_encode(buf + pos, sh->of_size);
-        if (n == 0 || pos + n > cap) return 0;
-        pos += n;
-    }
+    if (!zgec_seg_emit_varint(buf, cap, &pos, sh->of_size)) return 0;
 
     return pos;
 }
@@ -616,7 +652,7 @@ size_t zgec_seg_descriptors_walk(zgec_tbl_desc *lit_desc, int n_lit_tables,
         for (int i = 0; i < n_lit_tables; i++) {
             size_t n = zgec_walk_one(&lit_desc[i], buf, size, pos, 1, NULL);
             if (n == 0) return 0;
-            pos += n;
+            if (!zgec_size_add(&pos, n)) return 0;
         }
     }
 
@@ -629,7 +665,7 @@ size_t zgec_seg_descriptors_walk(zgec_tbl_desc *lit_desc, int n_lit_tables,
             int al = -2;
             size_t n = zgec_walk_one(&ll_desc[i], buf, size, pos, 0, &al);
             if (n == 0) return 0;
-            pos += n;
+            if (!zgec_size_add(&pos, n)) return 0;
             if (n_ll_tables == 3 && seq_ctx_ll && al >= 0) {
                 if (i == 0) first_al = al;
                 else if (al != first_al) return 0;
@@ -639,7 +675,7 @@ size_t zgec_seg_descriptors_walk(zgec_tbl_desc *lit_desc, int n_lit_tables,
     if (ml_desc != NULL) {
         size_t n = zgec_walk_one(ml_desc, buf, size, pos, 0, NULL);
         if (n == 0) return 0;
-        pos += n;
+        if (!zgec_size_add(&pos, n)) return 0;
     }
     if (of_desc != NULL && n_of_tables > 0) {
         int first_al = -2;
@@ -647,7 +683,7 @@ size_t zgec_seg_descriptors_walk(zgec_tbl_desc *lit_desc, int n_lit_tables,
             int al = -2;
             size_t n = zgec_walk_one(&of_desc[i], buf, size, pos, 0, &al);
             if (n == 0) return 0;
-            pos += n;
+            if (!zgec_size_add(&pos, n)) return 0;
             if (n_of_tables == 3 && seq_ctx_of && al >= 0) {
                 if (i == 0) first_al = al;
                 else if (al != first_al) return 0;

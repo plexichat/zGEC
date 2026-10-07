@@ -5,84 +5,9 @@
 
 #include "zgec.h"
 
-/* ---- tiny threading shim (decode.c only, §10.6) ----
- * POSIX: pthreads. Windows: CRITICAL_SECTION + CreateThread
- * (MinGW provides both; the native API needs no extra link).
- * Only <pthread.h> / <windows.h> plus C11 are used. */
-#if defined(_WIN32)
-#include <windows.h>
-#else
-#include <pthread.h>
-#include <unistd.h>
-#endif
+#include "zgec_internal.h"
 
-#if defined(_WIN32)
-typedef struct { CRITICAL_SECTION cs; int ok; } zgec_mu;
-#else
-typedef struct { pthread_mutex_t mu; int ok; } zgec_mu;
-#endif
-
-static void zgec_mu_init(zgec_mu *m)
-{
-    if (m == NULL) return;
-    m->ok = 0;
-#if defined(_WIN32)
-    InitializeCriticalSection(&m->cs);
-    m->ok = 1;
-#else
-    if (pthread_mutex_init(&m->mu, NULL) == 0) m->ok = 1;
-#endif
-}
-
-static void zgec_mu_destroy(zgec_mu *m)
-{
-    if (m == NULL || m->ok == 0) return;
-#if defined(_WIN32)
-    DeleteCriticalSection(&m->cs);
-#else
-    (void)pthread_mutex_destroy(&m->mu);
-#endif
-    m->ok = 0;
-}
-
-static void zgec_mu_lock(zgec_mu *m)
-{
-    if (m == NULL || m->ok == 0) return;
-#if defined(_WIN32)
-    EnterCriticalSection(&m->cs);
-#else
-    (void)pthread_mutex_lock(&m->mu);
-#endif
-}
-
-static void zgec_mu_unlock(zgec_mu *m)
-{
-    if (m == NULL || m->ok == 0) return;
-#if defined(_WIN32)
-    LeaveCriticalSection(&m->cs);
-#else
-    (void)pthread_mutex_unlock(&m->mu);
-#endif
-}
-
-/* Static worker cap: also the WaitForMultipleObjects limit. */
-#define ZGEC_DEC_MAX_WORKERS 64u
-
-static unsigned zgec_dec_cpu_count(void)
-{
-#if defined(_WIN32)
-    SYSTEM_INFO si;
-    memset(&si, 0, sizeof(si));
-    GetSystemInfo(&si);
-    if (si.dwNumberOfProcessors >= 1u && si.dwNumberOfProcessors <= 1024u)
-        return (unsigned)si.dwNumberOfProcessors;
-    return 1u;
-#else
-    long n = sysconf(_SC_NPROCESSORS_ONLN);
-    if (n >= 1L && n <= 1024L) return (unsigned)n;
-    return 1u;
-#endif
-}
+/* Threading shim lives in zgec_internal.h (§10.6). */
 
 /*
  * Decoding procedure per spec sections 6, 7, 9, 10 and Annex D,
@@ -363,9 +288,9 @@ static size_t dec_resolve_workers(const zgec_decoder *d, size_t n_items)
     long long nt;
     if (n_items <= 1u) return 1u;
     nt = (d != NULL) ? (long long)d->limits.n_threads : 1LL;
-    if (nt == 0LL) nt = (long long)zgec_dec_cpu_count();
+    if (nt == 0LL) nt = (long long)zgec_cpu_count();
     if (nt < 1LL) nt = 1LL;
-    if (nt > (long long)ZGEC_DEC_MAX_WORKERS) nt = (long long)ZGEC_DEC_MAX_WORKERS;
+    if (nt > (long long)ZGEC_MAX_WORKERS) nt = (long long)ZGEC_MAX_WORKERS;
     if ((uint64_t)nt > (uint64_t)n_items) nt = (long long)n_items;
     return (size_t)nt;
 }
@@ -872,9 +797,8 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
 
 static zgec_err check_stream_sentinel(const uint8_t *s, size_t n)
 {
-    if (n == 0) return ZGEC_ERR_STREAM_SIZE;
-    if (s[n - 1] == 0) return ZGEC_ERR_BITSTREAM_SENTINEL; /* V5 */
-    return ZGEC_OK;
+    /* Shared V5 sentinel check (see zgec_internal.h). */
+    return zgec_check_stream_sentinel(s, n);
 }
 
 /* Single-table (or RLE) stream decode with V5 checks. */
@@ -2728,7 +2652,7 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     if (n_workers > (size_t)nblk) n_workers = (size_t)nblk;
     {
         size_t want = (d->limits.n_threads > 0) ? (size_t)d->limits.n_threads
-                                                : (size_t)zgec_dec_cpu_count();
+                                                : (size_t)zgec_cpu_count();
         inner = (want > n_workers) ? (want / n_workers) : 1u;
         if (inner < 1u) inner = 1u;
     }

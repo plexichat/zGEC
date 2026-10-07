@@ -73,6 +73,10 @@ target_link_libraries(zgec_test_mini PRIVATE zgec_core)
 add_executable(zgec_test_block tests/test_block_check.c)
 target_link_libraries(zgec_test_block PRIVATE zgec_core)
 
+# Shared-helper regression tests (deduplicated internals).
+add_executable(zgec_test_dedup tests/test_dedup.c)
+target_link_libraries(zgec_test_dedup PRIVATE zgec_core)
+
 # Microbenchmark.
 add_executable(zgec_bench tests/bench.c)
 target_link_libraries(zgec_bench PRIVATE zgec_core)
@@ -97,3 +101,9 @@ if(ZGEC_FUZZ_LIBFUZZER)
     target_link_options(zgec_fuzz_libfuzzer PRIVATE
         -fsanitize=fuzzer,address,undefined)
 endif()
+
+enable_testing()
+add_test(NAME conformance COMMAND zgec_test)
+add_test(NAME smoke COMMAND zgec_test_mini)
+add_test(NAME block COMMAND zgec_test_block)
+add_test(NAME dedup COMMAND zgec_test_dedup)

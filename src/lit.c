@@ -92,7 +92,11 @@ unsigned zgec_classify(int ctx_mode, uint8_t b)
     case 3:
         return (unsigned)text_table[b];
     case 4: {
-        int s = (int8_t)b;
+        /* Annex C signed mode. Decode the signed value by hand: the
+         * uint8_t to int8_t conversion is implementation-defined in
+         * strictly conforming C once b exceeds 127, whereas this is
+         * exact on every target. */
+        int s = (b < 128u) ? (int)b : (int)b - 256;
         int cl = s < -32 ? -32 : s > 31 ? 31 : s;
         return (unsigned)(cl + 32);
     }
@@ -125,7 +129,16 @@ void zgec_class_map_encode(uint8_t *packed,
                            const uint8_t *map)
 {
     if (packed == NULL || map == NULL) return;
-    memset(packed, 0, 24);
+    /* Every one of the 24 bytes is stored by the loop below (8 groups x
+     * 3 bytes), so there is nothing to pre-clear. Entries are masked to
+     * their low three bits -- 255 becomes 7 and 8 becomes 0, i.e. they
+     * are wrapped modulo 8, not clamped into range. This is the
+     * trusted-input fast path, and an entry that is not a legal class
+     * for the block's k is not rejected here: zgec_class_map_decode
+     * (above) rejects such a stream with ZGEC_ERR_CLASS_MAP, so a
+     * wrapped entry can turn an encode into a stream its own decoder
+     * refuses. The checked variant that would take k and validate every
+     * entry needs a declaration in include/zgec_lit.h. */
     for (int g = 0; g < 8; g++) {
         uint8_t *p = packed + (size_t)g * 3u;
         uint32_t val24 = 0;
@@ -148,25 +161,45 @@ zgec_err zgec_lit_runstart(uint8_t *runstart,
     /* Caller contract: ll[0..n_seq-1] are the literal lengths and
      * n_lit is the total literal count (tail = n_lit - sum(ll)).
      * The tail start index sum(ll) is itself a run start when a tail
-     * exists (sum(ll) < n_lit), per section 9.3. */
+     * exists (sum(ll) < n_lit), per section 9.3.
+     *
+     * The lengths are validated in full before any byte of runstart is
+     * written, so a rejected call leaves the output untouched, and the
+     * running position only ever advances by an amount already proved
+     * to fit, so it cannot wrap size_t (V1). */
     if (n_lit == 0) {
-        size_t sum = 0;
+        /* No literals: every length must be zero. Comparing them one by
+         * one avoids accumulating a sum that could itself wrap. */
         if (n_seq > 0 && ll == NULL) return ZGEC_ERR_INVAL;
-        for (size_t i = 0; i < n_seq; i++) sum += (size_t)ll[i];
-        return sum == 0 ? ZGEC_OK : ZGEC_ERR_LL_SUM;
+        for (size_t i = 0; i < n_seq; i++) {
+            if (ll[i] != 0) return ZGEC_ERR_LL_SUM;
+        }
+        return ZGEC_OK;
     }
     if (runstart == NULL) return ZGEC_ERR_INVAL;
     if (n_seq > 0 && ll == NULL) return ZGEC_ERR_INVAL;
+
+    /* Pass 1: prove sum(ll) <= n_lit without touching runstart. */
+    {
+        size_t vpos = 0;
+        for (size_t vi = 0; vi < n_seq; vi++) {
+            size_t vadd = (size_t)ll[vi];
+            if (vadd > n_lit - vpos) return ZGEC_ERR_LL_SUM;
+            vpos += vadd;
+        }
+    }
+
+    /* Pass 2: fill. Pass 1 proved pos <= n_lit at every step, so both
+     * the index below and the advance are in range. */
     memset(runstart, 0, n_lit);
     size_t pos = 0;
     for (size_t i = 0; i < n_seq; i++) {
-        if (pos > n_lit) return ZGEC_ERR_LL_SUM;
-        if (ll[i] > 0 && pos < n_lit) {
+        size_t add = (size_t)ll[i];
+        if (add != 0) {
             runstart[pos] = 1;
         }
-        pos += (size_t)ll[i];
+        pos += add;
     }
-    if (pos > n_lit) return ZGEC_ERR_LL_SUM;
     /* Tail start (j == sum LL) when tail literals exist. */
     if (pos < n_lit) {
         runstart[pos] = 1;
@@ -176,16 +209,33 @@ zgec_err zgec_lit_runstart(uint8_t *runstart,
 
 /* ---- lane starts ---- */
 
+/* Section 9.2 cuts Z into exactly eight contiguous lanes, so the lane
+ * divisor below is the lane count and not an arbitrary eight. */
+_Static_assert(ZGEC_NLANES == 8, "literal lane layout requires eight lanes");
+
 void zgec_lit_lane_starts(size_t start[ZGEC_NLANES],
                           size_t n_lit)
 {
     size_t q;
     size_t r;
     if (start == NULL) return;
-    q = n_lit / 8;
-    r = n_lit % 8;
+    q = n_lit / ZGEC_NLANES;
+    r = n_lit % ZGEC_NLANES;
     for (unsigned lane = 0; lane < ZGEC_NLANES; lane++) {
         start[lane] = (size_t)lane * q + ((size_t)lane < r ? (size_t)lane : r);
+    }
+}
+
+void zgec_lit_lane_geom(size_t start[ZGEC_NLANES], size_t len[ZGEC_NLANES],
+                        size_t n_lit)
+{
+    size_t q = n_lit / ZGEC_NLANES;
+    size_t r = n_lit % ZGEC_NLANES;
+    for (unsigned lane = 0; lane < ZGEC_NLANES; lane++) {
+        if (start != NULL)
+            start[lane] = (size_t)lane * q + ((size_t)lane < r ? (size_t)lane : r);
+        if (len != NULL)
+            len[lane] = q + ((size_t)lane < r ? 1u : 0u);
     }
 }
 
@@ -219,7 +269,35 @@ void zgec_lit_sub_reconstruct(uint8_t *Z,
     if (n_lit == 0) return;
     if (Z == NULL) return;
     if (n_seq > 0 && (rep0_before == NULL || ll == NULL)) return;
-    if (tail > 0 && pos >= n_lit) return;
+    if (tail > n_lit) return;
+
+    /* Check the metadata the loops below rely on before writing
+     * anything: sum(ll[0..n_seq-1]) + tail == n_lit, with the running
+     * sum held at or below n_lit so it cannot wrap. This replaces a
+     * guard that was dead - "tail > 0 && pos >= n_lit" could never
+     * hold, since pos is still 0 there and the n_lit == 0 case already
+     * returned above - and it is what stops a malformed segment from
+     * being half-reconstructed.
+     *
+     * Note the consequence of the void return, which include/zgec_lit.h
+     * fixes: a mismatch makes this call a no-op, and the caller has no
+     * way to tell that from a completed reconstruction. That is still
+     * strictly better than the previous behaviour, which wrote a prefix
+     * and presented the half-built buffer as success, but it is not a
+     * resting place. As of this writing the routine has no callers in
+     * the tree, so the decision owed here is whether it survives at all:
+     * either delete it together with its declaration, or change the
+     * return to zgec_err so the refusal above is observable. Both need
+     * include/zgec_lit.h, so neither is done here. */
+    {
+        size_t vsum = 0;
+        for (size_t vi = 0; vi < n_seq; vi++) {
+            size_t vadd = (size_t)ll[vi];
+            if (vadd > n_lit - vsum) return;
+            vsum += vadd;
+        }
+        if (vsum != n_lit - tail) return;
+    }
 
     for (size_t i = 0; i < n_seq; i++) {
         uint32_t rep0 = rep0_before[i];
