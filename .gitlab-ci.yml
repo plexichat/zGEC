@@ -98,7 +98,7 @@ report:
     - first=$(ls rows_*.csv | sort | head -1)
     - head -1 "$first" > results.csv
     - for f in $(ls rows_*.csv | sort); do tail -n +2 "$f" >> results.csv; done
-    - echo "rows: $(( $(wc -l < results.csv) - 1 ))"
+    - 'echo "rows: $(( $(wc -l < results.csv) - 1 ))"'
     # Per-tool best ratio and fastest encode/decode (MB/s, uncompressed bytes).
     - awk -F, 'NR>1 { r[$3]=($9+0>r[$3]?$9+0:r[$3]);
         if ($6=="encode" && ($11+0>e[$3])) e[$3]=$11+0;
