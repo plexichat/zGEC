@@ -2018,42 +2018,48 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         e = seg_tables_build(&cur, &h, seg_buf, seg_size, &prev,
                              (i == 0) ? 1 : 0);
         if (e != ZGEC_OK) goto efail;
-        if (h.n_seq > 0) {
-            ll = (uint32_t *)zgec_alloc((size_t)h.n_seq * sizeof(uint32_t), 64);
-            if (!ll) {
-                e = ZGEC_ERR_NOMEM;
-                goto efail;
-            }
-        }
         lit_stream = seg_buf + h.header_size;
         ll_stream = lit_stream + (size_t)h.lit_size;
-        if (h.n_seq > 0) {
-            e = seq_decode_one(ll, (size_t)h.n_seq, cur.ll[0],
-                               cur.ll_rle[0], ll_stream, (size_t)h.ll_size);
-            if (e != ZGEC_OK) {
-                zgec_free(ll);
-                goto efail;
-            }
-        }
         if (h.n_lit > 0) {
             runstart = (uint8_t *)zgec_alloc((size_t)h.n_lit, 1);
             if (!runstart) {
-                zgec_free(ll);
                 e = ZGEC_ERR_NOMEM;
                 goto efail;
             }
             memset(runstart, 0, (size_t)h.n_lit);
         }
-        for (j = 0; j < (size_t)h.n_seq; j++) {
-            sum_ll += (uint64_t)ll[j];
-            if (sum_ll > (uint64_t)h.n_lit) {
-                zgec_free(ll);
+        /* The LL array is allocated, tested and read inside one block, so
+         * that the read is dominated by its own NULL test. Split across
+         * two n_seq tests, the loop read is a dereference of a pointer the
+         * compiler only knows is conditionally allocated, which gcc 13
+         * reports as a potential null dereference. runstart is allocated
+         * before the LL array because this loop writes it, so every
+         * failure path below releases it too. */
+        if (h.n_seq > 0) {
+            ll = (uint32_t *)zgec_alloc((size_t)h.n_seq * sizeof(uint32_t), 64);
+            if (!ll) {
                 zgec_free(runstart);
-                e = ZGEC_ERR_LL_SUM;
+                e = ZGEC_ERR_NOMEM;
                 goto efail;
             }
-            if (ll[j] > 0)
-                runstart[(size_t)sum_ll - (size_t)ll[j]] = 1;
+            e = seq_decode_one(ll, (size_t)h.n_seq, cur.ll[0],
+                               cur.ll_rle[0], ll_stream, (size_t)h.ll_size);
+            if (e != ZGEC_OK) {
+                zgec_free(ll);
+                zgec_free(runstart);
+                goto efail;
+            }
+            for (j = 0; j < (size_t)h.n_seq; j++) {
+                sum_ll += (uint64_t)ll[j];
+                if (sum_ll > (uint64_t)h.n_lit) {
+                    zgec_free(ll);
+                    zgec_free(runstart);
+                    e = ZGEC_ERR_LL_SUM;
+                    goto efail;
+                }
+                if (ll[j] > 0)
+                    runstart[(size_t)sum_ll - (size_t)ll[j]] = 1;
+            }
         }
         if (sum_ll < (uint64_t)h.n_lit && h.n_lit > 0)
             runstart[(size_t)sum_ll] = 1;
