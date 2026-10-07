@@ -1,0 +1,112 @@
+# zGEC vs zstd (3/4/5/6) vs xz on the full Silesia corpus.
+#
+# Five stages:
+#   1. build    compile zgec (Release, same -Werror flags as CMakeLists)
+#   2. corpus   fetch + verify Silesia (12 files, mattmahoney.net mirror)
+#   3. bench-1t every config single-threaded  (zgec -l1..9, zstd -3..6, xz -6)
+#   4. bench-nt every config multi-threaded   (same, one worker per core)
+#   5. report   merge per-file CSVs into results.csv + summary table
+#
+# Measurement itself is tools/ci/silesia_bench.sh (own implementation:
+# best-of-REPS wall time, encode + decode, cmp round-trip check).
+# Rows: corpus,file,tool,config,threads,op,input_bytes,output_bytes,
+#       ratio,seconds,mbps,notes
+
+stages:
+  - build
+  - corpus
+  - bench-1t
+  - bench-nt
+  - report
+
+variables:
+  REPS: "3"
+  SILESIA_URL: "https://mattmahoney.net/dc/silesia.zip"
+
+default:
+  image: ubuntu:24.04
+  before_script:
+    - apt-get update -qq
+    - DEBIAN_FRONTEND=noninteractive apt-get install -y -qq cmake g++ zstd xz-utils curl unzip ca-certificates
+
+compile:
+  stage: build
+  script:
+    - cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+    - cmake --build build --parallel
+    - ./build/zgec -V
+    - ./build/zgec_test_mini
+  artifacts:
+    paths:
+      - build/zgec
+      - tools/ci/silesia_bench.sh
+    expire_in: 1 day
+
+silesia:
+  stage: corpus
+  needs: []
+  cache:
+    key: silesia-corpus
+    paths:
+      - silesia.zip
+  script:
+    - test -f silesia.zip || curl -sSL "$SILESIA_URL" -o silesia.zip
+    - rm -rf silesia && mkdir silesia && unzip -q -o silesia.zip -d silesia
+    - ls silesia
+    - for f in dickens mozilla mr nci ooffice osdb reymont samba sao webster x-ray xml; do test -f "silesia/$f" || { echo "missing $f"; exit 1; }; done
+    - du -sh silesia && du -b silesia/* | sort -n
+  artifacts:
+    paths:
+      - silesia/
+    expire_in: 1 day
+
+# One parallel job per Silesia file keeps each job to a few minutes
+# (xz encode is the long pole) and isolates failures per file.
+.bench_template: &bench
+  needs: [compile, silesia]
+  parallel:
+    matrix:
+      - SFILE: [dickens, mozilla, mr, nci, ooffice, osdb, reymont, samba, sao, webster, x-ray, xml]
+
+bench-1t:
+  <<: *bench
+  stage: bench-1t
+  script:
+    - chmod +x tools/ci/silesia_bench.sh
+    - tools/ci/silesia_bench.sh "rows_1t_${SFILE}.csv" build/zgec "$REPS" 1t "silesia/${SFILE}"
+  artifacts:
+    paths:
+      - rows_1t_*.csv
+    expire_in: 1 week
+
+bench-nt:
+  <<: *bench
+  stage: bench-nt
+  script:
+    - chmod +x tools/ci/silesia_bench.sh
+    - tools/ci/silesia_bench.sh "rows_nt_${SFILE}.csv" build/zgec "$REPS" nt "silesia/${SFILE}"
+  artifacts:
+    paths:
+      - rows_nt_*.csv
+    expire_in: 1 week
+
+report:
+  stage: report
+  needs: [bench-1t, bench-nt]
+  script:
+    - set -euo pipefail
+    - first=$(ls rows_*.csv | sort | head -1)
+    - head -1 "$first" > results.csv
+    - for f in $(ls rows_*.csv | sort); do tail -n +2 "$f" >> results.csv; done
+    - echo "rows: $(( $(wc -l < results.csv) - 1 ))"
+    # Per-tool best ratio and fastest encode/decode (MB/s, uncompressed bytes).
+    - awk -F, 'NR>1 { r[$3]=($9+0>r[$3]?$9+0:r[$3]);
+        if ($6=="encode" && ($11+0>e[$3])) e[$3]=$11+0;
+        if ($6=="decode" && ($11+0>d[$3])) d[$3]=$11+0 }
+        END { printf "| tool | best ratio | best enc MB/s | best dec MB/s |\n|---|---|---|---|\n";
+        for (t in r) printf "| %s | %.3f | %.1f | %.1f |\n", t, r[t], e[t], d[t] }' results.csv | sort | tee summary.md
+  artifacts:
+    paths:
+      - results.csv
+      - summary.md
+    expire_in: 90 days
