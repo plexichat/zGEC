@@ -1,6 +1,15 @@
 #ifndef ZGEC_INTERNAL_H
 #define ZGEC_INTERNAL_H
 
+/* macOS hides sysconf(3) and _SC_NPROCESSORS_ONLN under the strict
+ * -std=c11 this project builds with (same class of issue as cli.c
+ * needing _POSIX_C_SOURCE for clock_gettime). _POSIX_C_SOURCE alone
+ * is not enough there; request the full Darwin declarations before
+ * any system header is pulled in. Inert everywhere else. */
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+#define _DARWIN_C_SOURCE 1
+#endif
+
 /* Shared internals deduplicated from decode.c / encode.c / seq.c /
  * dict.c / common.c. Not part of the public API; for in-tree use only.
  */
