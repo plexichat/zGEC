@@ -244,6 +244,133 @@ static int bench_decode(const uint8_t *frame, size_t frame_size,
     return 1;
 }
 
+static int bench_cmp_dbl(const void *a, const void *b)
+{
+    double x = *(const double *)a;
+    double y = *(const double *)b;
+    if (x < y) return -1;
+    if (x > y) return 1;
+    return 0;
+}
+
+/* Random-access latency: decode every block once by index (warm-up,
+ * verifying bytes against the source), then time each block `reps`
+ * times and keep the best per block. Reports min/median/p95/max/mean
+ * across blocks plus the per-block best table, so any single slow
+ * block is visible instead of hidden in a frame-wide average. */
+static int bench_random_access(const uint8_t *frame, size_t frame_size,
+                               const uint8_t *src, size_t src_size, int reps)
+{
+    zgec_frame_header fh;
+    zgec_trailer tr;
+    zgec_footer f;
+    zgec_decoder *d = NULL;
+    uint64_t bsize = 0;
+    double *best = NULL;
+    double *sorted = NULL;
+    uint32_t b;
+    double sum = 0.0;
+    double mn = 0.0, mx = 0.0, med = 0.0, p95 = 0.0;
+    int ok = 0;
+    memset(&f, 0, sizeof(f));
+    if (zgec_frame_header_parse(&fh, frame) != ZGEC_OK) {
+        fprintf(stderr, "bench: random-access header parse failed\n");
+        return 0;
+    }
+    if (zgec_trailer_parse(&tr, frame + frame_size - 16) != ZGEC_OK ||
+        tr.footer_offset + (uint64_t)tr.footer_size + 16u !=
+        (uint64_t)frame_size ||
+        zgec_footer_parse(&f, frame + (size_t)tr.footer_offset,
+                          tr.footer_size) != ZGEC_OK) {
+        fprintf(stderr, "bench: random-access footer parse failed\n");
+        return 0;
+    }
+    if (f.block_count == 0) {
+        fprintf(stderr, "bench: random-access found no blocks\n");
+        zgec_footer_free(&f);
+        return 0;
+    }
+    bsize = (uint64_t)1 << fh.block_log2;
+    best = (double *)malloc(sizeof(double) * f.block_count);
+    sorted = (double *)malloc(sizeof(double) * f.block_count);
+    if (!best || !sorted) {
+        fprintf(stderr, "bench: allocation failed\n");
+        free(best);
+        free(sorted);
+        zgec_footer_free(&f);
+        return 0;
+    }
+    d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
+    if (!d) {
+        fprintf(stderr, "bench: decoder allocation failed\n");
+        free(best);
+        free(sorted);
+        zgec_footer_free(&f);
+        return 0;
+    }
+    for (b = 0; b < f.block_count; b++) {
+        const uint8_t *blk = NULL;
+        size_t blk_size = 0;
+        uint64_t base = (uint64_t)b * bsize;
+        double bb = 0.0;
+        int i;
+        if (base >= (uint64_t)src_size ||
+            zgec_decode_block_index(d, frame, frame_size, b,
+                                    &blk, &blk_size) != ZGEC_OK ||
+            base + (uint64_t)blk_size > (uint64_t)src_size ||
+            memcmp(blk, src + (size_t)base, blk_size) != 0) {
+            fprintf(stderr, "bench: random-access verify failed block %u\n",
+                    b);
+            goto ra_done;
+        }
+        for (i = 0; i < reps; i++) {
+            double t0 = bench_now_sec();
+            const uint8_t *tb = NULL;
+            size_t tbsz = 0;
+            double sec;
+            if (zgec_decode_block_index(d, frame, frame_size, b,
+                                        &tb, &tbsz) != ZGEC_OK) {
+                fprintf(stderr, "bench: random-access decode failed\n");
+                goto ra_done;
+            }
+            sec = bench_now_sec() - t0;
+            if (i == 0 || sec < bb) bb = sec;
+        }
+        best[b] = bb;
+    }
+    memcpy(sorted, best, sizeof(double) * f.block_count);
+    qsort(sorted, f.block_count, sizeof(double), bench_cmp_dbl);
+    mn = sorted[0];
+    mx = sorted[f.block_count - 1u];
+    med = sorted[f.block_count / 2u];
+    p95 = sorted[(f.block_count * 95u) / 100u];
+    for (b = 0; b < f.block_count; b++) sum += best[b];
+    printf("  rand-access: %u blocks  min %9.3f ms  med %9.3f ms  "
+           "p95 %9.3f ms  max %9.3f ms  mean %9.3f ms\n",
+           f.block_count, mn * 1000.0, med * 1000.0, p95 * 1000.0,
+           mx * 1000.0, (sum / (double)f.block_count) * 1000.0);
+    printf("  per-block latency (best of %d, ms):\n", reps);
+    for (b = 0; b < f.block_count; b++) {
+        const uint8_t *blk = NULL;
+        size_t blk_size = 0;
+        if (zgec_decode_block_index(d, frame, frame_size, b,
+                                    &blk, &blk_size) != ZGEC_OK) {
+            fprintf(stderr, "bench: random-access decode failed\n");
+            goto ra_done;
+        }
+        printf("    block %5u  off %10llu  size %8zu  %9.3f ms  %9.1f MB/s\n",
+               b, (unsigned long long)((uint64_t)b * bsize), blk_size,
+               best[b] * 1000.0, bench_mbps(blk_size, best[b]));
+    }
+    ok = 1;
+ra_done:
+    zgec_decoder_destroy(d);
+    free(best);
+    free(sorted);
+    zgec_footer_free(&f);
+    return ok;
+}
+
 static int bench_parse_reps(const char *s, int *out)
 {
     char *end = NULL;
@@ -368,6 +495,11 @@ int main(int argc, char **argv)
            bench_mbps(in_size, enc1), bench_mbps(in_size, encN),
            bench_mbps(in_size, dec1), bench_mbps(in_size, decN),
            ((double)in_size) / ((double)frame_size));
+
+    if (ok && !bench_random_access(frame, frame_size, in, in_size, reps)) {
+        ok = 0;
+        goto done;
+    }
 
 done:
     zgec_free(frame1);

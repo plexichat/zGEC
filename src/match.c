@@ -176,10 +176,11 @@
  * until the match would need more samples than this. */
 #define ZGEC_MF_HIGH_SAMPLES 2048u
 
-/* The matcher struct stays 64-byte aligned; tables
- * use the 2 MiB huge-page alignment intent. */
+/* The matcher struct stays 64-byte aligned; tables use the same
+ * 64B cache-line alignment (huge-page intent removed: malloc never
+ * provides MAP_HUGETLB, so 2MiB alignment only wasted ~1MiB/table). */
 #define ZGEC_MF_ALIGN 64
-#define ZGEC_MF_TABLE_ALIGN ((size_t)2u * (size_t)1024u * (size_t)1024u)
+#define ZGEC_MF_TABLE_ALIGN 64
 
 struct zgec_matcher {
     zgec_tier      tier;
@@ -313,7 +314,7 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos)
     uint32_t tag;
     uint32_t entry;
 
-    if (pos + 1u >= (size_t)ZGEC_MF_POS_LIMIT) {
+    if (pos >= (size_t)ZGEC_MF_POS_LIMIT - 1u) {
         return; /* position does not fit the 24-bit field */
     }
     if (m->is_binary) {
@@ -417,6 +418,14 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes)
 {
     uint32_t mask = 0u;
     uint32_t lane = 0u;
+    if (nlanes < 8u) {
+        for (; lane < nlanes; lane++) {
+            uint32_t e = b[lane];
+            uint32_t etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
+            mask |= (uint32_t)((e != 0u && etag == tag) ? 1u : 0u) << lane;
+        }
+        return mask;
+    }
 #if defined(__AVX2__)
     __m256i tagv = _mm256_set1_epi32((int)(tag << ZGEC_MF_TAG_SHIFT));
     __m256i tagmask = _mm256_set1_epi32((int)(ZGEC_MF_TAG_MASK << ZGEC_MF_TAG_SHIFT));
@@ -671,7 +680,7 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
 }
 
 zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
-                             uint32_t rep0, uint32_t rep1,
+                             uint32_t rep0, uint32_t rep1, uint32_t rep2,
                              uint32_t min_len, uint32_t max_len)
 {
     zgec_match best;
@@ -681,7 +690,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     uint32_t nreps;
     uint32_t i;
     size_t avail;
-    uint32_t reps[2];
+    uint32_t reps[3];
 
     best.offset = 0;
     best.length = 0;
@@ -718,11 +727,12 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         hash_min = cap + 1u; /* disables hash probes below */
     }
 
-    /* 1. Repeat offsets, checked first (fast checks
-     * rep0 only; main/high check rep0 and rep1). */
+    /* 1. Repeat offsets: rep0..rep2 all probed (parser grants min=4
+     * to all three, so all three must be measured). */
     reps[0] = rep0;
     reps[1] = rep1;
-    nreps = (m->tier == ZGEC_TIER_FAST) ? 1u : 2u;
+    reps[2] = rep2;
+    nreps = (m->tier == ZGEC_TIER_FAST) ? 1u : 3u;
     for (i = 0; i < nreps; i++) {
         uint32_t d = reps[i];
         uint32_t len;
@@ -832,7 +842,7 @@ void zgec_matcher_insert(zgec_matcher *m, const uint8_t *vb, size_t ip)
     /* The position must fit the 24-bit field; the
      * short hash reads 5 bytes (4 for binary). */
     need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN : (size_t)ZGEC_MF_HASH_BYTES;
-    if (ip + need > m->vb_size || ip >= (size_t)ZGEC_MF_POS_LIMIT) {
+    if (ip >= (size_t)ZGEC_MF_POS_LIMIT || ip > m->vb_size || need > m->vb_size - ip) {
         return;
     }
     mf_insert_pos(m, vb, ip);
@@ -877,7 +887,8 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
     } else {
         /* Sampled: evenly spaced, distinct positions across the match
          * (never more than the match length, so no duplicate inserts),
-         * all within the virtual buffer. */
+         * all within the virtual buffer. uint64_t math: no 32-bit wrap,
+         * no division per sample. */
         size_t nsamp = (m->tier == ZGEC_TIER_FAST)
                            ? (size_t)ZGEC_MF_MATCH_SAMPLES_FAST
                            : (size_t)ZGEC_MF_MATCH_SAMPLES;
@@ -887,9 +898,12 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
         if (nsamp > len) nsamp = len;
         if (nsamp < 1u) nsamp = 1u;
         for (t = 0; t < nsamp; t++) {
-            size_t pos = start + (len - 1u) * t /
-                                    (nsamp > 1u ? nsamp - 1u : 1u);
-            if (pos < m->vb_size && pos + need <= m->vb_size) {
+            uint64_t off = (nsamp > 1u)
+                               ? ((uint64_t)(len - 1u) * (uint64_t)t /
+                                  (uint64_t)(nsamp - 1u))
+                               : 0u;
+            size_t pos = start + (size_t)off;
+            if (pos < m->vb_size && need <= m->vb_size - pos) {
                 mf_insert_pos(m, vb, pos);
             }
         }

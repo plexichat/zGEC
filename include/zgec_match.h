@@ -55,7 +55,7 @@ void zgec_matcher_reset(zgec_matcher *m,
  */
 zgec_match zgec_matcher_find(zgec_matcher *m,
                                          const uint8_t *vb, size_t ip,
-                                         uint32_t rep0, uint32_t rep1,
+                                         uint32_t rep0, uint32_t rep1, uint32_t rep2,
                                          uint32_t min_len, uint32_t max_len);
 
 /* Insert the position ip into the hash tables. */

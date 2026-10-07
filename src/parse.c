@@ -516,7 +516,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (ip + (size_t)64 <= end) {
             __builtin_prefetch((const void *)(vb + ip + (size_t)64), 0, 3);
         }
-        match = zgec_matcher_find(m, vb, ip, reps.rep[0], reps.rep[1], 4u,
+        match = zgec_matcher_find(m, vb, ip, reps.rep[0], reps.rep[1], reps.rep[2], 4u,
                                   (uint32_t)(end - ip));
         ll = (uint32_t)(ip - anchor);
         if (match.length >= 4u) {
@@ -542,7 +542,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], 4u,
+                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
                                               (uint32_t)(end - (ip + (size_t)1)));
             uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
             uint32_t nis_rep = (nm.length >= 4u &&

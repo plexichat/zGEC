@@ -3509,14 +3509,32 @@ zgec_err zgec_decode_block(zgec_decoder *d,
                             const uint8_t **dst, size_t *dst_size)
 {
     zgec_frame_header fh;
+    zgec_trailer tr;
+    zgec_footer f;
     zgec_err e;
     uint64_t bsize;
     uint32_t idx;
     if (!d || !src || !dst || !dst_size || src_size < 32) return ZGEC_ERR_INVAL;
     e = zgec_frame_header_parse(&fh, src);
     if (e != ZGEC_OK) return e;
+    if (zgec_rd32(src + src_size - 4) != ZGEC_TRAILER_MAGIC_U32)
+        return ZGEC_ERR_MAGIC;
+    e = zgec_trailer_parse(&tr, src + src_size - 16);
+    if (e != ZGEC_OK) return e;
+    if (tr.footer_offset + (uint64_t)tr.footer_size + 16u !=
+        (uint64_t)src_size)
+        return ZGEC_ERR_TRUNCATED;
+    memset(&f, 0, sizeof(f));
+    e = zgec_footer_parse(&f, src + (size_t)tr.footer_offset,
+                          tr.footer_size);
+    if (e != ZGEC_OK) return e;
+    if (offset >= f.content_size) {
+        zgec_footer_free(&f);
+        return ZGEC_ERR_BLOCK_SIZE;
+    }
     bsize = (uint64_t)1 << fh.block_log2;
     idx = (uint32_t)(offset / bsize);
+    zgec_footer_free(&f);
     return zgec_decode_block_index(d, src, src_size, idx, dst, dst_size);
 }
 

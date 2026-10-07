@@ -829,8 +829,8 @@ The guidance describes the reference encoder, which is designed to reach the goa
 | Tier | Table layout | Probes | Lazy | Skip shift |
 |---|---|---|---|---|
 | fast | 4-entry buckets, packed 32-bit entries | rep0, long table, short table (depth 2) | none | 5-6 |
-| main | 8-entry buckets, packed | rep0, rep1, long, short | one step | 7-8 |
-| high | 16-slot rows with separate 8-bit tag arrays | rep0, rep1, long, short, deeper | one step, price-based | 8 |
+| main | 8-entry buckets, packed | rep0, rep1, rep2, long, short | one step | 7-8 |
+| high | 16-slot rows with separate 8-bit tag arrays | rep0, rep1, rep2, long, short, deeper | one step, price-based | 8 |
 
 - Entries in packed tables are 32 bits: a 24-bit position in the virtual buffer and an 8-bit tag from spare hash bits. Eight packed entries fill one 32-byte vector, so a bucket is one aligned load and one SIMD tag comparison. With 16-slot rows, separate tag arrays are better: 16 tags compare in one 128-bit operation and only hit positions are loaded.
 - Hashing: the short table hashes 5 bytes (4 bytes for data classified as binary); the long table hashes 8 bytes with one entry per bucket. A 5-byte hash cannot find 4-byte matches, so the minimum non-repeat match is 5, with 4 permitted for repeat offsets.
@@ -841,7 +841,7 @@ The guidance describes the reference encoder, which is designed to reach the goa
 ### 11.3 Per-position order and pipelining
 
 1. Compute the hashes for position ip + D*step and prefetch the bucket line, but only for positions the skip schedule will actually visit.
-2. At ip: check rep0 (and rep1) at ip + 1 with one 4-byte compare each. Probe the long table, then the short bucket.
+2. At ip: check rep0 (rep0..rep2 on main/high with one 4-byte compare each; rep0 only on fast). Probe the long table, then the short bucket.
 3. Compare tags with a SIMD instruction; extract the first two hits with trailing-zero count and clear-lowest-bit; an empty mask selects a padded dummy slot, so no branch is needed.
 4. Load 8 bytes at each candidate, XOR with the current 8 bytes, count trailing zero bytes to get the length (at most 8); select the best by conditional move on the price score; extend beyond 8 bytes with 32-byte compares in a loop that normally runs once.
 5. Lazy check at ip + 1 with the same score, again by conditional move.

@@ -1084,8 +1084,10 @@ out:
  * decoder rebuilds, or the round-trip breaks. */static int zgec_test_litref_bound(void)
 {
     size_t block = (size_t)1 << 21;      /* 2 MiB blocks */
-    size_t n = 4u * block;               /* four blocks */
-    static const size_t dict_mib[4] = { 11u, 12u, 13u, 14u };
+    size_t n = 6u * block;               /* six blocks: deep enough that the
+                                          * P24 16MiB cap binds regardless of
+                                          * parse-level literal savings */
+    static const size_t dict_mib[5] = { 11u, 12u, 13u, 14u, 15u };
     int round_tripped = 0;
     uint8_t *src = (uint8_t *)malloc(n);
     uint8_t *cmp = NULL;
@@ -1103,13 +1105,13 @@ out:
     t_noisy_body(src, n, 45, 999u);
 
     /* Whether the ratio gate chooses to reference a predecessor's literals
-     * at all, and how many of them fit, depends on the parse, so the test
-     * does not pin one dictionary size: it sweeps sizes that all leave less
-     * room than three predecessors need (P24 caps the virtual buffer at
-     * 16 MiB, so 9..13 MiB of dictionary plus a 2 MiB block leaves under
-     * 5 MiB), and requires the chain to be used AND to be shrunk below the
-     * available run somewhere in the sweep. What must hold in EVERY
-     * configuration is the invariant: a block never references more
+     * at all, and how many of them fit, depends on the parse (rep2 probing
+     * included), so the test does not pin one dictionary size: it sweeps
+     * sizes that all leave less room than three predecessors need (P24 caps
+     * the virtual buffer at 16 MiB, so 11..15 MiB of dictionary plus a 2 MiB
+     * block leaves under 5 MiB), and requires the chain to be used AND to be
+     * shrunk below the available run somewhere in the sweep. What must hold
+     * in EVERY configuration is the invariant: a block never references more
      * exportable predecessors than it actually has (6.3). */
     for (cf = 0; cf < sizeof(dict_mib) / sizeof(dict_mib[0]); cf++) {
         size_t dn = dict_mib[cf] << 20;
@@ -1149,7 +1151,7 @@ out:
             free(dict);
             goto out;
         }
-        if (f.block_count != 4) {
+        if (f.block_count != 6) {
             printf("  litref_bound: block_count=%u\n", f.block_count);
             zgec_footer_free(&f);
             free(dict);
@@ -1298,6 +1300,256 @@ out:
     free(src);
     return ok;
 }
+/* Section 4.6 exhaustive random access: EVERY block of a multi-block
+ * frame must decode identically by index and by original-data offset,
+ * and must match both the sequential full-frame decode and the source.
+ * Covers first/middle/last byte offsets of each block, by-index vs
+ * by-offset agreement, out-of-range offset/index rejection, RAW/RLE/
+ * COMPRESSED record kinds, checksums, and litref chains. */
+static int zgec_test_random_access_full(void)
+{
+    uint8_t *src = NULL;
+    uint8_t *frame = NULL;
+    size_t frame_size = 0;
+    uint8_t *seq = NULL;
+    size_t seq_size = 0;
+    zgec_params p;
+    zgec_encoder *e = NULL;
+    zgec_decoder *d = NULL;
+    zgec_frame_header fh;
+    zgec_footer f;
+    zgec_err err;
+    int ok = 0;
+    uint64_t bsize;
+    uint32_t b;
+    size_t n = 700000;
+    int mixed = 0;
+    memset(&f, 0, sizeof(f));
+    for (mixed = 0; mixed < 2; mixed++) {
+#define RA_FAIL(msg) do { \
+        printf("  random_access_full: case=%d blocks=%u step=%s err=%d\n", \
+               mixed, f.block_count, msg, (int)err); \
+        goto ra_out2; \
+    } while (0)
+        if (mixed == 0) {
+            n = 700000;
+            src = (uint8_t *)malloc(n);
+            if (!src) goto ra_out;
+            t_body(src, n);
+            zgec_params_default(&p);
+            p.block_log2 = 16;
+            p.n_threads = 2;
+            p.use_litref = 1;
+            p.use_contexts = 1;
+            p.block_checksums = 1;
+        } else {
+            const size_t bs = 65536u;
+            n = 6u * bs;
+            src = (uint8_t *)malloc(n);
+            if (!src) goto ra_out;
+            memset(src, 0x5Au, bs);
+            {
+                /* Truly incompressible: full xorshift bytes, no low-bit
+                 * structure (the old (s>>7)^(s>>19)^k form has k-XOR
+                 * structure that rep2 matching now compresses, flipping
+                 * this block from RAW to COMPRESSED). */
+                uint32_t s = 12345u;
+                size_t k;
+                for (k = 0; k < bs; k++) {
+                    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+                    src[bs + k] = (uint8_t)(s >> 11);
+                    s ^= s << 7;
+                    src[bs + k] ^= (uint8_t)s;
+                }
+            }
+            t_text_body(src + 2u * bs, n - 2u * bs, 77u);
+            zgec_params_default(&p);
+            p.block_log2 = 16;
+            p.n_threads = 1;
+            p.use_litref = 0;
+            p.use_contexts = 0;
+            p.block_checksums = 1;
+        }
+        e = zgec_encoder_create(&p);
+        if (!e) goto ra_out;
+        err = zgec_encode_frame(e, src, n, &frame, &frame_size);
+        zgec_encoder_destroy(e);
+        e = NULL;
+        if (err != ZGEC_OK) RA_FAIL("encode");
+        if (!t_frame_parts(frame, frame_size, &fh, &f)) RA_FAIL("frame_parts");
+        if (f.block_count < 2) RA_FAIL("single-block");
+        bsize = (uint64_t)1 << fh.block_log2;
+        d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
+        if (!d) RA_FAIL("decoder-create");
+        err = zgec_decode_frame(d, frame, frame_size, &seq, &seq_size);
+        if (err != ZGEC_OK || seq_size != n || memcmp(seq, src, n) != 0)
+            RA_FAIL("sequential");
+
+        /* Every block: by index, plus start/mid/end offsets. */
+        for (b = 0; b < f.block_count; b++) {
+            const uint8_t *bi = NULL;
+            size_t bisz = 0;
+            uint64_t base = (uint64_t)b * bsize;
+            uint64_t esz = (base + bsize <= (uint64_t)n)
+                ? bsize : ((uint64_t)n - base);
+            uint64_t probes[3];
+            int pi;
+            if (base >= (uint64_t)n) RA_FAIL("base-beyond");
+            probes[0] = base;
+            probes[1] = base + esz / 2u;
+            probes[2] = base + esz - 1u;
+            err = zgec_decode_block_index(d, frame, frame_size, b,
+                                          &bi, &bisz);
+            if (err != ZGEC_OK || (uint64_t)bisz != esz) RA_FAIL("by-index");
+            if (memcmp(bi, src + (size_t)base, bisz) != 0)
+                RA_FAIL("by-index-bytes");
+            if (memcmp(bi, seq + (size_t)base, bisz) != 0)
+                RA_FAIL("by-index-vs-seq");
+            for (pi = 0; pi < 3; pi++) {
+                const uint8_t *bo = NULL;
+                size_t bosz = 0;
+                uint64_t off = probes[pi];
+                if (off >= (uint64_t)n) continue;
+                err = zgec_decode_block(d, frame, frame_size, off,
+                                        &bo, &bosz);
+                if (err != ZGEC_OK) RA_FAIL("by-offset");
+                if (bosz != bisz || bo != bi) RA_FAIL("idx-vs-off");
+                if (memcmp(bo, src + (size_t)base, bosz) != 0)
+                    RA_FAIL("by-offset-bytes");
+                if (bo[(size_t)(off - base)] != src[(size_t)off])
+                    RA_FAIL("byte-lane");
+            }
+        }
+        /* Out-of-range offset/index must fail, never decode. */
+        {
+            const uint8_t *bx = NULL;
+            size_t bxsz = 0;
+            if (zgec_decode_block(d, frame, frame_size, (uint64_t)n,
+                                  &bx, &bxsz) == ZGEC_OK) RA_FAIL("off-eq-n");
+            if (zgec_decode_block_index(d, frame, frame_size,
+                                        f.block_count, &bx,
+                                        &bxsz) == ZGEC_OK) RA_FAIL("idx-eq-n");
+            if (zgec_decode_block_index(d, frame, frame_size,
+                                        f.block_count + 100u, &bx,
+                                        &bxsz) == ZGEC_OK)
+                RA_FAIL("idx-huge");
+        }
+        /* Truncated frame must fail, never crash. */
+        if (frame_size > 64) {
+            zgec_decoder *d2 = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
+            const uint8_t *bx = NULL;
+            size_t bxsz = 0;
+            zgec_err e2;
+            if (!d2) RA_FAIL("decoder2");
+            e2 = zgec_decode_block_index(d2, frame, frame_size - 32u, 0,
+                                         &bx, &bxsz);
+            zgec_decoder_destroy(d2);
+            if (e2 == ZGEC_OK) RA_FAIL("truncated");
+        }
+        /* Case B must really hold RLE + RAW + COMPRESSED kinds. */
+        if (mixed == 1) {
+            int n_rle = 0, n_raw = 0, n_cmp = 0;
+            size_t i;
+            for (i = 0; i < f.block_count; i++) {
+                zgec_record_header rh;
+                if (zgec_record_header_parse(&rh,
+                        frame + (size_t)f.blocks[i].offset,
+                        &fh) != ZGEC_OK) RA_FAIL("record-parse");
+                if (rh.record_type == ZGEC_REC_RLE) n_rle++;
+                else if (rh.record_type == ZGEC_REC_RAW) n_raw++;
+                else if (rh.record_type == ZGEC_REC_COMPRESSED) n_cmp++;
+            }
+            if (n_rle < 1 || n_raw < 1 || n_cmp < 1) {
+                printf("  random_access_full: kinds RLE=%d RAW=%d CMP=%d\n",
+                       n_rle, n_raw, n_cmp);
+                RA_FAIL("kinds");
+            }
+        }
+        zgec_decoder_destroy(d);
+        d = NULL;
+        zgec_footer_free(&f);
+        memset(&f, 0, sizeof(f));
+        zgec_free(frame);
+        frame = NULL;
+        frame_size = 0;
+        zgec_free(seq);
+        seq = NULL;
+        seq_size = 0;
+        free(src);
+        src = NULL;
+        continue;
+ra_out2:
+        if (d) { zgec_decoder_destroy(d); d = NULL; }
+        goto ra_out;
+    }
+#undef RA_FAIL
+    /* Random offsets across the last-built input hit the right block.
+     * Re-encode case A first: the loop above freed both frames, so
+     * `frame/src/n/fh` no longer name a live buffer here. */
+    {
+        uint32_t s = 0xC0FFEEu;
+        uint32_t k;
+        n = 700000;
+        free(src);
+        src = (uint8_t *)malloc(n);
+        if (!src) goto ra_out;
+        t_body(src, n);
+        zgec_params_default(&p);
+        p.block_log2 = 16;
+        p.n_threads = 1;
+        p.use_litref = 0;
+        p.use_contexts = 0;
+        p.block_checksums = 0;
+        e = zgec_encoder_create(&p);
+        if (!e) goto ra_out;
+        err = zgec_encode_frame(e, src, n, &frame, &frame_size);
+        zgec_encoder_destroy(e);
+        e = NULL;
+        if (err != ZGEC_OK || !t_frame_parts(frame, frame_size, &fh, &f)) {
+            printf("  random_access_full: rand-phase encode err=%d\n",
+                   (int)err);
+            goto ra_out;
+        }
+        d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
+        if (!d) goto ra_out;
+        bsize = (uint64_t)1 << fh.block_log2;
+        for (k = 0; k < 64u; k++) {
+            uint64_t ro;
+            uint32_t want;
+            const uint8_t *br = NULL;
+            size_t brsz = 0;
+            s ^= s << 13; s ^= s >> 17; s ^= s << 5;
+            ro = (uint64_t)(s % (uint32_t)n);
+            want = (uint32_t)(ro / bsize);
+            err = zgec_decode_block(d, frame, frame_size, ro, &br, &brsz);
+            if (err != ZGEC_OK) {
+                printf("  random_access_full: rand-off %llu err=%d\n",
+                       (unsigned long long)ro, (int)err);
+                goto ra_out2b;
+            }
+            if (memcmp(br, src + (size_t)((uint64_t)want * bsize),
+                       brsz) != 0) {
+                printf("  random_access_full: rand-off %llu wrong block\n",
+                       (unsigned long long)ro);
+                goto ra_out2b;
+            }
+        }
+        zgec_decoder_destroy(d);
+        d = NULL;
+    }
+    ok = 1;
+    goto ra_out;
+ra_out2b:
+    if (d) { zgec_decoder_destroy(d); d = NULL; }
+ra_out:
+    if (d) zgec_decoder_destroy(d);
+    if (e) zgec_encoder_destroy(e);
+    zgec_footer_free(&f);
+    zgec_free(frame);
+    zgec_free(seq);
+    free(src);
+    return ok;
+}
 
 int main(void)
 {
@@ -1325,6 +1577,7 @@ int main(void)
     if (zgec_test_litref_all_flags()) passed++; else { printf("FAIL litref_all_flags\n"); failed++; }
     if (zgec_test_litref_bound()) passed++; else { printf("FAIL litref_bound\n"); failed++; }
     if (zgec_test_dict_no_orphan()) passed++; else { printf("FAIL dict_no_orphan\n"); failed++; }
+    if (zgec_test_random_access_full()) passed++; else { printf("FAIL random_access_full\n"); failed++; }
 
     printf("PASS %d FAIL %d\n", passed, failed);
     return failed ? 1 : 0;
