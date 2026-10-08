@@ -91,6 +91,22 @@ that ran. `--conditioning` is **not** cleared: the encoder keeps OF
 conditioning on the literal-reference path and drops only LL conditioning,
 which is the part that would break exportability.
 
+## Checksum cost
+
+`--checksums` (on by default only at level 9) adds a per-block CRC32C
+pass: `src/encode.c:3891` checksums the source block on encode and
+`src/decode.c:1917` re-checksums the decoded block on decode, both via
+`zgec_crc32c` (`src/crc32c.c:155` `zgec_crc32c_hw`, which uses the x86
+SSE4.2 `crc32` instruction when available and falls back to a sliced
+software table otherwise). The pass costs ~0.7 line-hits/byte (~6% of
+the level-9 decode budget, measured on the 211938580-byte Silesia
+corpus). It applies only when block checksums are on (`block_checksums`
+/ `--checksums`); with `--no-checksums` — or any level below 9 without
+`--checksums` — there is no CRC pass. Interleaving the CRC with the
+copy pass was considered and rejected: it risks cache pollution for
+little gain, since the checksum path is already HW-accelerated
+(`crc32` path ~155-176 vs sliced software ~108-142).
+
 ## Tuning dials
 
 ```sh
