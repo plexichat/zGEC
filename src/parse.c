@@ -352,7 +352,16 @@ zgec_err zgec_parse_block(zgec_parse **out,
  * compare, then one probe of each table, take the longest acceptable match.
  * No tags, no ring buffer, no lazy step beyond the one-position check below.
  * Skip schedule step = ((ip - anchor) >> shift) + 1. Compiled only with
- * ZGEC_FASTDFAST (disable with -DZGEC_FASTDFAST_OFF). */
+ * ZGEC_FASTDFAST (disable with -DZGEC_FASTDFAST_OFF).
+ *
+ * Measured and rejected: folding the two tables into one 5-byte-keyed table
+ * of two-entry buckets. It halves the hashes and the cache lines touched per
+ * position at unchanged memory, but it also gives up the 8-byte key, and the
+ * long table was earning rather more than the extra candidate recovers: at
+ * level 1 it lost 3.8% of ratio on llvm_small.tar and 4.4% on text.tar for
+ * -1% and +3% of encode throughput (the two tables are separate arrays and
+ * their probes already overlap in the out-of-order window, so the saved line
+ * touch was worth almost nothing). Keep the two keys. */
 #ifndef ZGEC_FAST_SHORT_BITS
 #define ZGEC_FAST_SHORT_BITS 20u
 #endif
@@ -505,8 +514,9 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
              * the miss instead of waiting for it. */
             size_t nxt = ip + (((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u);
             if (nxt + 8u <= end) {
-                __builtin_prefetch(&ts[fast_hash_s(vb, nxt) >> sshift], 1, 3);
-                __builtin_prefetch(&tl[fast_hash_l(vb, nxt) >> lshift], 1, 3);
+                uint64_t nv = zgec_rd64(vb + nxt);
+                __builtin_prefetch(&ts[fast_hash_s_v(nv) >> sshift], 1, 3);
+                __builtin_prefetch(&tl[fast_hash_l_v(nv) >> lshift], 1, 3);
             }
         }
 #endif
