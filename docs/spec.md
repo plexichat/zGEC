@@ -114,6 +114,13 @@ the first block that references it. The footer holds an index of every record so
 starts at the end of the file can reach any block with two reads (trailer, then footer) and one
 more read per block.
 
+A frame MUST contain at least one BLOCK record (type 0, 1 or 2). A zero-block frame is invalid: an
+empty input has no legal encoding, a decoder MUST reject a frame in which no BLOCK record appears,
+and an encoder given a zero-byte input MUST fail rather than emit such a frame. The frame-header
+`block_count` field is 0 only when the count is not known up front, which is why the record scan
+(4.7) rather than that field decides the rule; the footer `block_count` (4.4) MUST be at least 1
+whenever a footer is present.
+
 ### 3.2 Decoding a block at a glance
 
 1. Locate the block through the footer index; read its record, and the dictionary record it names (if any).
@@ -213,7 +220,7 @@ MUST equal raw_size.
 | Offset | Size | Field | Description |
 |---|---|---|---|
 | 0 | 4 | magic | ASCII "zGEF". |
-| 4 | 4 | block_count | Number of BLOCK records (types 0, 1, 2). |
+| 4 | 4 | block_count | Number of BLOCK records (types 0, 1, 2); MUST be at least 1, since a frame has at least one block (3.1). |
 | 8 | 4 | dict_count | Number of DICT records. |
 | 12 | 8 | content_size | Total original size. |
 | 20 | 16 x block_count | block entries | See below. Entry b describes block b in file order. |

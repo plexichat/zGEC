@@ -221,8 +221,9 @@ static void cli_usage(FILE *f, const char *argv0)
         "      --sub-lit       sub-literal segments (9.6)\n"
         "      --conditioning  sequence conditioning (8.6)\n"
         "      --litref        literal references (6.3); keeps blocks\n"
-        "                      plain, so it replaces sub-literals and\n"
-        "                      sequence conditioning (6.3)\n"
+        "                      exportable, so it replaces sub-literals\n"
+        "                      and drops LL conditioning (OF conditioning\n"
+        "                      stays on)\n"
         "      --dicts         epoch dictionaries (5.5, 5.7)\n"
         "      --filter        sampled block pre-filter (11.11)\n"
         "      --checksums     per-block CRC32C\n"
@@ -260,10 +261,12 @@ typedef struct {
 /* A level adds the feature that measured best on the reference corpus, so
  * the compressed size never rises with the level.
  *
- * Two orderings matter. A literal-reference level carries its own bit set,
- * which suppresses conditioning (6.3), so conditioning is added after
- * literal references rather than before them; the level that adds it
- * re-states the flag rather than dropping one.
+ * One ordering matters: a literal-reference level keeps its predecessor
+ * block's literals plain and free of LL conditioning so the 6.3 chain stays
+ * alive, which is why sub-literals (9.6) are added only at level 8, above
+ * every literal-reference level. OF conditioning does not break the chain
+ * (D6), so level 6 adds conditioning on top of level 5's literal references:
+ * the level that adds it re-states the flag rather than dropping one.
  *
  * Every preset uses the 2 MiB block of section 12.3 (block_log2 21). A
  * larger block is not free: blocks are the unit of parallelism (10.6), so a
@@ -553,6 +556,18 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Section 3.1: a frame MUST contain at least one block, so a zero-byte
+     * input has no legal encoding. Name the rule here rather than letting the
+     * encoder return the generic invalid-argument code, which said nothing
+     * about why. A zero-byte file handed to decompress is likewise not a
+     * frame, and the same rule is the reason. */
+    if (in_size == 0) {
+        fprintf(stderr, "zgec: %s: empty input has no valid frame "
+                        "(at least one block is required, 3.1)\n",
+                cmd == CLI_DECOMPRESS ? "decompress" : "compress");
+        goto done;
+    }
+
     /* External dictionaries are read once and handed to both ends. */
     for (i = 0; i < n_dicts; i++) {
         dict_ids[i] = (uint16_t)(i + 1);
@@ -590,25 +605,25 @@ int main(int argc, char **argv)
         if (f_filter >= 0) p.use_filter = f_filter;
         if (f_ck >= 0) p.block_checksums = f_ck;
 
-        /* Literal references keep their predecessor block plain and
-         * unconditioned (6.3), so --litref replaces --sub-lit and
-         * --conditioning. The encoder suppresses those two itself, so
-         * clearing the flags here is belt-and-braces, not what makes the run
-         * correct, and it is not what makes the reported configuration true
-         * either (neither flag is reported anywhere).
-         *
-         * The warning is therefore keyed on the user's own request (f_sub and
-         * f_cond, which are -1 when the flag was never given), not on the
-         * resolved parameters. Testing the parameters fired on every higher
-         * level, because the presets enable sub-literals and conditioning on
-         * their own: `zgec c -l 9 --litref in out` announced that its options
-         * had been replaced when the preset had chosen them. */
+        /* Literal references keep their predecessor block's literals plain
+         * so the 6.3 chain survives, so --litref replaces --sub-lit (the
+         * encoder suppresses sub-literals itself too, but clearing the flag
+         * keeps the reported run honest). It does NOT replace
+         * --conditioning: the encoder keeps OF conditioning live on the
+         * literal-reference path (encode.c D6) and drops only LL conditioning,
+         * which would break exportability. Clearing use_conditioning here used
+         * to suppress OF conditioning as well, which made every
+         * literal-reference level larger than it needed to be -- level 6 came
+         * out byte-identical to level 5 (both conditioning-free), and 8 and 9
+         * identical to 7. The warning
+         * tracks the user's own request (f_sub is -1 when the flag was never
+         * given), not the resolved parameters, so a preset that enables
+         * sub-literals does not trigger it. */
         if (p.use_litref != 0) {
-            if (!quiet && (f_sub == 1 || f_cond == 1))
-                fprintf(stderr, "zgec: --litref replaces sub-literals and "
-                                "sequence conditioning (6.3)\n");
+            if (!quiet && f_sub == 1)
+                fprintf(stderr, "zgec: --litref replaces sub-literals "
+                                "(6.3)\n");
             p.use_sublit = 0;
-            p.use_conditioning = 0;
         }
 
         /* A block is the unit of parallelism (10.6), so more workers than
