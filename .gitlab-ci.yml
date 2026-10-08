@@ -100,11 +100,17 @@ report:
     - for f in $(ls rows_*.csv | sort); do tail -n +2 "$f" >> results.csv; done
     - 'echo "rows: $(( $(wc -l < results.csv) - 1 ))"'
     # Per-tool best ratio and fastest encode/decode (MB/s, uncompressed bytes).
-    - awk -F, 'NR>1 { r[$3]=($9+0>r[$3]?$9+0:r[$3]);
-        if ($6=="encode" && ($11+0>e[$3])) e[$3]=$11+0;
-        if ($6=="decode" && ($11+0>d[$3])) d[$3]=$11+0 }
-        END { printf "| tool | best ratio | best enc MB/s | best dec MB/s |\n|---|---|---|---|\n";
-        for (t in r) printf "| %s | %.3f | %.1f | %.1f |\n", t, r[t], e[t], d[t] }' results.csv | sort | tee summary.md
+    # The table body is written first and sorted on its own, so the header row
+    # keeps first place: piping the rendered table straight into sort moved the
+    # header under the tool rows ("|" sorts before letters).
+    - |
+      awk -F, 'NR>1 { r[$3]=($9+0>r[$3]?$9+0:r[$3]);
+          if ($6=="encode" && ($11+0>e[$3])) e[$3]=$11+0;
+          if ($6=="decode" && ($11+0>d[$3])) d[$3]=$11+0 }
+          END { printf "%s\n", "| tool | best ratio | best enc MB/s | best dec MB/s |";
+          printf "%s\n", "|---|---|---|---|";
+          for (t in r) printf "| %s | %.3f | %.1f | %.1f |\n", t, r[t], e[t], d[t] }' results.csv > table.rows
+      { head -2 table.rows; tail -n +3 table.rows | sort; } | tee summary.md
   artifacts:
     paths:
       - results.csv

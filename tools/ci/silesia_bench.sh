@@ -21,8 +21,13 @@ REPS="$3"
 MODE="$4"
 shift 4
 
+# 1t leaves zstd's thread flag off entirely rather than passing -T1: with
+# -T1 zstd builds the multi-worker job queue and runs it with one worker,
+# which is the same output at about half the speed, so -T1 would report a
+# single-thread number no single-threaded caller can reproduce. A bare
+# zstd invocation is already single-threaded.
 if [ "$MODE" = "1t" ]; then
-  ZT=1; ST=1; XT=""; THR=1
+  ZT=1; ST=""; XT=""; THR=1
 else
   ZT=0; ST=0; XT="-T0"; THR=n
 fi
@@ -84,11 +89,22 @@ sweep_zstd() { # file level
   trap 'rm -f "$enc" "$dec"' RETURN
   local esec dsec dnote="roundtrip-ok" isize csize
   isize=$(stat -c%s "$file")
-  esec=$(best_of "$REPS" zstd -c "-$lvl" -T"$ST" "$file" -o "$enc")
-  zstd -c "-$lvl" -T"$ST" -q "$file" -o "$enc"
+  # `best_of` fails the job when the command fails, so these calls have to
+  # actually succeed. `-f` is required because mktemp created both paths:
+  # without it zstd refuses to overwrite an existing output file ("already
+  # exists; not overwritten") and exits 1, which failed every bench job.
+  # `-c` is left out because it asks for stdout and `-o` names a file, and
+  # zstd honours `-o`; asking for both is ambiguous.
+  if [ -n "$ST" ]; then
+    esec=$(best_of "$REPS" zstd -f "-$lvl" -T"$ST" "$file" -o "$enc")
+    zstd -f "-$lvl" -T"$ST" -q "$file" -o "$enc"
+  else
+    esec=$(best_of "$REPS" zstd -f "-$lvl" "$file" -o "$enc")
+    zstd -f "-$lvl" -q "$file" -o "$enc"
+  fi
   csize=$(stat -c%s "$enc")
-  dsec=$(best_of "$REPS" zstd -dc "$enc" -o "$dec")
-  zstd -dc "$enc" -o "$dec" -q
+  dsec=$(best_of "$REPS" zstd -df "$enc" -o "$dec")
+  zstd -df "$enc" -o "$dec" -q
   cmp -s "$file" "$dec" || dnote="MISMATCH"
   row "$base" zstd "-$lvl" encode "$isize" "$csize" "$esec" "roundtrip-ok"
   row "$base" zstd "-$lvl" decode "$isize" "$csize" "$dsec" "$dnote"
