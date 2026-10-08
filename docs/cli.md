@@ -84,9 +84,12 @@ zgec c -l 9 --no-checksums input output
 zgec c -l 3 --contexts input output
 ```
 
-Note: `--litref` replaces `--sub-lit` and `--conditioning` (§6.3); the CLI
-prints a warning and turns the other two off so the reported config is the
-one that ran.
+Note: `--litref` replaces `--sub-lit` (§6.3): a literal-reference predecessor
+must stay literal-exportable, and sub-literal segments break that chain. The
+CLI prints a warning and clears `--sub-lit` so the reported config is the one
+that ran. `--conditioning` is **not** cleared: the encoder keeps OF
+conditioning on the literal-reference path and drops only LL conditioning,
+which is the part that would break exportability.
 
 ## Tuning dials
 
