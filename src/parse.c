@@ -419,15 +419,18 @@ static unsigned fast_table_bits(size_t positions)
     return bits;
 }
 
-static inline uint32_t fast_hash_s(const uint8_t *vb, size_t ip)
+/* Both tables hash the same eight bytes at a position, so every caller
+ * loads them once and hands the value to both hashes. Splitting the load
+ * out is a pure load elimination: the hashes are bit-identical to the older
+ * pair that each read the bytes themselves, so the parse, the ratio and the
+ * byte stream do not move. */
+static inline uint32_t fast_hash_s_v(uint64_t v)
 {
-    uint64_t v = zgec_rd64(vb + ip);
     return (uint32_t)(((v << (64u - 8u * ZGEC_FAST_SHORT_HASH_BYTES)) * 0x9E3779B97F4A7C15ULL) >> (64u - ZGEC_FAST_SHORT_BITS));
 }
 
-static inline uint32_t fast_hash_l(const uint8_t *vb, size_t ip)
+static inline uint32_t fast_hash_l_v(uint64_t v)
 {
-    uint64_t v = zgec_rd64(vb + ip);
     return (uint32_t)((v * 0xD6E8FEB86659FD93ULL) >> (64u - ZGEC_FAST_LONG_BITS));
 }
 
@@ -477,8 +480,9 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 
     /* Seed the tables with the dictionary / literal-reference prefix, sparsely. */
     for (pos = 0; pos + 8u <= prefix; pos += 4u) {
-        ts[fast_hash_s(vb, pos) >> sshift] = (uint32_t)pos + 1u;
-        tl[fast_hash_l(vb, pos) >> lshift] = (uint32_t)pos + 1u;
+        uint64_t sv = zgec_rd64(vb + pos);
+        ts[fast_hash_s_v(sv) >> sshift] = (uint32_t)pos + 1u;
+        tl[fast_hash_l_v(sv) >> lshift] = (uint32_t)pos + 1u;
     }
 
     zgec_reps_init(&reps);
@@ -490,9 +494,10 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     while (ip + 8u <= end) {
         uint32_t best_len = 0u;
         uint32_t best_off = 0u;
-        uint32_t cur4 = zgec_rd32(vb + ip);
-        uint32_t hs = fast_hash_s(vb, ip) >> sshift;
-        uint32_t hl = fast_hash_l(vb, ip) >> lshift;
+        uint64_t cur8 = zgec_rd64(vb + ip);
+        uint32_t cur4 = (uint32_t)cur8;
+        uint32_t hs = fast_hash_s_v(cur8) >> sshift;
+        uint32_t hl = fast_hash_l_v(cur8) >> lshift;
 #if ZGEC_FAST_PREFETCH
         {
             /* Prefetch the buckets of the position the skip schedule visits
@@ -547,13 +552,14 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
              * longer match, emit this position as a literal and move on. */
             size_t p1 = ip + 1u;
             uint32_t l1 = 0u;
-            uint32_t c1 = tl[fast_hash_l(vb, p1) >> lshift];
+            uint64_t v1 = zgec_rd64(vb + p1);
+            uint32_t c1 = tl[fast_hash_l_v(v1) >> lshift];
             if (c1 != 0u && (size_t)(c1 - 1u) < p1) {
                 size_t d1 = p1 - (size_t)(c1 - 1u);
                 uint32_t len1 = fast_match_len(vb, p1, d1, end - p1);
                 if (len1 >= ZGEC_FAST_MIN_LONG) l1 = len1;
             }
-            c1 = ts[fast_hash_s(vb, p1) >> sshift];
+            c1 = ts[fast_hash_s_v(v1) >> sshift];
             if (c1 != 0u && (size_t)(c1 - 1u) < p1) {
                 size_t d1 = p1 - (size_t)(c1 - 1u);
                 uint32_t len1 = fast_match_len(vb, p1, d1, end - p1);
@@ -592,9 +598,10 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             p->n_seq++;
 #if ZGEC_FAST_INS_ALL
             for (ins = ip + 1u; ins + 8u <= end && ins < ip + (size_t)best_len; ins += (size_t)ZGEC_FAST_INS_STRIDE) {
-                ts[fast_hash_s(vb, ins) >> sshift] = (uint32_t)ins + 1u;
+                uint64_t iv = zgec_rd64(vb + ins);
+                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
 #if ZGEC_FAST_INS_LONG
-                tl[fast_hash_l(vb, ins) >> lshift] = (uint32_t)ins + 1u;
+                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
 #endif
             }
             ins = ip + (size_t)best_len;
@@ -602,13 +609,15 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             /* Sparse inserts inside the match: second and last position. */
             ins = ip + 1u;
             if (ins + 8u <= end) {
-                ts[fast_hash_s(vb, ins) >> sshift] = (uint32_t)ins + 1u;
-                tl[fast_hash_l(vb, ins) >> lshift] = (uint32_t)ins + 1u;
+                uint64_t iv = zgec_rd64(vb + ins);
+                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
+                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
             }
             ins = ip + (size_t)best_len - 1u;
             if (ins + 8u <= end) {
-                ts[fast_hash_s(vb, ins) >> sshift] = (uint32_t)ins + 1u;
-                tl[fast_hash_l(vb, ins) >> lshift] = (uint32_t)ins + 1u;
+                uint64_t iv = zgec_rd64(vb + ins);
+                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
+                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
             }
 #endif
             ip += best_len;
