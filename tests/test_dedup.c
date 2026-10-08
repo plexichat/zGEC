@@ -143,6 +143,18 @@ static void test_class_map_shared(void)
     printf("classmap ok\n");
 }
 
+static void test_cpu_count(void)
+{
+    /* zgec_cpu_count has three implementations (GetSystemInfo on Windows,
+     * sysctl on Darwin, sysconf elsewhere). This is the only in-tree
+     * caller, so it is also what compiles and runs the Darwin and POSIX
+     * arms on CI. */
+    unsigned n = zgec_cpu_count();
+    CHECK(n >= 1u, "cpu count >= 1");
+    CHECK(n <= 1024u, "cpu count <= 1024");
+    printf("cpucount ok (%u)\n", n);
+}
+
 static void test_reps_shared(void)
 {
     zgec_reps r;
@@ -164,6 +176,7 @@ int main(void)
     test_shuffle_count();
     test_runstart();
     test_class_map_shared();
+    test_cpu_count();
     test_reps_shared();
     if (fails == 0) printf("ALL DEDUP CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);

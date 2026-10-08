@@ -1,17 +1,18 @@
 #ifndef ZGEC_INTERNAL_H
 #define ZGEC_INTERNAL_H
 
-/* macOS hides sysconf(3) and _SC_NPROCESSORS_ONLN under the strict
- * -std=c11 this project builds with (same class of issue as cli.c
- * needing _POSIX_C_SOURCE for clock_gettime). _POSIX_C_SOURCE alone
- * is not enough there; request the full Darwin declarations before
- * any system header is pulled in. Inert everywhere else. */
-#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
-#define _DARWIN_C_SOURCE 1
-#endif
-
 /* Shared internals deduplicated from decode.c / encode.c / seq.c /
  * dict.c / common.c. Not part of the public API; for in-tree use only.
+ *
+ * This header sets no feature-test macro, deliberately. Darwin fixes its
+ * C level (__DARWIN_C_LEVEL) inside <sys/cdefs.h> the first time any
+ * system header is read, so a macro defined here arrives too late in the
+ * translation units that include a system header first -- common.c
+ * defines _POSIX_C_SOURCE and includes zgec_common.h before this file.
+ * That is how _SC_NPROCESSORS_ONLN came to be undeclared on macOS. A
+ * file that needs a POSIX symbol sets its macro on line 1 (see common.c
+ * and cli.c for _POSIX_C_SOURCE); zgec_cpu_count below asks the Darwin
+ * sysctl API instead, which needs no macro at all.
  */
 
 #include "zgec_common.h"
@@ -27,6 +28,10 @@ typedef struct { CRITICAL_SECTION cs; int ok; } zgec_mu;
 #include <pthread.h>
 #include <unistd.h>
 typedef struct { pthread_mutex_t mu; int ok; } zgec_mu;
+#endif
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h> /* sysctlbyname, for zgec_cpu_count */
 #endif
 
 /* Worker cap (was ZGEC_DEC_MAX_WORKERS / ZGEC_ENC_MAX_WORKERS, both 64). */
@@ -83,6 +88,15 @@ static inline unsigned zgec_cpu_count(void)
     GetSystemInfo(&si);
     if (si.dwNumberOfProcessors >= 1u && si.dwNumberOfProcessors <= 1024u)
         return (unsigned)si.dwNumberOfProcessors;
+    return 1u;
+#elif defined(__APPLE__)
+    /* hw.logicalcpu is Darwin's equivalent of _SC_NPROCESSORS_ONLN and,
+     * unlike that selector, needs no feature-test macro (see above). */
+    int ncpu = 0;
+    size_t ncpu_len = sizeof(ncpu);
+    if (sysctlbyname("hw.logicalcpu", &ncpu, &ncpu_len, NULL, 0) == 0 &&
+        ncpu >= 1 && ncpu <= 1024)
+        return (unsigned)ncpu;
     return 1u;
 #else
     long n = sysconf(_SC_NPROCESSORS_ONLN);
