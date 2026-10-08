@@ -83,9 +83,17 @@ const char *zgec_strerror(zgec_err e)
    (sizeof(void *) + align - 1) and the total (n + prefix) can each
    wrap size_t for attacker-influenced sizes, and a wrapped total
    would hand the caller a block smaller than the n bytes it believes
-   it owns -- heap corruption on the next write. The UINTPTR_MAX test
-   is defensive rather than presently reachable (user-space bases sit
-   far below it), but it keeps the alignment arithmetic total. */
+   it owns -- heap corruption on the next write. The addition of the
+   prefix to the block address is guarded the same way: it is
+   defensive rather than presently reachable (a malloc block never sits
+   within `prefix` bytes of the top of the address space), but the mask
+   below would silently wrap and write out of bounds, so it is checked.
+   The check is written as __builtin_add_overflow rather than
+   `base > UINTPTR_MAX - prefix` because the two are equivalent but
+   only the builtin keeps gcc's LTO value analysis from proving the
+   branch dead and then flagging the guarded free as a release of an
+   interior pointer (-Wfree-nonheap-object, which it reported once per
+   inlined caller). */
 void *zgec_alloc(size_t n, size_t align)
 {
     size_t prefix;
@@ -93,6 +101,7 @@ void *zgec_alloc(size_t n, size_t align)
     void *raw;
     uintptr_t base;
     uintptr_t aligned;
+    uintptr_t sum;
 
     if (n == 0) n = 1;
     if (align <= sizeof(void *)) align = sizeof(void *);
@@ -105,11 +114,11 @@ void *zgec_alloc(size_t n, size_t align)
     raw = malloc(total);
     if (!raw) return NULL;
     base = (uintptr_t)raw;
-    if (base > UINTPTR_MAX - prefix) {
+    if (__builtin_add_overflow(base, prefix, &sum)) {
         free(raw);
         return NULL;
     }
-    aligned = (base + prefix) & ~(uintptr_t)(align - 1);
+    aligned = sum & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
     return (void *)aligned;
 }
