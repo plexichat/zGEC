@@ -194,6 +194,9 @@ struct zgec_matcher {
     size_t         vb_capacity; /* maximum referenceable offset */
     const uint8_t *vb;
     size_t         vb_size;
+    size_t         c_ip;        /* hash cache: position the cached hashes belong to */
+    uint32_t       c_hs, c_hl;  /* cached short / long hash */
+    uint32_t       c_flags;     /* bit0: c_hs valid, bit1: c_hl valid */
 };
 
 /* Multiplicative hash of the 5 bytes at ip
@@ -326,14 +329,16 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos)
             return;
         }
     }
-    h = mf_hash_short(m, vb, pos);
+    /* The finder at this position has already computed both hashes; when it
+     * hands the same position to insert, reuse them instead of recomputing. */
+    h = (m->c_ip == pos && (m->c_flags & 1u)) ? m->c_hs : mf_hash_short(m, vb, pos);
     bucket = h & (m->nbuckets - 1u);
     tag = (h >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
     entry = mf_pack((uint32_t)pos, tag);
     mf_insert_short(m, bucket, entry);
 
     if (pos + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
-        uint32_t hl = mf_hash8(vb, pos);
+        uint32_t hl = (m->c_ip == pos && (m->c_flags & 2u)) ? m->c_hl : mf_hash8(vb, pos);
         uint32_t lb = hl & (m->long_buckets - 1u);
         uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         mf_insert_long(m, lb, mf_pack((uint32_t)pos, ltag));
@@ -343,7 +348,7 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos)
 /* First-8-byte length via 8-byte XOR plus trailing
  * zero byte count (tzcnt >> 3, section 11.3 step 4).
  * Returns 8 when the first 8 bytes match. */
-static uint32_t mf_len8(const uint8_t *src, const uint8_t *dst)
+static inline __attribute__((always_inline)) uint32_t mf_len8(const uint8_t *src, const uint8_t *dst)
 {
     uint64_t diff = (uint64_t)zgec_rd64(src) ^ (uint64_t)zgec_rd64(dst);
     if (diff == (uint64_t)0) {
@@ -356,7 +361,7 @@ static uint32_t mf_len8(const uint8_t *src, const uint8_t *dst)
  * cap. The caller guarantees d <= ip and
  * cap <= vb_size - ip, so neither side reads past the
  * virtual buffer. */
-static uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
+static uint32_t mf_match_len_slow(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
 {
     const uint8_t *src = vb + ip - (size_t)d;
     const uint8_t *dst = vb + ip;
@@ -408,6 +413,23 @@ static uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t 
         len++;
     }
     return len;
+}
+
+/* Length of the match at ip with offset d, capped at cap. The first eight
+ * bytes are the overwhelmingly common case -- a source tree's matches are
+ * about seven bytes long -- so they are compared here, inline, and only a
+ * match that survives them pays for the wide-compare loop above. The
+ * precondition is mf_match_len_slow's: d <= ip and cap <= vb_size - ip. */
+static inline __attribute__((always_inline))
+uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
+{
+    if (cap >= 8u) {
+        uint32_t first = mf_len8(vb + ip - (size_t)d, vb + ip);
+        if (first < 8u) {
+            return first;
+        }
+    }
+    return mf_match_len_slow(vb, ip, d, cap);
 }
 
 /* Hit mask of the short bucket: bit `lane` is set when entry `lane`
@@ -549,6 +571,11 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     memset(m->short_tab, 0, short_n * sizeof(uint32_t));
     memset(m->short_head, 0, m->nbuckets);
     memset(m->long_tab, 0, long_n * sizeof(uint32_t));
+    /* No position has cached hashes yet. */
+    m->c_ip = (size_t)-1;
+    m->c_hs = 0u;
+    m->c_hl = 0u;
+    m->c_flags = 0u;
     return m;
 }
 
@@ -593,6 +620,11 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
     if (m->long_tab) {
         memset(m->long_tab, 0, long_n * sizeof(uint32_t));
     }
+    /* The cache describes the previous block's buffer, so drop it: a stale
+     * hash could otherwise be reused for the same position in an unrelated
+     * buffer. */
+    m->c_ip = (size_t)-1;
+    m->c_flags = 0u;
     /* This interface returns void, so inconsistent state is rejected by
      * refusing to attach a buffer rather than by reporting an error. Every
      * entry point below starts with a vb_size bound check, so a detached
@@ -691,6 +723,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     uint32_t i;
     size_t avail;
     uint32_t reps[3];
+    uint32_t cur4;
 
     best.offset = 0;
     best.length = 0;
@@ -733,10 +766,16 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     reps[1] = rep1;
     reps[2] = rep2;
     nreps = (m->tier == ZGEC_TIER_FAST) ? 1u : 3u;
+    cur4 = zgec_rd32(vb + ip);   /* cap >= min_match >= 4 here */
     for (i = 0; i < nreps; i++) {
         uint32_t d = reps[i];
         uint32_t len;
         if (d == 0u || (size_t)d > ip || (size_t)d > m->vb_capacity) {
+            continue;
+        }
+        /* min_match >= 4, so a repeat whose first four bytes differ cannot
+         * qualify; one 4-byte compare replaces the length scan. */
+        if (zgec_rd32(vb + ip - (size_t)d) != cur4) {
             continue;
         }
         len = mf_match_len(vb, ip, d, cap);
@@ -745,6 +784,10 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         }
     }
 
+    /* The hashes this find computes for ip are the ones an insert of ip
+     * needs, so leave them behind for mf_insert_pos. */
+    m->c_ip = ip;
+    m->c_flags = 0u;
     /* 2. Long table: 8-byte hash, one entry per
      * bucket, tag-checked before any length work. */
     if (ip + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
@@ -757,6 +800,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         uint32_t pos;
         uint32_t d;
         uint32_t len;
+        m->c_hl = hl;
+        m->c_flags |= 2u;
         mf_prefetch_bucket((const void *)le);
         e = *le;
         ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
@@ -779,8 +824,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * mf_bucket_hits(): on AVX2 that is 32-bit-lane compares, two 256-bit
      * vectors for a 16-lane high-tier bucket, with any leftover lanes
      * scalar, so there is no 128-bit tag compare here. The returned hit
-     * mask is then walked in newest-first physical lane order, so no tzcnt
-     * is used to extract lanes and an empty mask simply ends the loop
+     * mask is then rotated so a count-leading-zeros walk visits the hit
+     * lanes in newest-first order, and an empty mask simply ends the loop
      * after zero iterations. */
     {
         size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
@@ -795,7 +840,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             uint32_t nmatch;
             uint32_t want;
             uint32_t nhit;
-            uint32_t k;
+            m->c_hs = h;
+            m->c_flags |= 1u;
             mf_prefetch_bucket((const void *)b);
             mask = mf_bucket_hits(b, tag, m->nlanes);
             nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
@@ -805,32 +851,122 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             nhit = (nmatch < want) ? nmatch : want;
             head = (uint32_t)m->short_head[bucket];
             /* The live entries walk backwards from the newest lane: the
-             * ring head points one past the most recent write. */
-            for (k = 0; k < m->nlanes && nhit > 0; k++) {
-                uint32_t lane = (head + m->nlanes - 1u - k) & (m->nlanes - 1u);
-                uint32_t entry;
-                uint32_t pos;
-                uint32_t d;
-                uint32_t len;
-                if (!(mask & (1u << lane))) continue;
-                nhit--;
-                entry = b[lane];
-                pos = mf_pos(entry);
-                if ((size_t)pos >= ip) {
-                    continue;
+             * ring head points one past the most recent write.
+             *
+             * Visit only the lanes that hit, newest first. Rotating the hit
+             * mask so that lane head-1 lands in the top bit lets a
+             * count-leading-zeros walk yield lanes in newest-first order
+             * while skipping the empty ones: the loop runs once per hit
+             * instead of once per lane. `s == 0` (head == 0) is the
+             * unrotated mask, which also keeps each shift below in range,
+             * and the mask is truncated to nlanes bits for nlanes < 32. */
+            {
+                uint32_t n = m->nlanes;
+                uint32_t s = (n - head) & (n - 1u);
+                uint32_t rm;
+                if (s == 0u) {
+                    rm = mask;
+                } else {
+                    rm = (mask << s) | (mask >> (n - s));
                 }
-                d = (uint32_t)(ip - (size_t)pos);
-                if ((size_t)d > m->vb_capacity) {
-                    continue;
+                if (n < 32u) {
+                    rm &= (uint32_t)(((uint64_t)1u << n) - 1u);
                 }
-                len = mf_match_len(vb, ip, d, cap);
-                if (len >= hash_min) {
-                    mf_candidate(d, len, &best);
+                while (rm != 0u && nhit > 0) {
+                    uint32_t bpos = 31u - (uint32_t)__builtin_clz(rm);
+                    uint32_t lane = (head + bpos) & (n - 1u);
+                    uint32_t entry;
+                    uint32_t pos;
+                    uint32_t d;
+                    uint32_t len;
+                    rm &= ~(1u << bpos);
+                    nhit--;
+                    entry = b[lane];
+                    pos = mf_pos(entry);
+                    if ((size_t)pos >= ip) {
+                        continue;
+                    }
+                    d = (uint32_t)(ip - (size_t)pos);
+                    if ((size_t)d > m->vb_capacity) {
+                        continue;
+                    }
+                    /* A candidate can only beat `best` if it matches at
+                     * best.length - 1 as well; one byte compare there skips
+                     * the length scan for the candidates that cannot. */
+                    if (best.length != 0u && best.length <= cap &&
+                        vb[ip - (size_t)d + (size_t)best.length - 1u] !=
+                        vb[ip + (size_t)best.length - 1u]) {
+                        continue;
+                    }
+                    len = mf_match_len(vb, ip, d, cap);
+                    if (len >= hash_min) {
+                        mf_candidate(d, len, &best);
+                    }
                 }
             }
         }
     }
     return best;
+}
+
+/* Prefetch the table lines a find at ip will touch (section 11.3 step 1).
+ * Issued a step ahead of the skip schedule, so the bucket load overlaps the
+ * position's own work instead of stalling on it. */
+void zgec_matcher_prefetch(zgec_matcher *m, const uint8_t *vb, size_t ip)
+{
+    size_t need;
+    if (!m || !vb || vb != m->vb || !m->short_tab || !m->long_tab) {
+        return;
+    }
+    need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN : (size_t)ZGEC_MF_HASH_BYTES;
+    if (ip + need > m->vb_size) {
+        return;
+    }
+    {
+        uint32_t h = mf_hash_short(m, vb, ip);
+        uint32_t bucket = h & (m->nbuckets - 1u);
+        __builtin_prefetch((const void *)&m->short_tab[(size_t)bucket * (size_t)m->nlanes], 1, 3);
+        __builtin_prefetch((const void *)&m->short_head[bucket], 1, 3);
+    }
+    if (ip + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
+        uint32_t hl = mf_hash8(vb, ip);
+        __builtin_prefetch((const void *)&m->long_tab[(size_t)(hl & (m->long_buckets - 1u))], 1, 3);
+    }
+}
+
+/* Prefetch the lines insert_match(start, len) will write: every position in
+ * the high tier, the same sample grid the other tiers insert. */
+void zgec_matcher_prefetch_match(zgec_matcher *m, const uint8_t *vb, size_t start, size_t len)
+{
+    if (!m || !vb || vb != m->vb || !m->short_tab || !m->long_tab || len == 0 || start >= m->vb_size) {
+        return;
+    }
+    if (len > m->vb_size - start) {
+        len = m->vb_size - start;
+    }
+    if (m->tier == ZGEC_TIER_HIGH) {
+        size_t stride = (size_t)1;
+        size_t pos;
+        if (len > (size_t)ZGEC_MF_HIGH_SAMPLES) {
+            stride = (len + (size_t)ZGEC_MF_HIGH_SAMPLES - 1u) / (size_t)ZGEC_MF_HIGH_SAMPLES;
+        }
+        for (pos = start; pos < start + len; pos += stride) {
+            zgec_matcher_prefetch(m, vb, pos);
+        }
+    } else {
+        size_t nsamp = (m->tier == ZGEC_TIER_FAST) ? (size_t)ZGEC_MF_MATCH_SAMPLES_FAST
+                                                   : (size_t)ZGEC_MF_MATCH_SAMPLES;
+        size_t t;
+        if (nsamp > len) nsamp = len;
+        if (nsamp < 1u) nsamp = 1u;
+        for (t = 0; t < nsamp; t++) {
+            uint64_t off = (nsamp > 1u)
+                               ? ((uint64_t)(len - 1u) * (uint64_t)t /
+                                  (uint64_t)(nsamp - 1u))
+                               : 0u;
+            zgec_matcher_prefetch(m, vb, start + (size_t)off);
+        }
+    }
 }
 
 void zgec_matcher_insert(zgec_matcher *m, const uint8_t *vb, size_t ip)

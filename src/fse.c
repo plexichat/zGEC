@@ -578,11 +578,31 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
         unsigned _k = (unsigned)(_nb); \
         if (_k != 0u) { \
             if (nacc < _k) { \
-                while (nacc <= 56u && left > 0u) { \
-                    acc |= (uint64_t)(ptr[0]) << (56u - nacc); \
-                    nacc += 8u; \
-                    left--; \
-                    if (left > 0u) ptr--; \
+                if (left >= 8u && nacc <= 56u) { \
+                    /* Fast refill: one 8-byte load supplies every byte the \
+                     * byte loop below would add. The load is little-endian, \
+                     * so ptr sits at bit 56 and lands on bit (56 - nacc), \
+                     * exactly where the loop puts it. Bytes past the last one \
+                     * counted are ORed in at the positions a later refill \
+                     * writes them at, with the same values, so they are \
+                     * harmless; ptr and left advance exactly as the loop does. \
+                     * (`left >= 8` guarantees [ptr-7, ptr] is inside the \
+                     * stream, and nb8 <= 8 <= left, so nb8 bytes are always \
+                     * available.) */ \
+                    unsigned _nb8 = (56u - nacc) / 8u + 1u; \
+                    uint64_t _w = zgec_rd64(ptr - 7); \
+                    acc |= _w >> nacc; \
+                    nacc += 8u * _nb8; \
+                    left -= _nb8; \
+                    ptr -= _nb8; \
+                    if (left == 0u) ptr++; \
+                } else { \
+                    while (nacc <= 56u && left > 0u) { \
+                        acc |= (uint64_t)(ptr[0]) << (56u - nacc); \
+                        nacc += 8u; \
+                        left--; \
+                        if (left > 0u) ptr--; \
+                    } \
                 } \
             } \
             if (nacc < _k) { br->overflow = 1; goto bad; } \
@@ -627,7 +647,60 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
     ZGEC_BRF_TAKE(t->al, state);
     if (state >= S) goto bad;
 
-    for (i = 0; i < n; i++) {
+    i = 0;
+    /* Fast loop: while at least 16 bytes remain and this is not the final
+     * symbol. Every refill is unconditional (one 8-byte load) and every bit
+     * take is branchless, so the only branches left are the validity checks,
+     * which are never taken on a valid stream. Bit order and the consumed bit
+     * count are identical to the generic loop below; the loop hands over with
+     * the reader state fully up to date.
+     *
+     * Each symbol needs at most 11 + 32 = 43 bits. `nb` tops the accumulator
+     * up to 63 - ((63 - nacc) mod 8) bits, i.e. into 56..63, so one refill
+     * always covers a whole symbol. nacc is at most 59 on entry (the take
+     * above is preceded by a refill that tops out at 64 bits) and never
+     * exceeds 63 afterwards, so `w >> nacc` is never a shift by 64. The
+     * `left > 16u` test keeps nb <= 7 well inside the stream, so the 8-byte
+     * load at ptr-7 never reads below the stream start. */
+    while (i + 1 < n && left > 16u) {
+        const zgec_fse_dec_entry *e = &t->e[state];
+        unsigned sym;
+        unsigned xb = 0u;
+        uint32_t extra;
+        unsigned nbq;
+        uint32_t bits;
+        int32_t next;
+        unsigned nb;
+        uint64_t w;
+        if (e->symbol < 0 || e->symbol >= t->nsym) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+        sym = (unsigned)e->symbol;
+        if (nbits != NULL) xb = (unsigned)nbits[sym];
+        if (xb > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+        /* refill to 56..63 bits */
+        nb = (63u - nacc) >> 3;
+        w = zgec_rd64(ptr - 7);
+        acc |= w >> nacc;
+        nacc += 8u * nb;
+        ptr -= nb;
+        left -= nb;
+        if (syms) syms[i] = (uint8_t)sym;
+        /* extra bits: (acc >> 1) >> (63 - xb) is acc >> (64 - xb) for xb >= 1
+         * and 0 for xb == 0, without a branch */
+        extra = (uint32_t)((acc >> 1) >> (63u - xb));
+        acc <<= xb;
+        nacc -= xb;
+        if (out) out[i] = (base ? base[sym] : (uint32_t)sym) + extra;
+        nbq = e->nb_bits;
+        bits = (uint32_t)((acc >> 1) >> (63u - nbq));
+        acc <<= nbq;
+        nacc -= nbq;
+        next = e->baseline + (int32_t)bits;
+        if (next < 0 || next >= (int32_t)S) { err = ZGEC_ERR_BITSTREAM; goto bad; }
+        state = (unsigned)next;
+        i++;
+    }
+
+    for (; i < n; i++) {
         const zgec_fse_dec_entry *e = &t->e[state];
         unsigned sym = 0;
         unsigned extra_bits = 0;

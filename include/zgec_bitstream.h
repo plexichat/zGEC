@@ -94,6 +94,28 @@ static inline void zgec_br_init(zgec_br *b, const void *buf, size_t size)
 
 static inline void zgec_br_refill(zgec_br *b)
 {
+    /* Fast path: one 8-byte load covers every byte the loop below would add.
+     * The load is little-endian, so b->ptr sits at bit 56 of w and the bytes
+     * below it follow downwards; shifting right by nacc drops the byte at
+     * b->ptr onto bit (56 - nacc), which is exactly where the loop places it
+     * relative to the valid bits. Bytes past the last one counted are ORed
+     * in at the positions a later refill writes them at, with the same
+     * values, so they are harmless: OR-ing a byte twice at the same offset is
+     * idempotent and no OR ever lands on a valid bit (the top of w>>nacc is
+     * bit 63-nacc, one below the last valid bit). The pointer, the count and
+     * `left` advance exactly as the loop's do -- including the loop's
+     * convention that b->ptr is not stepped down on the load that exhausts
+     * the stream. */
+    if (b->left >= 8 && b->nacc <= 56) {
+        unsigned nb8 = (56u - b->nacc) / 8u + 1u;
+        uint64_t w = zgec_rd64(b->ptr - 7);
+        b->acc |= w >> b->nacc;
+        b->nacc += 8u * nb8;
+        b->left -= nb8;
+        b->ptr -= nb8;
+        if (b->left == 0) b->ptr++;
+        return;
+    }
     while (b->nacc <= 56 && b->left > 0) {
         b->acc |= (uint64_t)(b->ptr[0]) << (56 - b->nacc);
         b->nacc += 8;

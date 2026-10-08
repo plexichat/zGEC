@@ -126,54 +126,97 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
         }
     }
 
-    size_t max_rounds = 0;
-    for (unsigned lane = 0; lane < 8; lane++)
-        if (len[lane] > max_rounds) max_rounds = len[lane];
-    for (size_t round = 0; round < max_rounds; round++) {
-        for (unsigned lane = 0; lane < 8; lane++) {
-            if (round >= len[lane]) continue;
-            size_t j = start[lane] + round;
-            int table_idx = 0;
-            if (k > 1) {
-                if (j >= n_lit) return ZGEC_ERR_RANS_STATE;
-                if (j == start[lane] || runstart[j]) {
-                    table_idx = k;  /* run-start table */
-                } else {
-                    unsigned cls = zgec_classify(ctx_mode, Z[j - 1]);
-                    if (cls >= 64u) return ZGEC_ERR_CLASS_MAP;
-                    if ((int)class_map[cls] >= k) return ZGEC_ERR_CLASS_MAP;
-                    table_idx = (int)class_map[cls];
-                }
-                if (table_idx < 0 || table_idx > k) return ZGEC_ERR_CLASS_MAP;
-            }
-            const zgec_rans_dec_table *tab = &tables[table_idx];
-            unsigned slot = (unsigned)(state[lane] & (uint32_t)(ZGEC_RANS_M - 1));
-            if (slot >= (unsigned)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
-            uint16_t s = tab->symbol_of_slot[slot];
-            if ((unsigned)s >= (unsigned)ZGEC_NSYM_LIT) return ZGEC_ERR_RANS_STATE;
-            Z[j] = (uint8_t)s;
-            if (tab->f[s] == 0) return ZGEC_ERR_RANS_STATE;
-            if (slot < (unsigned)tab->c[s] ||
-                slot >= (unsigned)tab->c[s] + (unsigned)tab->f[s])
-                return ZGEC_ERR_RANS_STATE;
-            uint64_t x = state[lane];
-            x = (uint64_t)tab->f[s] * (x >> ZGEC_RANS_L) + (uint64_t)slot - (uint64_t)tab->c[s];
-            state[lane] = (uint32_t)x;
-            if (state[lane] < ZGEC_RANS_STATE_MIN) {
-                if (remaining < 2) return ZGEC_ERR_RANS_CURSOR;
-                uint16_t w = zgec_rd16(cursor);
-                cursor += 2;
-                remaining -= 2;
-                state[lane] = (state[lane] << 16) | w;
+    /* Packed decode slots (one u32 per slot, per table):
+     *   bits 0..7   symbol
+     *   bits 8..19  frequency (0 marks a slot that is not a valid symbol
+     *               slot; it is rejected when first used, as before)
+     *   bits 20..31 bias = slot - c[symbol]
+     * The table is packed once per call, so each symbol costs one load,
+     * one multiply and one add, instead of the several re-checked loads of
+     * the reference form. The checks themselves are kept, lazily, as a
+     * single predictable branch on the frequency field. Frequency is at
+     * most ZGEC_RANS_M (2048, 12 bits) and the bias is below it, so both
+     * fields fit the widths above. */
+    unsigned ntab = (k > 1) ? (unsigned)k + 1u : 1u;
+    uint32_t *pk = (uint32_t *)zgec_alloc((size_t)ntab * ZGEC_RANS_M * sizeof(uint32_t), 64);
+    if (!pk) return ZGEC_ERR_NOMEM;
+    for (unsigned t = 0; t < ntab; t++) {
+        const zgec_rans_dec_table *tb = &tables[t];
+        uint32_t *dst = pk + (size_t)t * ZGEC_RANS_M;
+        for (unsigned slot = 0; slot < (unsigned)ZGEC_RANS_M; slot++) {
+            unsigned s = tb->symbol_of_slot[slot];
+            uint32_t f = (s < (unsigned)ZGEC_NSYM_LIT) ? tb->f[s] : 0u;
+            uint32_t c = (s < (unsigned)ZGEC_NSYM_LIT) ? tb->c[s] : 0u;
+            if (s >= (unsigned)ZGEC_NSYM_LIT || f == 0u || f > (uint32_t)ZGEC_RANS_M ||
+                slot < c || slot >= c + f) {
+                dst[slot] = 0u;   /* invalid: decodes to an error */
+            } else {
+                dst[slot] = (uint32_t)s | (f << 8) | ((uint32_t)(slot - c) << 20);
             }
         }
     }
 
-    for (unsigned lane = 0; lane < 8; lane++) {
-        if (state[lane] != ZGEC_RANS_STATE_MIN) return ZGEC_ERR_RANS_STATE;
+    /* Context of each byte, resolved once. 0xFF marks a byte whose class
+     * maps outside the table set; it is rejected when a literal follows it,
+     * which is the behaviour of the reference form. k <= 8, so a real class
+     * never maps to 0xFF. */
+    uint8_t idx_lut[256];
+    if (k > 1) {
+        for (unsigned b = 0; b < 256u; b++) {
+            unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
+            if (cls >= 64u || (int)class_map[cls] >= k) idx_lut[b] = 0xFFu;
+            else idx_lut[b] = class_map[cls];
+        }
     }
-    if (remaining != 0) return ZGEC_ERR_RANS_CURSOR;
-    return ZGEC_OK;
+
+    /* Lanes 0..r-1 hold q+1 symbols and the rest hold q (section 9.2, and
+     * zgec_lit_lane_geom: len[lane] = q + (lane < r)), so every round has a
+     * prefix of active lanes: full rounds run all eight, the tail round runs
+     * the first `r`. Lane order within a round is the decode order the
+     * renormalisation cursor depends on. */
+    size_t full = len[7];
+    size_t max_rounds = len[0];
+    unsigned rem = 0u;
+    for (unsigned lane = 0; lane < 8; lane++) if (len[lane] > full) rem++;
+    zgec_err err = ZGEC_OK;
+    for (size_t round = 0; round < max_rounds && err == ZGEC_OK; round++) {
+        unsigned m = (round < full) ? 8u : rem;
+        for (unsigned lane = 0; lane < m; lane++) {
+            size_t j = start[lane] + round;
+            unsigned ti = 0u;
+            if (k > 1) {
+                if (j == start[lane] || runstart[j]) {
+                    ti = (unsigned)k;   /* run-start table */
+                } else {
+                    uint8_t pidx = idx_lut[Z[j - 1]];
+                    if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    ti = pidx;
+                }
+            }
+            uint32_t x = state[lane];
+            uint32_t e = pk[(size_t)ti * ZGEC_RANS_M + (x & (uint32_t)(ZGEC_RANS_M - 1))];
+            uint32_t f = (e >> 8) & 0xFFFu;
+            if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[j] = (uint8_t)e;
+            x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+            if (x < ZGEC_RANS_STATE_MIN) {
+                if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
+                x = (x << 16) | zgec_rd16(cursor);
+                cursor += 2;
+                remaining -= 2;
+            }
+            state[lane] = x;
+        }
+    }
+
+    if (err == ZGEC_OK) {
+        for (unsigned lane = 0; lane < 8; lane++) {
+            if (state[lane] != ZGEC_RANS_STATE_MIN) { err = ZGEC_ERR_RANS_STATE; break; }
+        }
+    }
+    if (err == ZGEC_OK && remaining != 0) err = ZGEC_ERR_RANS_CURSOR;
+    zgec_free(pk);
+    return err;
 }
 
 /* ---- 8-lane rANS encode (section 9.5) ---- */

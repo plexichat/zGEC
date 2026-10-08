@@ -69,4 +69,10 @@ void zgec_matcher_insert_match(zgec_matcher *m,
                                            const uint8_t *vb,
                                            size_t start, size_t len);
 
+/* Prefetch the table lines that a find/insert at ip will touch. */
+void zgec_matcher_prefetch(zgec_matcher *m, const uint8_t *vb, size_t ip);
+/* Prefetch the lines that insert_match(start, len) will write. */
+void zgec_matcher_prefetch_match(zgec_matcher *m, const uint8_t *vb,
+                                 size_t start, size_t len);
+
 #endif /* ZGEC_MATCH_H */
