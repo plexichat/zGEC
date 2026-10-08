@@ -91,9 +91,15 @@
  * retention, is what costs time: a 2^17-bucket main short table is
  * 4 MiB per worker, so every probe is an L3 round trip. Dropping it to
  * 2^16 buckets costs 0.2% of ratio and buys ~7% of encode wall time
- * (the probe count is unchanged, the miss latency is not). The long
- * table keeps 2^18 buckets: halving it as well costs another 0.8% of
- * ratio, which measurement says is not worth it. The short table hashes
+ * (the probe count is unchanged, the miss latency is not), and a later
+ * sweep on four corpora (14.9 MiB and 141 MiB source trees, a 20 MiB
+ * text tar and an 86 MiB binary tree) moved the main tier down one more
+ * step: 2^15 buckets, a 1 MiB table, costs 0.3-0.4% of ratio and buys
+ * 12-15% of encode throughput, while 2^14 costs 0.6-0.9% for another
+ * 10%, which is past where the ratio is worth trading. The long table
+ * keeps 2^18 buckets: at 2^14 short, halving the long one to 2^17 was
+ * measured to buy about as much throughput as the short-table step from
+ * 2^15 to 2^14 but to cost more ratio than it. The short table hashes
  * 5 bytes into a bucket of `lanes` packed entries; the long table hashes
  * 8 bytes into one entry per bucket. Overridable so a build can
  * re-measure. */
@@ -101,7 +107,7 @@
 #define ZGEC_MF_FAST_BUCKETS (1u << 16)
 #endif
 #ifndef ZGEC_MF_MAIN_BUCKETS
-#define ZGEC_MF_MAIN_BUCKETS (1u << 16)
+#define ZGEC_MF_MAIN_BUCKETS (1u << 15)
 #endif
 #ifndef ZGEC_MF_HIGH_BUCKETS
 #define ZGEC_MF_HIGH_BUCKETS (1u << 18)
