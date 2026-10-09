@@ -226,26 +226,17 @@ static uint32_t parse_offbase(uint32_t off, const zgec_reps *reps)
  * the three tiny per-symbol terms remain. l2tot[] holds log2(total+66)
  * for LL/ML/OF, refreshed when a sequence is accepted. */
 static double parse_seq_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
-                             const uint32_t *ll_hist,
-                             const uint32_t *ml_hist,
-                             const uint32_t *of_hist,
-                             const double l2tot[3])
+                             const float *ll_cost,
+                             const float *ml_cost,
+                             const float *of_cost)
 {
     uint8_t nb_ll = 0, nb_ml = 0, nb_of = 0;
     uint8_t c_ll = zgec_seq_code_of(ll, &nb_ll);
     uint8_t c_ml = zgec_seq_code_of(ml >= 3 ? ml - 3 : 0, &nb_ml);
     uint8_t c_of = zgec_seq_code_of(offbase >= 1 ? offbase - 1 : 0, &nb_of);
-    /* Straight-line rather than an indexed loop over three parallel
-     * arrays: this runs once per candidate and the loop form kept the
-     * three terms in memory. The accumulation order is unchanged, so the
-     * floating-point result is bit-identical. */
-    double cost = 0.0;
-    cost += l2tot[0] - zgec_fast_log2_u32(ll_hist[c_ll] + 1u);
-    cost += (double)nb_ll; /* extra bits written raw */
-    cost += l2tot[1] - zgec_fast_log2_u32(ml_hist[c_ml] + 1u);
-    cost += (double)nb_ml;
-    cost += l2tot[2] - zgec_fast_log2_u32(of_hist[c_of] + 1u);
-    cost += (double)nb_of;
+    double cost = (double)ll_cost[c_ll] + (double)nb_ll;
+    cost += (double)ml_cost[c_ml] + (double)nb_ml;
+    cost += (double)of_cost[c_of] + (double)nb_of;
     return cost;
 }
 
@@ -254,12 +245,11 @@ static double parse_seq_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
  * Positive means the match saves bits over coding its len bytes as
  * literals. */
 static double parse_score(uint32_t len, uint32_t ll, uint32_t offbase,
-                          const uint32_t *ll_hist, const uint32_t *ml_hist,
-                          const uint32_t *of_hist, const double l2tot[3],
+                          const float *ll_cost, const float *ml_cost,
+                          const float *of_cost,
                           double lbar, double lscale)
 {
-    double cost = parse_seq_cost(ll, len, offbase, ll_hist, ml_hist, of_hist,
-                                 l2tot);
+    double cost = parse_seq_cost(ll, len, offbase, ll_cost, ml_cost, of_cost);
     return (double)len * lbar - cost * lscale;
 }
 
@@ -800,6 +790,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     uint32_t ml_hist[ZGEC_NSYM_SEQ];
     uint32_t of_hist[ZGEC_NSYM_SEQ];
     uint32_t lit_hist[ZGEC_NSYM_LIT];
+    float ll_cost[ZGEC_NSYM_SEQ];
+    float ml_cost[ZGEC_NSYM_SEQ];
+    float of_cost[ZGEC_NSYM_SEQ];
     uint32_t ll_tot = 0, ml_tot = 0, of_tot = 0;   /* running code totals */
     double l2tot[3];           /* log2(total + 66) for LL/ML/OF */
     size_t lit_total = 0;      /* literals tallied into lit_hist */
@@ -807,6 +800,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     size_t lit_step = 256u;    /* literals before the next estimate */
     double lbar = 6.0;
     unsigned shift = parse_skip_shift(tier);
+    int s_i;
     memset(ll_hist, 0, sizeof(ll_hist));
     memset(ml_hist, 0, sizeof(ml_hist));
     memset(of_hist, 0, sizeof(of_hist));
@@ -814,6 +808,11 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     l2tot[0] = zgec_fast_log2_u32(ZGEC_NSYM_SEQ);
     l2tot[1] = l2tot[0];
     l2tot[2] = l2tot[0];
+    for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
+        ll_cost[s_i] = (float)(l2tot[0] - zgec_fast_log2_u32(1u));
+        ml_cost[s_i] = (float)(l2tot[1] - zgec_fast_log2_u32(1u));
+        of_cost[s_i] = (float)(l2tot[2] - zgec_fast_log2_u32(1u));
+    }
 
     size_t ip = prefix;
     size_t end = prefix + raw_size;
@@ -864,7 +863,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             if (match.length >= need) {
                 offbase = parse_offbase(match.offset, &reps);
                 cur_score = parse_score(match.length, ll, offbase,
-                                        ll_hist, ml_hist, of_hist, l2tot,
+                                        ll_cost, ml_cost, of_cost,
                                         lbar, lscale);
                 if (cur_score > 0.0) {
                     cur_len = match.length;
@@ -893,7 +892,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             if (nm.length >= nneed) {
                 uint32_t noffbase = parse_offbase(nm.offset, &reps);
                 nscore = parse_score(nm.length, nll, noffbase,
-                                     ll_hist, ml_hist, of_hist, l2tot,
+                                     ll_cost, ml_cost, of_cost,
                                      lbar, lscale);
             }
             /* cmov-style: the score comparison feeds a
@@ -964,15 +963,25 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
 
             /* Fold the accepted triple into the
              * running statistics for the price gate. */
-            ll_hist[zgec_seq_code_of(ll, &nb)]++;
-            ml_hist[zgec_seq_code_of(ml >= 3u ? ml - 3u : 0u, &nb)]++;
-            of_hist[zgec_seq_code_of(ob >= 1u ? ob - 1u : 0u, &nb)]++;
-            ll_tot++;
-            ml_tot++;
-            of_tot++;
-            l2tot[0] = zgec_fast_log2_u32(ll_tot + (uint32_t)ZGEC_NSYM_SEQ);
-            l2tot[1] = zgec_fast_log2_u32(ml_tot + (uint32_t)ZGEC_NSYM_SEQ);
-            l2tot[2] = zgec_fast_log2_u32(of_tot + (uint32_t)ZGEC_NSYM_SEQ);
+            {
+                uint8_t c_ll_acc = zgec_seq_code_of(ll, &nb);
+                uint8_t c_ml_acc = zgec_seq_code_of(ml >= 3u ? ml - 3u : 0u, &nb);
+                uint8_t c_of_acc = zgec_seq_code_of(ob >= 1u ? ob - 1u : 0u, &nb);
+                ll_hist[c_ll_acc]++;
+                ml_hist[c_ml_acc]++;
+                of_hist[c_of_acc]++;
+                ll_tot++;
+                ml_tot++;
+                of_tot++;
+                l2tot[0] = zgec_fast_log2_u32(ll_tot + (uint32_t)ZGEC_NSYM_SEQ);
+                l2tot[1] = zgec_fast_log2_u32(ml_tot + (uint32_t)ZGEC_NSYM_SEQ);
+                l2tot[2] = zgec_fast_log2_u32(of_tot + (uint32_t)ZGEC_NSYM_SEQ);
+                for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
+                    ll_cost[s_i] = (float)(l2tot[0] - zgec_fast_log2_u32(ll_hist[s_i] + 1u));
+                    ml_cost[s_i] = (float)(l2tot[1] - zgec_fast_log2_u32(ml_hist[s_i] + 1u));
+                    of_cost[s_i] = (float)(l2tot[2] - zgec_fast_log2_u32(of_hist[s_i] + 1u));
+                }
+            }
             /* Re-estimate Lbar when the literal count has grown by a
              * growing margin. parse_lbar walks all 256 symbols and takes
              * two logarithms of each, so a fixed 256-literal step
