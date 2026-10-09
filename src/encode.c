@@ -3141,6 +3141,39 @@ size_t zgec_estimate_block(zgec_encoder *e,
     }
 }
 
+/* Dict-NULL baseline memo (P5). zgec_estimate_block(dict=NULL) runs a
+ * FULL block encode, and three passes ask for the same block's value:
+ * the external-dictionary pass, the epoch sampler and the per-block
+ * epoch decision. The value is a pure function of (block index, block
+ * bytes, dict=NULL) and the encoder is deterministic, so one memo per
+ * frame makes every repeat free without moving a single emitted byte --
+ * the cached number is exactly the number the recompute would have
+ * produced. That is what makes it safe: it is a pure saving, so it
+ * cannot change ratio.
+ *
+ * The array is written from the three call sites below. A parallel-for
+ * partitions its indices and the ext pass and the epoch loop are
+ * sequential with respect to each other, so no two threads ever write
+ * the same slot. SIZE_MAX marks an empty slot (a real estimate never
+ * reaches it: a block is at most 1 << 26 bytes). */
+#define ZGEC_EST_UNSET SIZE_MAX
+
+static size_t zgec_estimate_nodict(zgec_encoder *e, const uint8_t *src,
+                                   size_t raw_size, uint32_t block_index,
+                                   size_t *cache, size_t cache_n)
+{
+    size_t v;
+    if (cache == NULL || (size_t)block_index >= cache_n) {
+        return zgec_estimate_block(e, src, raw_size, block_index, NULL, 0);
+    }
+    v = cache[block_index];
+    if (v == ZGEC_EST_UNSET) {
+        v = zgec_estimate_block(e, src, raw_size, block_index, NULL, 0);
+        cache[block_index] = v;
+    }
+    return v;
+}
+
 /* ---- frame encode ---- */
 
 /* One assembled record (header fields + payload bytes). */
@@ -3289,6 +3322,8 @@ typedef struct {
     const uint8_t *const *ext_data;
     const size_t         *ext_sizes;
     size_t                n_ext;
+    size_t               *est_cache;   /* P5: shared dict=NULL memo */
+    size_t                est_cache_n;
 } zgec_enc_extpass;
 
 static void zgec_enc_ext_block(void *ctx, size_t i)
@@ -3300,7 +3335,8 @@ static void zgec_enc_ext_block(void *ctx, size_t i)
     uint16_t best_id = 0;
     size_t k;
     if (bs > x->block_size) bs = x->block_size;
-    best = zgec_estimate_block(x->e, x->src + bo, bs, (uint32_t)i, NULL, 0);
+    best = zgec_estimate_nodict(x->e, x->src + bo, bs, (uint32_t)i,
+                                x->est_cache, x->est_cache_n);
     for (k = 0; k < x->n_ext; k++) {
         size_t b = zgec_estimate_block(x->e, x->src + bo, bs, (uint32_t)i,
                                        x->ext_data[k], x->ext_sizes[k]);
@@ -3324,6 +3360,8 @@ typedef struct {
     size_t         cand_len;
     uint16_t       id;
     size_t         begin;
+    size_t        *est_cache;          /* P5: shared dict=NULL memo */
+    size_t         est_cache_n;
 } zgec_enc_epochpass;
 
 static void zgec_enc_epoch_block(void *ctx, size_t k)
@@ -3336,7 +3374,8 @@ static void zgec_enc_epoch_block(void *ctx, size_t k)
     size_t b;
     if (bs > p->block_size) bs = p->block_size;
     if (p->block_dict[t] != 0) return; /* an external dict already wins */
-    a = zgec_estimate_block(p->e, p->src + bo, bs, (uint32_t)t, NULL, 0);
+    a = zgec_estimate_nodict(p->e, p->src + bo, bs, (uint32_t)t,
+                             p->est_cache, p->est_cache_n);
     b = zgec_estimate_block(p->e, p->src + bo, bs, (uint32_t)t, p->cand,
                             p->cand_len);
     p->block_dict[t] = (b < a) ? p->id : 0;
@@ -3355,6 +3394,8 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
     size_t recs_cap = 0;
     zgec_enc_blockjob *jobs = NULL;
     uint16_t *block_dict = NULL; /* per-block dict id (0 = none) */
+    size_t *est_cache = NULL;    /* P5: per-block dict=NULL memo */
+    size_t est_cache_n = 0;
     uint8_t **dict_bytes = NULL; /* per-epoch dict content (epoch k -> bytes) */
     size_t *dict_lens = NULL;
     uint16_t *epoch_dict_id = NULL;
@@ -3440,6 +3481,25 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
     if (!block_dict) return ZGEC_ERR_NOMEM;
     memset(block_dict, 0, n_blocks * sizeof(*block_dict));
 
+    n_epochs = (n_blocks + (size_t)params.epoch_blocks - 1) /
+               (size_t)params.epoch_blocks;
+
+    /* P5: one size_t per block memoising the dict=NULL estimate. Created
+     * only when a dictionary pass can actually run, so the default path
+     * pays nothing; a failed alloc leaves est_cache NULL and every lookup
+     * just recomputes, i.e. exactly the old behaviour. 0xFF fills every
+     * byte, which makes each entry SIZE_MAX (the unset sentinel) on any
+     * two's-complement target. */
+    if (n_ext > 0 ||
+        (params.use_dicts && params.epoch_blocks > 0 && n_epochs > 1)) {
+        est_cache = (size_t *)zgec_alloc(n_blocks * sizeof(*est_cache),
+                                         _Alignof(size_t));
+        if (est_cache) {
+            memset(est_cache, 0xFF, n_blocks * sizeof(*est_cache));
+            est_cache_n = n_blocks;
+        }
+    }
+
     /* ---- external dictionary pass (5.8) ----
      * The bytes are supplied by the application, so they cost the frame
      * only a footer entry; a block uses one only when a measurement
@@ -3461,13 +3521,13 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
         xp.ext_data = (const uint8_t *const *)ext_data;
         xp.ext_sizes = ext_sizes;
         xp.n_ext = n_ext;
+        xp.est_cache = est_cache;
+        xp.est_cache_n = est_cache_n;
         zgec_enc_parallel_for(params.n_threads, n_blocks,
                               zgec_enc_ext_block, &xp);
     }
 
     /* ---- dictionary pass (5.3-5.5, 11.1) ---- */
-    n_epochs = (n_blocks + (size_t)params.epoch_blocks - 1) /
-               (size_t)params.epoch_blocks;
     if (params.use_dicts && params.epoch_blocks > 0 && n_epochs > 1) {
         dict_bytes = (uint8_t **)zgec_alloc(n_epochs * sizeof(*dict_bytes),
                                            _Alignof(void *));
@@ -3477,6 +3537,7 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
                                               _Alignof(uint16_t));
         if (!dict_bytes || !dict_lens || !epoch_dict_id) {
             zgec_free(block_dict);
+            zgec_free(est_cache);
             zgec_free(dict_bytes);
             zgec_free(dict_lens);
             zgec_free(epoch_dict_id);
@@ -3533,8 +3594,9 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
                 /* A block that an external dictionary already wins keeps
                  * its id, so it cannot judge this candidate. */
                 if (block_dict[bi] != 0) continue;
-                s_without += zgec_estimate_block(e, src + bo, bs,
-                                                (uint32_t)bi, NULL, 0);
+                s_without += zgec_estimate_nodict(e, src + bo, bs,
+                                                 (uint32_t)bi,
+                                                 est_cache, est_cache_n);
                 s_with += zgec_estimate_block(e, src + bo, bs, (uint32_t)bi,
                                              cand, cand_len);
                 measured++;
@@ -3573,6 +3635,8 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
                 epj.cand_len = cand_len;
                 epj.id = next_dict_id;
                 epj.begin = ep_start;
+                epj.est_cache = est_cache;
+                epj.est_cache_n = est_cache_n;
                 zgec_enc_parallel_for(params.n_threads, ep_end - ep_start,
                                       zgec_enc_epoch_block, &epj);
             }
@@ -3618,6 +3682,7 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
         zgec_free(recs);
         zgec_free(jobs);
         zgec_free(block_dict);
+        zgec_free(est_cache);
         if (dict_bytes) {
             for (i = 0; i < n_epochs; i++) zgec_free(dict_bytes[i]);
         }
@@ -4216,6 +4281,7 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
         for (r = 0; r < n_recs; r++) zgec_free(recs[r].payload);
         zgec_free(recs);
         zgec_free(block_dict);
+        zgec_free(est_cache);
         if (dict_bytes) {
             for (i = 0; i < n_epochs; i++) zgec_free(dict_bytes[i]);
         }
@@ -4247,6 +4313,7 @@ frame_fail_out:
         zgec_free(recs);
     }
     zgec_free(block_dict);
+    zgec_free(est_cache);
     if (dict_bytes) {
         for (i = 0; i < n_epochs; i++) zgec_free(dict_bytes[i]);
     }
