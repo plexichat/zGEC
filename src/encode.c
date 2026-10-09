@@ -1913,10 +1913,9 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
             for (c2 = 0; c2 < 3; c2++) {
                 int16_t cc[ZGEC_NSYM_SEQ];
                 size_t nw;
-                err = zgec_seq_build_tables(&dec_ll3[c2], &enc_ll3[c2],
-                                            hc[c2], 10);
+                err = zgec_seq_build_tables_counts(&dec_ll3[c2], &enc_ll3[c2],
+                                                     hc[c2], 10, cc);
                 if (err != ZGEC_OK) goto seg_fail_tables;
-                (void)zgec_normalize_counts(cc, hc[c2], 66, 10);
                 nw = zgec_fse_write_counts(desc + desc_size,
                                            sizeof(desc) - desc_size, cc, 66, 10);
                 if (nw == 0) {
@@ -1928,9 +1927,8 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
         } else {
             int16_t c[ZGEC_NSYM_SEQ];
             size_t nw;
-            err = zgec_seq_build_tables(&dec_ll, &enc_ll, hist_ll, 10);
+            err = zgec_seq_build_tables_counts(&dec_ll, &enc_ll, hist_ll, 10, c);
             if (err != ZGEC_OK) goto seg_fail_tables;
-            (void)zgec_normalize_counts(c, hist_ll, 66, 10);
             nw = zgec_fse_write_counts(desc + desc_size,
                                        sizeof(desc) - desc_size, c, 66, 10);
             if (nw == 0) {

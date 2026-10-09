@@ -378,13 +378,15 @@ int zgec_normalize_counts(int16_t *counts, const uint32_t *hist,
     }
 }
 
-zgec_err zgec_seq_build_tables(zgec_fse_dec_table **dec,
-                               zgec_fse_enc_table **enc,
-                               const uint32_t *hist, int al)
+zgec_err zgec_seq_build_tables_counts(zgec_fse_dec_table **dec,
+                                               zgec_fse_enc_table **enc,
+                                               const uint32_t *hist, int al,
+                                               int16_t *counts_out)
 {
     if (!dec || !enc || !hist) return ZGEC_ERR_INVAL;
     if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
     int16_t counts[ZGEC_NSYM_SEQ];
+    int16_t *counts_use = counts_out ? counts_out : counts;
     /* No valid distribution: either more observed symbols than the state
        space has states, or its normalised counts do not sum to 2^al (entry 6;
        the sum is verified in zgec_normalize_counts() itself).
@@ -393,12 +395,19 @@ zgec_err zgec_seq_build_tables(zgec_fse_dec_table **dec,
        log outside [ZGEC_MIN_AL, ZGEC_MAX_AL] that the same code otherwise
        reports. A distinct member would have to be added to
        include/zgec_common.h (outside this slice). */
-    if (!zgec_normalize_counts(counts, hist, ZGEC_NSYM_SEQ, al))
+    if (!zgec_normalize_counts(counts_use, hist, ZGEC_NSYM_SEQ, al))
         return ZGEC_ERR_FSE_AL;
 
-    zgec_err err = zgec_fse_build_dec(dec, counts, ZGEC_NSYM_SEQ, al);
+    zgec_err err = zgec_fse_build_dec(dec, counts_use, ZGEC_NSYM_SEQ, al);
     if (err != ZGEC_OK) return err;
     err = zgec_fse_build_enc(enc, *dec);
     if (err != ZGEC_OK) { zgec_fse_free_dec(*dec); *dec = NULL; return err; }
     return ZGEC_OK;
+}
+
+zgec_err zgec_seq_build_tables(zgec_fse_dec_table **dec,
+                               zgec_fse_enc_table **enc,
+                               const uint32_t *hist, int al)
+{
+    return zgec_seq_build_tables_counts(dec, enc, hist, al, NULL);
 }

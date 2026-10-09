@@ -147,4 +147,12 @@ zgec_err zgec_seq_build_tables(zgec_fse_dec_table **dec,
                                          zgec_fse_enc_table **enc,
                                          const uint32_t *hist, int al);
 
+/* Same as above, but writes the normalised counts to counts_out[0..65]
+   (may be NULL) so the caller can reuse them for the table descriptor
+   instead of normalising a second time. */
+zgec_err zgec_seq_build_tables_counts(zgec_fse_dec_table **dec,
+                                                zgec_fse_enc_table **enc,
+                                                const uint32_t *hist, int al,
+                                                int16_t *counts_out);
+
 #endif /* ZGEC_SEQ_H */
