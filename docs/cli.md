@@ -29,29 +29,34 @@ Typical output (stderr, `--quiet` suppresses it):
 
 ```text
 zgec: input 12.0 MiB, one worker per core
-zgec: level 3, 12582912 -> 4210812 bytes (2.9884x)  210.5 ms  57.0 MiB/s
+zgec: level 6, 12582912 -> 4210812 bytes (2.9884x)  210.5 ms  57.0 MiB/s
 ```
 
-## Levels (`-l 1..9`, default 3)
+## Levels (`-l 1..25`, default 6)
 
 A level is a preset; any explicit flag overrides its column. Every preset
 uses `--block-log2 21` (2 MiB blocks) and `lambda 0`.
 
+Slots 1-3 and 11 and 13-25 are reserved and rejected with
+`level N is not implemented`; the implemented ladder is 4-10 and 12.
+Level 4 is the old level 1, level 12 is the old level 9, and the old
+levels 7 and 8 (byte-identical output on the reference corpus) are the
+single level 10.
+
 | level | tier | contexts | sub-lit | conditioning | litref | dicts | filter | checksums |
 |------:|------|----------|---------|--------------|--------|-------|--------|-----------|
-| 1 | fast | - | - | - | - | - | - | - |
-| 2 | fast | x | - | - | - | - | - | - |
-| 3 | main | - | - | - | - | - | - | - |
-| 4 | main | x | - | - | - | - | - | - |
-| 5 | main | x | - | - | x | - | - | - |
-| 6 | main | x | - | x | x | - | - | - |
-| 7 | high | x | - | x | x | - | - | - |
-| 8 | high | x | x | x | x | - | - | - |
-| 9 | high | x | x | x | x | - | - | x |
+| 4 | fast | - | - | - | - | - | - | - |
+| 5 | fast | x | - | - | - | - | - | - |
+| 6 | main | - | - | - | - | - | - | - |
+| 7 | main | x | - | - | - | - | - | - |
+| 8 | main | x | - | - | x | - | - | - |
+| 9 | main | x | - | x | x | - | - | - |
+| 10 | high | x | x | x | x | - | - | - |
+| 12 | high | x | x | x | x | - | - | x |
 
 ```sh
-zgec c -l 1 big.log big.zgec      # fastest
-zgec c -l 9 src.tar src.tar.zgec  # best ratio in the preset ladder
+zgec c -l 4 big.log big.zgec      # fastest implemented
+zgec c -l 12 src.tar src.tar.zgec # best ratio in the preset ladder
 ```
 
 ## Threads (`-T N`, default 0)
@@ -77,11 +82,11 @@ zgec c -T 1 input output   # serial, for benchmarking
 --checksums     --no-checksums
 ```
 
-Example: level 9 without checksums, or level 3 with contexts:
+Example: level 12 without checksums, or level 7 with contexts:
 
 ```sh
-zgec c -l 9 --no-checksums input output
-zgec c -l 3 --contexts input output
+zgec c -l 12 --no-checksums input output
+zgec c -l 7 --contexts input output
 ```
 
 Note: `--litref` replaces `--sub-lit` (§6.3): a literal-reference predecessor
@@ -93,7 +98,7 @@ which is the part that would break exportability.
 
 ## Checksum cost
 
-`--checksums` (on by default only at level 9) adds a per-block CRC32C
+`--checksums` (on by default only at level 12) adds a per-block CRC32C
 pass: `src/encode.c:3891` checksums the source block on encode and
 `src/decode.c:1917` re-checksums the decoded block on decode, both via
 `zgec_crc32c` (`src/crc32c.c:155` `zgec_crc32c_hw`, which uses the x86
@@ -146,7 +151,7 @@ zgec c --quiet input output        # no size summary
 
 ```sh
 zgec t input
-zgec t -l 9 --checksums input
+zgec t -l 12 --checksums input
 ```
 
 Compresses and decompresses in memory, byte-compares, prints decode timing
@@ -160,7 +165,7 @@ Common failures (all exit `1` with a `zgec: ...` message):
   `zgec -h`.
 - `c needs an output path` / `d needs an output path`.
 - `cannot read <path>` / `cannot write <path>`.
-- `level must be 1..9`, `thread count must be 0..1024`,
+- `level must be 1..25`, `thread count must be 0..1024`,
   `block-log2 must be 16..26`, `tier must be fast, main or high`,
   `lambda must be a number >= 0`, `at most 4 dictionaries`.
 - `compress failed: ...` / `decompress failed: ...` — the suffix is the

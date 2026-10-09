@@ -95,7 +95,7 @@ static int fuzz_chance(uint32_t pct)
 /* ---- parameters ----
  *
  * The table mirrors the level presets of src/cli.c, which is what a user
- * gets from -l 1..9: tier and the feature switches, at the 2 MiB block of
+ * gets from -l 4..10 and 12: tier and the feature switches, at the 2 MiB
  * section 12.3. Keeping a copy here means the fuzzer covers the shipped
  * ladder rather than an arbitrary set; the jitter below reaches the
  * combinations the ladder does not contain. */
@@ -111,14 +111,13 @@ typedef struct {
     int ck;
 } fuzz_level;
 
-static const fuzz_level fuzz_levels[9] = {
+static const fuzz_level fuzz_levels[8] = {
     { ZGEC_TIER_FAST, 0, 0, 0, 0, 0, 0, 0 },
     { ZGEC_TIER_FAST, 1, 0, 0, 0, 0, 0, 0 },
     { ZGEC_TIER_MAIN, 0, 0, 0, 0, 0, 0, 0 },
     { ZGEC_TIER_MAIN, 1, 0, 0, 0, 0, 0, 0 },
     { ZGEC_TIER_MAIN, 1, 0, 0, 1, 0, 0, 0 },
     { ZGEC_TIER_MAIN, 1, 0, 1, 1, 0, 0, 0 },
-    { ZGEC_TIER_HIGH, 1, 0, 1, 1, 0, 0, 0 },
     { ZGEC_TIER_HIGH, 1, 1, 1, 1, 0, 0, 0 },
     { ZGEC_TIER_HIGH, 1, 1, 1, 1, 0, 0, 1 }
 };
@@ -131,7 +130,7 @@ static const fuzz_level fuzz_levels[9] = {
  * input. */
 static void fuzz_build_params(zgec_params *p, uint32_t level, uint32_t jitter)
 {
-    const fuzz_level *l = &fuzz_levels[level % 9u];
+    const fuzz_level *l = &fuzz_levels[level % 8u];
 
     zgec_params_default(p);
     p->tier = (zgec_tier)l->tier;

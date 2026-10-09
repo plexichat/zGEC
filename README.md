@@ -31,7 +31,8 @@ zgec t input            # round-trip test
 zgec -h                 # all options, levels and feature flags
 ```
 
-Run `zgec -h` for compression levels (`-l 1..9`), thread count (`-T`) and the
+Run `zgec -h` for compression levels (`-l 1..25`; 4-10 and 12 implemented),
+thread count (`-T`) and the
 individual feature toggles. See `docs/cli.md` for the full CLI guide with
 examples (levels table, threads, dictionaries, verification).
 

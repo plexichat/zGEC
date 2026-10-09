@@ -5,7 +5,7 @@
 #
 # MODE is 1t (single-threaded) or nt (multi-threaded: one worker per core).
 # Measures, per input file:
-#   zgec  levels 1..9            (--tier left at the level preset)
+#   zgec  levels 4-10 and 12     (--tier left at the level preset)
 #   zstd  levels 3, 4, 5, 6
 #   xz    level 6 (default)
 # each as encode + decode, verifying the round trip with cmp.
@@ -130,7 +130,7 @@ sweep_xz() { # file
 }
 
 for f in "$@"; do
-  for l in 1 2 3 4 5 6 7 8 9; do sweep_zgec "$f" "$l"; done
+  for l in 4 5 6 7 8 9 10 12; do sweep_zgec "$f" "$l"; done
   for l in 3 4 5 6; do sweep_zstd "$f" "$l"; done
   sweep_xz "$f"
 done

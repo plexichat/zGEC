@@ -39,8 +39,9 @@ were not supplied.
 
 ## What is measured
 
-* **zGEC** — levels 1..9 from the preset ladder, plus one configuration that
-  turns on the features the presets leave out (`-l 9 --dicts --filter`). Each is
+* **zGEC** — the implemented levels 4-10 and 12 from the preset ladder, plus
+  one configuration that turns on the features the presets leave out
+  (`-l 12 --dicts --filter`). Each is
   measured for encode and decode at one thread and at all threads, and the
   encode is round-tripped once against the input before its numbers are
   reported; a mismatch is recorded in the row rather than thrown away.

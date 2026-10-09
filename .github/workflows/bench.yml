@@ -4,7 +4,7 @@
 #   baselines  zstd / zstd-seekable / xz, once per corpus -- cached, because a
 #              pinned tool on a pinned corpus produces the same bytes every
 #              time, so the numbers cannot change.
-#   zgec       every level 1..9 plus one all-features configuration, encode and
+#   zgec       every implemented level (4-10, 12) plus one all-features
 #              decode, one thread and all threads, round-tripped against the
 #              input before its numbers are reported.
 #   report     merges the per-corpus CSVs, computes the Pareto frontiers and

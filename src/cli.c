@@ -16,6 +16,10 @@
 
 #define CLI_MAX_DICTS 4
 
+/* Every level number a caller may name; a cli_levels[] entry with impl == 0
+ * is reserved (not implemented yet) and is rejected by option parsing. */
+#define CLI_LEVEL_MAX 25
+
 /* An external dictionary is a prefix region, so it competes for the per-worker
  * virtual buffer with the block itself (12.3, P24). The format's raw
  * dictionary maximum is 64 MiB; refusing a larger file before it is copied
@@ -211,7 +215,9 @@ static void cli_usage(FILE *f, const char *argv0)
         "      takes no output path)\n"
         "\n"
         "options:\n"
-        "  -l, --level N       1 (fastest) .. 9 (best ratio); default 3\n"
+        "  -l, --level N       1 (fastest) .. 25 (best ratio); default 6.\n"
+        "                      Levels 4-10 and 12 are implemented; 1-3 and\n"
+        "                      11, 13-25 are reserved and rejected.\n"
         "  -T, --threads N     worker threads (0 = one per core); default 0\n"
         "      --tier T        match finder tier: fast, main, high\n"
         "      --block-log2 N  block size log2, 16..26 (default: the level\n"
@@ -256,6 +262,7 @@ typedef struct {
     int       filter;
     int       ck;
     int       block_log2;
+    int       impl;   /* 1 = implemented preset, 0 = reserved slot */
 } cli_level;
 
 /* A level adds the feature that measured best on the reference corpus, so
@@ -263,9 +270,9 @@ typedef struct {
  *
  * One ordering matters: a literal-reference level keeps its predecessor
  * block's literals plain and free of LL conditioning so the 6.3 chain stays
- * alive, which is why sub-literals (9.6) are added only at level 8, above
+ * alive, which is why sub-literals (9.6) are added only at level 10, above
  * every literal-reference level. OF conditioning does not break the chain
- * (D6), so level 6 adds conditioning on top of level 5's literal references:
+ * (D6), so level 9 adds conditioning on top of level 8's literal references:
  * the level that adds it re-states the flag rather than dropping one.
  *
  * Every preset uses the 2 MiB block of section 12.3 (block_log2 21). A
@@ -278,7 +285,7 @@ typedef struct {
  * literal-reference region shares the 16 MiB virtual buffer with the block,
  * and the encoder shrinks the prefix to fit rather than the block.
  *
- * Level 8 adds sub-literals; level 9 adds the per-block CRC-32C, which is a
+ * Level 10 adds sub-literals; level 12 adds the per-block CRC-32C, which is a
  * fixed-width field and so does not move the size.
  *
  * Two features are deliberately in no preset: the sampled pre-filter and
@@ -287,7 +294,7 @@ typedef struct {
  * block, and neither is. The filter's sampled gate accepts, and a block it
  * accepts cannot set LIT_EXPORTABLE (6.3, V11), which breaks the
  * literal-reference chain the levels above 5 rely on: 254 KB, 1.0% of a
- * 26 MB frame, which made level 9 come out larger than level 7. The epoch
+ * 26 MB frame, which made level 12 come out larger than level 10. The epoch
  * dictionary is a 186 byte net loss on the same frame, because one epoch's
  * block is encoded with a dictionary that does not pay for itself there and
  * the encoder does not re-encode to prove each per-block choice. At 16 MiB
@@ -295,23 +302,47 @@ typedef struct {
  * stay available as flags for the input where they do pay (binary, columnar
  * and heterogeneous data), and a caller that wants a dictionary prefix on a
  * small block is the reason --block-log2 is still an option. */
-static const cli_level cli_levels[9] = {
-    /* 1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21 },
-    /* 2 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21 },
-    /* 3 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 21 },
-    /* 4 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 21 },
-    /* 5 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 1, 0, 0, 0, 21 },
-    /* 6 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 1, 1, 0, 0, 0, 21 },
-    /* 7 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 1, 1, 0, 0, 0, 21 },
-    /* 8 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21 },
-    /* 9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21 }
+/* Level slots 1..25. Rungs 1-3 and 11 are reserved (impl == 0) and 13-25 are
+ * not implemented yet; only 4-10 and 12 are usable today. The handful below
+ * carries the whole ladder: level 4 is the old level 1, and each implemented
+ * level maps to the preset that used to sit one number lower, except that the
+ * old levels 7 and 8 (which produced byte-identical output on the reference
+ * corpus) collapse into level 10, leaving slot 11 free for a ratio rung that
+ * does not exist yet and level 12 as today's best (old level 9, with the
+ * per-block CRC-32C). */
+static const cli_level cli_levels[CLI_LEVEL_MAX] = {
+    /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
+    /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
+    /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
+    /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  6 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  7 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  8 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 1, 0, 0, 0, 21, 1 },
+    /*  9 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 1, 1, 0, 0, 0, 21, 1 },
+    /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 1 },
+    /* 11 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 12 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21, 1 },
+    /* 13 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 14 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 15 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 16 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 17 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 18 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 19 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 20 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 21 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 22 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 23 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 24 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
+    /* 25 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)
 {
     const cli_level *l;
     if (level < 1) level = 1;
-    if (level > 9) level = 9;
+    if (level > CLI_LEVEL_MAX) level = CLI_LEVEL_MAX;
     l = &cli_levels[level - 1];
     p->block_log2 = l->block_log2;
     p->tier = l->tier;
@@ -364,7 +395,7 @@ static int cli_double(const char *s, double lo, double hi, double *out)
 
 int main(int argc, char **argv)
 {
-    int level = 3;
+    int level = 6;
     int threads = 0;
     int threads_set = 0;
     int tier_set = 0;
@@ -458,8 +489,17 @@ int main(int argc, char **argv)
                 return 0;
             } else if (strcmp(a, "-l") == 0 || strcmp(a, "--level") == 0) {
                 if (++i >= argc) goto bad_value;
-                if (!cli_int(argv[i], 1, 9, &num)) {
-                    fprintf(stderr, "zgec: level must be 1..9\n");
+                if (!cli_int(argv[i], 1, CLI_LEVEL_MAX, &num)) {
+                    fprintf(stderr, "zgec: level must be 1..%d\n",
+                            CLI_LEVEL_MAX);
+                    return 1;
+                }
+                /* Reserved slots are addressable but rejected, so a caller
+                 * learns the number is valid and simply not built yet. */
+                if (!cli_levels[(int)num - 1].impl) {
+                    fprintf(stderr, "zgec: level %ld is not implemented "
+                                    "(implemented levels: 4-10 and 12)\n",
+                            num);
                     return 1;
                 }
                 level = (int)num;
@@ -613,9 +653,9 @@ int main(int argc, char **argv)
          * literal-reference path (encode.c D6) and drops only LL conditioning,
          * which would break exportability. Clearing use_conditioning here used
          * to suppress OF conditioning as well, which made every
-         * literal-reference level larger than it needed to be -- level 6 came
-         * out byte-identical to level 5 (both conditioning-free), and 8 and 9
-         * identical to 7. The warning
+         * literal-reference level larger than it needed to be -- level 9 came
+         * out byte-identical to level 8 (both conditioning-free), and 10 and 12
+         * identical to 9. The warning
          * tracks the user's own request (f_sub is -1 when the flag was never
          * given), not the resolved parameters, so a preset that enables
          * sub-literals does not trigger it. */

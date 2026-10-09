@@ -445,10 +445,12 @@ class Bench(object):
         data = src.stat().st_size
         frame = self.tmp / "frame.zgec"
         back = self.tmp / "back.bin"
-        configs = ["-l %d" % lvl for lvl in range(1, 10)]
+        # The implemented preset ladder (src/cli.c): levels 1-3 and 11 and
+        # 13-25 are reserved and rejected by the CLI.
+        configs = ["-l %d" % lvl for lvl in (4, 5, 6, 7, 8, 9, 10, 12)]
         # The presets leave the sampled pre-filter and the epoch dictionaries
         # out on purpose, so exercise them together once on the top level.
-        configs.append("-l 9 --dicts --filter")
+        configs.append("-l 12 --dicts --filter")
         for cfg in configs:
             extra = cfg.split()
             for threads in (1, self.cpu_count):
