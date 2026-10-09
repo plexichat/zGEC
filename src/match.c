@@ -324,7 +324,7 @@ static void mf_insert_long(zgec_matcher *m, uint32_t bucket, uint32_t entry)
     m->long_tab[(size_t)bucket] = entry;
 }
 
-static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos)
+static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int long_ok)
 {
     uint32_t h;
     uint32_t bucket;
@@ -354,7 +354,7 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos)
     entry = mf_pack((uint32_t)pos, tag);
     mf_insert_short(m, bucket, entry);
 
-    if (pos + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
+    if (long_ok && pos + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
         uint32_t hl = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 2u)) ? m->c_hl[pos & 1u] : mf_hash8(vb, pos);
         uint32_t lb = hl & (m->long_buckets - 1u);
         uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
@@ -752,7 +752,7 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
                 break;
             }
         }
-        mf_insert_pos(m, vb, pos);
+        mf_insert_pos(m, vb, pos, 1);
     }
 }
 
@@ -1056,7 +1056,7 @@ void zgec_matcher_insert(zgec_matcher *m, const uint8_t *vb, size_t ip)
     if (ip >= (size_t)ZGEC_MF_POS_LIMIT || ip > m->vb_size || need > m->vb_size - ip) {
         return;
     }
-    mf_insert_pos(m, vb, ip);
+    mf_insert_pos(m, vb, ip, 1);
 }
 
 void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start, size_t len)
@@ -1093,7 +1093,7 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
             if (pos + need > m->vb_size) {
                 break;
             }
-            mf_insert_pos(m, vb, pos);
+            mf_insert_pos(m, vb, pos, 1);
         }
     } else {
         /* Sampled: evenly spaced, distinct positions across the match
@@ -1123,7 +1123,8 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
                                : 0u;
             size_t pos = start + (size_t)off;
             if (pos < m->vb_size && need <= m->vb_size - pos) {
-                mf_insert_pos(m, vb, pos);
+                int long_ok = (t == 0u || t + 1u == nsamp) ? 1 : 0;
+                mf_insert_pos(m, vb, pos, long_ok);
             }
         }
     }
