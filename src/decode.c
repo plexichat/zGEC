@@ -1370,13 +1370,36 @@ static zgec_err exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
         for (i = 0; i < len; i++) d[i] = src[i]; /* safe scalar tail */
         return ZGEC_OK;
     }
-    if (off >= 8) {
+    if (off == 1) {
+        memset(d, src[0], len);
+        return ZGEC_OK;
+    }
+    if (off >= 16) {
+        if (len >= 16) {
+            while (i + 16 <= len) {
+                memcpy(d + i, src + i, 16);
+                i += 16;
+            }
+            memcpy(d + len - 16, src + len - 16, 16);
+            return ZGEC_OK;
+        }
+        if (len >= 8) {
+            memcpy(d, src, 8);
+            memcpy(d + len - 8, src + len - 8, 8);
+            return ZGEC_OK;
+        }
+        if (len >= 4) {
+            memcpy(d, src, 4);
+            memcpy(d + len - 4, src + len - 4, 4);
+            return ZGEC_OK;
+        }
+    } else if (off >= 8) {
         if (len >= 8) {
             while (i + 8 <= len) {
                 memcpy(d + i, src + i, 8);
                 i += 8;
             }
-            memcpy(d + len - 8, src + len - 8, 8); /* within [0,len) */
+            memcpy(d + len - 8, src + len - 8, 8);
             return ZGEC_OK;
         }
         if (len >= 4) {
