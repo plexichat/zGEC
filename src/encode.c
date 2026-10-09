@@ -551,7 +551,6 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
     size_t n_gran;
     zgec_granule *grans = NULL;
     size_t *gstart = NULL;
-    uint32_t *lit_of_seq = NULL;
     size_t i;
     size_t gi;
     size_t lit_pos;
@@ -577,25 +576,12 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
     gstart = (size_t *)zgec_alloc((n_gran + 1) * sizeof(*gstart),
                                  _Alignof(size_t));
     if (parse->n_seq > UINT32_MAX - 1) return ZGEC_ERR_INVAL;
-    lit_of_seq = (uint32_t *)zgec_alloc((parse->n_seq + 1) * sizeof(*lit_of_seq),
-                                     _Alignof(uint32_t));
-    if (!grans || !gstart || !lit_of_seq) {
+    if (!grans || !gstart) {
         zgec_free(grans);
         zgec_free(gstart);
-        zgec_free(lit_of_seq);
         return ZGEC_ERR_NOMEM;
     }
     memset(grans, 0, n_gran * sizeof(*grans));
-
-    /* Sequence -> literal-start map from LL prefix sums. */
-    lit_pos = 0;
-    for (i = 0; i < parse->n_seq; i++) {
-        if (lit_pos > UINT32_MAX) return ZGEC_ERR_INTERNAL;
-        lit_of_seq[i] = (uint32_t)lit_pos;
-        lit_pos += (size_t)parse->seq[i].ll;
-    }
-    if (lit_pos > UINT32_MAX) { zgec_free(grans); zgec_free(gstart); zgec_free(lit_of_seq); return ZGEC_ERR_INTERNAL; }
-    lit_of_seq[parse->n_seq] = (uint32_t)lit_pos;
 
     {
         size_t per = (parse->n_seq + n_gran - 1) / n_gran;
@@ -607,12 +593,14 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
         gstart[n_gran] = parse->n_seq;
     }
 
+    lit_pos = 0;
     for (gi = 0; gi < n_gran; gi++) {
         zgec_granule *g = &grans[gi];
         for (i = gstart[gi]; i < gstart[gi + 1]; i++) {
             const zgec_sequence *q = &parse->seq[i];
             uint8_t nb = 0;
             uint8_t c;
+            size_t end_lit;
             size_t t;
             uint32_t mlv = (q->ml >= 3) ? (q->ml - 3u) : 0u;
             uint32_t ofv = (q->offbase >= 1) ? (q->offbase - 1u) : 0u;
@@ -626,9 +614,12 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
             g->of[c]++;
             g->extra_bits += (uint64_t)nb;
             g->n_seq++;
-            for (t = lit_of_seq[i]; t < lit_of_seq[i + 1]; t++) {
-                if (t < parse->n_lit) g->lit[parse->lit[t]]++;
+            end_lit = lit_pos + (size_t)q->ll;
+            if (end_lit > parse->n_lit) end_lit = parse->n_lit;
+            for (t = lit_pos; t < end_lit; t++) {
+                g->lit[parse->lit[t]]++;
             }
+            lit_pos = end_lit;
         }
     }
     /* Tail literals belong to the last granule. */
@@ -647,7 +638,6 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
         if (!gcost) {
             zgec_free(grans);
             zgec_free(gstart);
-            zgec_free(lit_of_seq);
             return ZGEC_ERR_NOMEM;
         }
         memset(&comb, 0, sizeof(comb));
@@ -691,7 +681,6 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
         if (!b) {
             zgec_free(grans);
             zgec_free(gstart);
-            zgec_free(lit_of_seq);
             return ZGEC_ERR_NOMEM;
         }
         for (gi = 0; gi <= n_gran; gi++) b[gi] = gstart[gi];
@@ -700,7 +689,6 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
     }
     zgec_free(grans);
     zgec_free(gstart);
-    zgec_free(lit_of_seq);
     return ZGEC_OK;
 }
 
