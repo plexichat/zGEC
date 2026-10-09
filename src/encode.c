@@ -781,11 +781,13 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
      * stack local: the block pass runs one block per worker (11.8). */
     static ZGEC_ENC_TLS uint32_t
         work[ZGEC_ENC_NCLASS][ZGEC_NSYM_LIT];
-    /* Cached merge deltas dlt[a][b] for a < b. A merge changes only the
-     * deltas that involve the surviving cluster, so one row is
-     * refreshed per merge instead of every pair. The greedy choice and
-     * its tie-breaking scan order are unchanged, so the result is
-     * identical to recomputing all pairs each time. */
+    /* Cached merge deltas dlt[a][b] for a < b, seeded once below and
+     * refreshed lazily: after a merge the entries involving the
+     * survivor go stale, and only a popped candidate's true delta is
+     * recomputed before it may commit. The commit rule (least true
+     * delta in scan order) is unchanged, so the result matches a full
+     * refresh whenever the popped candidate verifies as still
+     * minimal. */
     static ZGEC_ENC_TLS double dlt[ZGEC_ENC_NCLASS][ZGEC_ENC_NCLASS];
     uint32_t merged[ZGEC_NSYM_LIT];
     uint8_t members[ZGEC_ENC_NCLASS][ZGEC_ENC_NCLASS];
@@ -835,7 +837,14 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         int best_a = -1;
         int best_b = -1;
         double best_delta = 0.0;
-        int first = 1;
+        /* Lazy greedy: pop the best pair by possibly-stale cached
+         * deltas. Recompute only that pair's true delta and commit it
+         * iff it is still minimal in the same scan order (the commit
+         * rule is unchanged); otherwise the refreshed entry loses and
+         * the new minimum becomes the next candidate. */
+        int cand_a = -1;
+        int cand_b = -1;
+        double cand_delta = 0.0;
         int a;
 
         if (ncl == 8) { *bits_k8 = total; zgec_cluster_snapshot(members, nmem, alive, assign_out[3]); }
@@ -849,13 +858,50 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
                 double delta;
                 if (!alive[bb]) continue;
                 delta = dlt[(size_t)a][(size_t)bb];
-                if (first || delta < best_delta) {
-                    best_delta = delta;
-                    best_a = a;
-                    best_b = bb;
-                    first = 0;
+                if (cand_a < 0 || delta < cand_delta) {
+                    cand_delta = delta;
+                    cand_a = a;
+                    cand_b = bb;
                 }
             }
+        }
+        while (cand_a >= 0) {
+            int ver_a = -1;
+            int ver_b = -1;
+            double ver_delta = 0.0;
+            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+                merged[(size_t)s] =
+                    work[(size_t)cand_a][(size_t)s] +
+                    work[(size_t)cand_b][(size_t)s];
+            }
+            cand_delta =
+                zgec_class_entropy(merged, ctot[(size_t)cand_a] +
+                                           ctot[(size_t)cand_b]) -
+                cent[(size_t)cand_a] - cent[(size_t)cand_b];
+            dlt[(size_t)cand_a][(size_t)cand_b] = cand_delta;
+            for (a = 0; a < ZGEC_ENC_NCLASS; a++) {
+                int bb;
+                if (!alive[a]) continue;
+                for (bb = a + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+                    double delta;
+                    if (!alive[bb]) continue;
+                    delta = dlt[(size_t)a][(size_t)bb];
+                    if (ver_a < 0 || delta < ver_delta) {
+                        ver_delta = delta;
+                        ver_a = a;
+                        ver_b = bb;
+                    }
+                }
+            }
+            if (ver_a == cand_a && ver_b == cand_b) {
+                best_a = cand_a;
+                best_b = cand_b;
+                best_delta = cand_delta;
+                break;
+            }
+            cand_a = ver_a;
+            cand_b = ver_b;
+            cand_delta = ver_delta;
         }
         if (best_a < 0) break;
         /* Merge best_b into best_a. */
@@ -878,22 +924,8 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         alive[best_b] = 0;
         total += best_delta;
         ncl--;
-        /* Refresh only the deltas that involve the survivor. */
-        for (a = 0; a < ZGEC_ENC_NCLASS; a++) {
-            int lo;
-            int hi;
-            if (a == best_a || !alive[a]) continue;
-            lo = (a < best_a) ? a : best_a;
-            hi = (a < best_a) ? best_a : a;
-            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)lo][(size_t)s] + work[(size_t)hi][(size_t)s];
-            }
-            dlt[(size_t)lo][(size_t)hi] =
-                zgec_class_entropy(merged,
-                                   ctot[(size_t)lo] + ctot[(size_t)hi]) -
-                cent[(size_t)lo] - cent[(size_t)hi];
-        }
+        /* No survivor-row refresh: survivor entries go stale and are
+         * recomputed lazily only when popped as candidates above. */
     }
     *bits_k1 = total;
     zgec_cluster_snapshot(members, nmem, alive, assign_out[0]);
@@ -910,8 +942,9 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
  * to mode 0. The map is emitted once per block; segments only pick
  * tables.
  * Cost note (P8): one 4*64*256-u32 histogram build plus 2 greedy
- * clusterings (each O(64^2*256) seed + 63 merges with one refreshed
- * row each). Once per block; acceptable next to parse/emit. */
+ * clusterings (each O(64^2*256) seed + 63 merges with lazy
+ * recompute-before-commit instead of a refreshed row each). Once per
+ * block; acceptable next to parse/emit. */
 static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
                                      const uint32_t *ll, size_t n_seq,
                                      uint8_t *mode_out, uint8_t *k_out,
