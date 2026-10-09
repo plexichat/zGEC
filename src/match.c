@@ -893,6 +893,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             uint32_t nmatch;
             uint32_t want;
             uint32_t nhit;
+            uint32_t cur4s;
             m->c_hs = h;
             m->c_flags |= 1u;
             mf_prefetch_bucket((const void *)b);
@@ -904,6 +905,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                                   (head - 1u) & (m->nlanes - 1u));
             nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
             nhit = (nmatch < want) ? nmatch : want;
+            cur4s = zgec_rd32(vb + ip); /* need >= 4 above, so ip + 4 <= vb_size */
             /* The live entries walk backwards from the newest lane: the
              * ring head points one past the most recent write.
              *
@@ -943,6 +945,14 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     d = (uint32_t)(ip - (size_t)pos);
                     /* Assert-style: d <= ip < vb_size <= vb_capacity. */
                     assert((size_t)d <= m->vb_capacity);
+                    /* A len >= 5 match implies a first-4-byte match, so the
+                     * 4-byte screen the rep path uses skips hopeless hash
+                     * candidates before any length work. The pos + 4 guard
+                     * keeps the read in bounds locally. */
+                    if ((size_t)pos + (size_t)4 <= m->vb_size &&
+                        zgec_rd32(vb + (size_t)pos) != cur4s) {
+                        continue;
+                    }
                     /* A candidate can only beat `best` if it matches at
                      * best.length - 1 as well; one byte compare there skips
                      * the length scan for the candidates that cannot. */
