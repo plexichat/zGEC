@@ -874,7 +874,12 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * scalar, so there is no 128-bit tag compare here. The returned hit
      * mask is then rotated so a count-leading-zeros walk visits the hit
      * lanes in newest-first order, and an empty mask simply ends the loop
-     * after zero iterations. */
+     * after zero iterations.
+     *
+     * A rep or long-table match of 32 bytes or more already captures the
+     * bulk of the available gain; scoring the short bucket then rarely
+     * changes the parse, so it is skipped. */
+    if (best.length < 32u) {
     {
         size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
                                    : (size_t)ZGEC_MF_HASH_BYTES;
@@ -953,6 +958,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 }
             }
         }
+    }
     }
     return best;
 }
