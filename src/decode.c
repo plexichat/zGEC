@@ -319,6 +319,17 @@ static void dec_cache_put(zgec_decoder *d, zgec_dict *nd)
  * parameters (k depends on lit_form), so REPEAT/NEW/RLE extents
  * are known before the stream-size varints are read. */
 
+/* One parsed NEW table description (counts sized for literals, the
+ * largest alphabet; seq tables use the ZGEC_NSYM_SEQ prefix). */
+typedef struct zgec_new_desc {
+    int16_t counts[ZGEC_NSYM_LIT];
+    int nsym;
+    int al;
+    size_t len; /* descriptor byte length */
+    int max_nsym;
+    int need_lit;
+} new_desc_t;
+
 typedef struct {
     uint8_t seg_flags;
     uint8_t tbl_modes;
@@ -338,7 +349,60 @@ typedef struct {
     int k;
     int ctx_mode;
     const uint8_t *class_map; /* NULL when k == 1 */
+    /* Parsed NEW descriptors (P3a): the sizing walk parses each NEW
+     * description once and stashes its counts here; seg_tables_build
+     * consumes them in order instead of re-running
+     * zgec_fse_read_counts. RLE/REPEAT descriptors add no entry. */
+    new_desc_t *new_descs;
+    uint16_t n_new;
+    uint16_t cap_new;
 } seg_hdr_t;
+
+/* Release a header's cached NEW descriptors (idempotent; scalars kept). */
+static void seg_hdr_free_descs(seg_hdr_t *h)
+{
+    if (h == NULL) return;
+    zgec_free(h->new_descs);
+    h->new_descs = NULL;
+    h->n_new = 0;
+    h->cap_new = 0;
+}
+
+/* Append one parsed NEW description to the header cache. */
+static zgec_err seg_hdr_push_new(seg_hdr_t *h, const int16_t *counts, int nsym,
+                                 int al, size_t len, int max_nsym,
+                                 int need_lit)
+{
+    new_desc_t *nb;
+    uint16_t ncap;
+    if (h == NULL || counts == NULL) return ZGEC_ERR_INVAL;
+    if (h->n_new < h->cap_new) {
+        nb = h->new_descs;
+    } else {
+        /* At most 9 lit + 3 ll + 1 ml + 3 of = 16 NEW descriptors. */
+        ncap = (h->cap_new == 0u) ? 2u : (uint16_t)(h->cap_new * 2u);
+        if (ncap > 16u) ncap = 16u;
+        if (h->n_new >= ncap) return ZGEC_ERR_INTERNAL;
+        nb = (new_desc_t *)zgec_alloc((size_t)ncap * sizeof(*nb),
+                                      _Alignof(new_desc_t));
+        if (nb == NULL) return ZGEC_ERR_NOMEM;
+        if (h->new_descs != NULL) {
+            memcpy(nb, h->new_descs, (size_t)h->n_new * sizeof(*nb));
+            zgec_free(h->new_descs);
+        }
+        h->new_descs = nb;
+        h->cap_new = ncap;
+    }
+    memcpy(h->new_descs[h->n_new].counts, counts,
+           sizeof(h->new_descs[h->n_new].counts));
+    h->new_descs[h->n_new].nsym = nsym;
+    h->new_descs[h->n_new].al = al;
+    h->new_descs[h->n_new].len = len;
+    h->new_descs[h->n_new].max_nsym = max_nsym;
+    h->new_descs[h->n_new].need_lit = need_lit;
+    h->n_new++;
+    return ZGEC_OK;
+}
 
 /* Peek the accuracy log of one FSE description (1st byte). */
 static zgec_err desc_peek_al(const uint8_t *p, size_t rem, int need_lit,
@@ -360,24 +424,28 @@ static zgec_err desc_peek_al(const uint8_t *p, size_t rem, int need_lit,
     return ZGEC_OK;
 }
 
-/* Measure one NEW FSE description; returns its byte length. */
-static zgec_err desc_measure_new(size_t *len_out, const uint8_t *p, size_t rem,
-                                  int max_nsym, int need_lit, int *al_out)
+/* Parse one NEW FSE description once (P3a sizing pass); returns its byte
+ * length and caches the counts on the header for seg_tables_build. */
+static zgec_err desc_parse_new(seg_hdr_t *h, const uint8_t *p, size_t rem,
+                               int max_nsym, int need_lit, int *al_out)
 {
-    int16_t tmp[ZGEC_NSYM_LIT];
+    int16_t counts[ZGEC_NSYM_LIT];
     int nsym = 0;
     int al = 0;
     size_t n;
-    zgec_err e = desc_peek_al(p, rem, need_lit, &al);
+    zgec_err e;
+    if (h == NULL || al_out == NULL) return ZGEC_ERR_INVAL;
+    e = desc_peek_al(p, rem, need_lit, &al);
     if (e != ZGEC_OK) return e;
-    n = zgec_fse_read_counts(tmp, &nsym, &al, max_nsym, p, rem);
+    n = zgec_fse_read_counts(counts, &nsym, &al, max_nsym, p, rem);
     if (n == 0) return ZGEC_ERR_FSE_COUNTS;
     if (need_lit) {
         if (al != ZGEC_LIT_AL) return ZGEC_ERR_FSE_AL;
     } else {
         if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
     }
-    *len_out = n;
+    e = seg_hdr_push_new(h, counts, nsym, al, n, max_nsym, need_lit);
+    if (e != ZGEC_OK) return e;
     *al_out = al;
     return ZGEC_OK;
 }
@@ -400,7 +468,6 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
     int i;
     int al0 = 0;
     int alx = 0;
-    size_t dl = 0;
     zgec_err e;
 
     if (!h || !buf || !bp) return ZGEC_ERR_INVAL;
@@ -463,11 +530,11 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
             return ZGEC_ERR_TABLE_MODE; /* no RLE literal tables */
         } else {
             for (i = 0; i < n_lit_tables; i++) {
-                e = desc_measure_new(&dl, buf + pos + dpos, avail - dpos,
-                                     ZGEC_NSYM_LIT, 1, &al0);
-                if (e != ZGEC_OK) return e;
-                dpos += dl;
-                if (dpos > avail) return ZGEC_ERR_TRUNCATED;
+                e = desc_parse_new(h, buf + pos + dpos, avail - dpos,
+                                   ZGEC_NSYM_LIT, 1, &al0);
+                if (e != ZGEC_OK) { seg_hdr_free_descs(h); return e; }
+                dpos += h->new_descs[h->n_new - 1].len;
+                if (dpos > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
             }
         }
     }
@@ -481,13 +548,13 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
         } else if (ll_mode == ZGEC_TBL_NEW) {
             al0 = 0;
             for (i = 0; i < n_ll; i++) {
-                e = desc_measure_new(&dl, buf + pos + dpos, avail - dpos,
-                                     ZGEC_NSYM_SEQ, 0, &alx);
-                if (e != ZGEC_OK) return e;
+                e = desc_parse_new(h, buf + pos + dpos, avail - dpos,
+                                   ZGEC_NSYM_SEQ, 0, &alx);
+                if (e != ZGEC_OK) { seg_hdr_free_descs(h); return e; }
                 if (i == 0) al0 = alx;
-                else if (alx != al0) return ZGEC_ERR_FSE_AL; /* same AL */
-                dpos += dl;
-                if (dpos > avail) return ZGEC_ERR_TRUNCATED;
+                else if (alx != al0) { seg_hdr_free_descs(h); return ZGEC_ERR_FSE_AL; } /* same AL */
+                dpos += h->new_descs[h->n_new - 1].len;
+                if (dpos > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
             }
         }
         if (ml_mode == ZGEC_TBL_RLE) {
@@ -495,11 +562,11 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
             if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL; /* V6 */
             dpos += 1;
         } else if (ml_mode == ZGEC_TBL_NEW) {
-            e = desc_measure_new(&dl, buf + pos + dpos, avail - dpos,
-                                 ZGEC_NSYM_SEQ, 0, &al0);
-            if (e != ZGEC_OK) return e;
-            dpos += dl;
-            if (dpos > avail) return ZGEC_ERR_TRUNCATED;
+            e = desc_parse_new(h, buf + pos + dpos, avail - dpos,
+                               ZGEC_NSYM_SEQ, 0, &al0);
+            if (e != ZGEC_OK) { seg_hdr_free_descs(h); return e; }
+            dpos += h->new_descs[h->n_new - 1].len;
+            if (dpos > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
         }
         if (of_mode == ZGEC_TBL_RLE) {
             if (dpos + 1 > avail) return ZGEC_ERR_TRUNCATED;
@@ -508,13 +575,13 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
         } else if (of_mode == ZGEC_TBL_NEW) {
             al0 = 0;
             for (i = 0; i < n_of; i++) {
-                e = desc_measure_new(&dl, buf + pos + dpos, avail - dpos,
-                                     ZGEC_NSYM_SEQ, 0, &alx);
-                if (e != ZGEC_OK) return e;
+                e = desc_parse_new(h, buf + pos + dpos, avail - dpos,
+                                   ZGEC_NSYM_SEQ, 0, &alx);
+                if (e != ZGEC_OK) { seg_hdr_free_descs(h); return e; }
                 if (i == 0) al0 = alx;
-                else if (alx != al0) return ZGEC_ERR_FSE_AL; /* same AL */
-                dpos += dl;
-                if (dpos > avail) return ZGEC_ERR_TRUNCATED;
+                else if (alx != al0) { seg_hdr_free_descs(h); return ZGEC_ERR_FSE_AL; } /* same AL */
+                dpos += h->new_descs[h->n_new - 1].len;
+                if (dpos > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
             }
         }
     }
@@ -523,16 +590,16 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
     pos += dpos;
 
     n = zgec_varint_decode(buf + pos, size - pos, &h->lit_size);
-    if (n == 0) return ZGEC_ERR_VARINT; /* V8 */
+    if (n == 0) { seg_hdr_free_descs(h); return ZGEC_ERR_VARINT; } /* V8 */
     pos += n;
     n = zgec_varint_decode(buf + pos, size - pos, &h->ll_size);
-    if (n == 0) return ZGEC_ERR_VARINT;
+    if (n == 0) { seg_hdr_free_descs(h); return ZGEC_ERR_VARINT; }
     pos += n;
     n = zgec_varint_decode(buf + pos, size - pos, &h->ml_size);
-    if (n == 0) return ZGEC_ERR_VARINT;
+    if (n == 0) { seg_hdr_free_descs(h); return ZGEC_ERR_VARINT; }
     pos += n;
     n = zgec_varint_decode(buf + pos, size - pos, &h->of_size);
-    if (n == 0) return ZGEC_ERR_VARINT;
+    if (n == 0) { seg_hdr_free_descs(h); return ZGEC_ERR_VARINT; }
     pos += n;
     h->header_size = pos;
 
@@ -542,57 +609,99 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
     if ((uint64_t)h->lit_size > (uint64_t)size ||
         (uint64_t)h->ll_size > (uint64_t)size ||
         (uint64_t)h->ml_size > (uint64_t)size ||
-        (uint64_t)h->of_size > (uint64_t)size)
+        (uint64_t)h->of_size > (uint64_t)size) {
+        seg_hdr_free_descs(h);
         return ZGEC_ERR_STREAM_SIZE;
+    }
 
     if (h->n_seq == 0) {
-        if (h->ll_size != 0 || h->ml_size != 0 || h->of_size != 0)
+        if (h->ll_size != 0 || h->ml_size != 0 || h->of_size != 0) {
+            seg_hdr_free_descs(h);
             return ZGEC_ERR_STREAM_SIZE; /* V8 */
+        }
     }
-    if (h->n_lit == 0 && h->lit_size != 0) return ZGEC_ERR_STREAM_SIZE; /* V8 */
-    if (h->lit_coder == 0 && h->lit_size != h->n_lit) return ZGEC_ERR_STREAM_SIZE;
+    if (h->n_lit == 0 && h->lit_size != 0) { seg_hdr_free_descs(h); return ZGEC_ERR_STREAM_SIZE; } /* V8 */
+    if (h->lit_coder == 0 && h->lit_size != h->n_lit) { seg_hdr_free_descs(h); return ZGEC_ERR_STREAM_SIZE; }
     return ZGEC_OK;
 }
 
-/* Build one NEW FSE table from the descriptor at *pp (advances it). */
-static zgec_err build_new_fse(zgec_fse_dec_table **out, const uint8_t **pp,
-                               size_t *rem, int max_nsym, int need_lit)
+/* Cursor over the header's cached NEW descriptors (build pass). */
+typedef struct {
+    const new_desc_t *arr;
+    uint16_t n;
+    uint16_t pos;
+} new_desc_cursor_t;
+
+/* Take the next cached NEW descriptor; re-checks the AL so a corrupt or
+ * mismatched header fails here rather than building a wrong table. */
+static zgec_err take_new_desc(new_desc_cursor_t *c, int max_nsym, int need_lit,
+                              int *nsym_out, int *al_out,
+                              const int16_t **counts_out, size_t *len_out)
 {
-    int16_t counts[ZGEC_NSYM_LIT];
+    const new_desc_t *d;
+    if (c == NULL || nsym_out == NULL || al_out == NULL ||
+        counts_out == NULL || len_out == NULL)
+        return ZGEC_ERR_INVAL;
+    if (c->pos >= c->n) return ZGEC_ERR_TRUNCATED;
+    d = &c->arr[c->pos];
+    if (d->max_nsym != max_nsym || d->need_lit != need_lit)
+        return ZGEC_ERR_INTERNAL;
+    if (need_lit) {
+        if (d->al != ZGEC_LIT_AL) return ZGEC_ERR_FSE_AL; /* V6 */
+    } else {
+        if (d->al < ZGEC_MIN_AL || d->al > ZGEC_MAX_AL)
+            return ZGEC_ERR_FSE_AL; /* V6 */
+    }
+    *nsym_out = d->nsym;
+    *al_out = d->al;
+    *counts_out = d->counts;
+    *len_out = d->len;
+    c->pos++;
+    return ZGEC_OK;
+}
+
+/* Build one NEW FSE table from the next cached descriptor (advances both
+ * the descriptor cursor and the byte stream). */
+static zgec_err build_new_fse(new_desc_cursor_t *c, zgec_fse_dec_table **out,
+                              const uint8_t **pp, size_t *rem,
+                              int max_nsym, int need_lit)
+{
+    const int16_t *counts = NULL;
     int nsym = 0;
     int al = 0;
-    size_t n;
+    size_t n = 0;
     zgec_err e;
     /* Literal tables always go through build_new_rans; the old need_lit
      * path built a rANS table only to discard it, so reject it outright. */
     if (need_lit) return ZGEC_ERR_TABLE_MODE;
-    e = desc_peek_al(*pp, *rem, 0, &al);
+    if (out == NULL || pp == NULL || rem == NULL) return ZGEC_ERR_INVAL;
+    e = take_new_desc(c, max_nsym, need_lit, &nsym, &al, &counts, &n);
     if (e != ZGEC_OK) return e;
-    n = zgec_fse_read_counts(counts, &nsym, &al, max_nsym, *pp, *rem);
-    if (n == 0) return ZGEC_ERR_FSE_COUNTS; /* V6 */
-    if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL; /* V6 */
+    if (n > *rem) return ZGEC_ERR_TRUNCATED;
     e = zgec_fse_build_dec(out, counts, ZGEC_NSYM_SEQ, al); /* V6 sum check */
     if (e != ZGEC_OK) return e;
+    (void)nsym;
     *pp += n;
     *rem -= n;
     return ZGEC_OK;
 }
 
-/* Build one NEW rANS literal table. */
-static zgec_err build_new_rans(zgec_rans_dec_table *out, const uint8_t **pp,
-                                size_t *rem)
+/* Build one NEW rANS literal table from the next cached descriptor. */
+static zgec_err build_new_rans(new_desc_cursor_t *c, zgec_rans_dec_table *out,
+                              const uint8_t **pp, size_t *rem)
 {
-    int16_t counts[ZGEC_NSYM_LIT];
+    const int16_t *counts = NULL;
     int nsym = 0;
     int al = 0;
-    size_t n;
-    zgec_err e = desc_peek_al(*pp, *rem, 1, &al);
+    size_t n = 0;
+    zgec_err e;
+    if (out == NULL || pp == NULL || rem == NULL) return ZGEC_ERR_INVAL;
+    e = take_new_desc(c, ZGEC_NSYM_LIT, 1, &nsym, &al, &counts, &n);
     if (e != ZGEC_OK) return e;
-    n = zgec_fse_read_counts(counts, &nsym, &al, ZGEC_NSYM_LIT, *pp, *rem);
-    if (n == 0) return ZGEC_ERR_FSE_COUNTS; /* V6 */
-    if (al != ZGEC_LIT_AL) return ZGEC_ERR_FSE_AL; /* V6 */
+    if (n > *rem) return ZGEC_ERR_TRUNCATED;
     e = zgec_rans_build_dec(out, counts);
     if (e != ZGEC_OK) return e;
+    (void)nsym;
     *pp += n;
     *rem -= n;
     return ZGEC_OK;
@@ -606,6 +715,7 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
 {
     const uint8_t *p;
     size_t rem;
+    new_desc_cursor_t dc;
     int lit_mode;
     int ll_mode;
     int ml_mode;
@@ -623,6 +733,9 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
     seg_tables_init(cur);
     p = seg_buf + h->desc_off;
     rem = h->desc_len;
+    dc.arr = h->new_descs;
+    dc.n = h->n_new;
+    dc.pos = 0;
     lit_mode = (int)(((unsigned)h->tbl_modes >> 0u) & 3u);
     ll_mode = (int)(((unsigned)h->tbl_modes >> 2u) & 3u);
     ml_mode = (int)(((unsigned)h->tbl_modes >> 4u) & 3u);
@@ -660,7 +773,7 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
             if (!cur->lit) return ZGEC_ERR_NOMEM;
             cur->n_lit_tbl = n_lit_tables;
             for (i = 0; i < n_lit_tables; i++) {
-                e = build_new_rans(&cur->lit[i], &p, &rem);
+                e = build_new_rans(&dc, &cur->lit[i], &p, &rem);
                 if (e != ZGEC_OK) return e;
             }
         }
@@ -715,7 +828,7 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
         int al0 = 0;
         for (i = 0; i < n_ll; i++) {
             int alx = 0;
-            e = build_new_fse(&cur->ll[i], &p, &rem, ZGEC_NSYM_SEQ, 0);
+            e = build_new_fse(&dc, &cur->ll[i], &p, &rem, ZGEC_NSYM_SEQ, 0);
             if (e != ZGEC_OK) return e;
             alx = cur->ll[i]->al;
             if (i == 0) al0 = alx;
@@ -755,7 +868,7 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
         cur->ml_al = 0;
     } else {
         cur->ml = NULL;
-        e = build_new_fse(&cur->ml, &p, &rem, ZGEC_NSYM_SEQ, 0);
+        e = build_new_fse(&dc, &cur->ml, &p, &rem, ZGEC_NSYM_SEQ, 0);
         if (e != ZGEC_OK) return e;
         cur->ml_rle = -1;
         cur->ml_al = cur->ml->al;
@@ -802,7 +915,7 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
         int al0 = 0;
         for (i = 0; i < n_of; i++) {
             int alx = 0;
-            e = build_new_fse(&cur->of[i], &p, &rem, ZGEC_NSYM_SEQ, 0);
+            e = build_new_fse(&dc, &cur->of[i], &p, &rem, ZGEC_NSYM_SEQ, 0);
             if (e != ZGEC_OK) return e;
             alx = cur->of[i]->al;
             if (i == 0) al0 = alx;
@@ -813,6 +926,7 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
         cur->of_al = al0;
     }
     cur->has_seq = 1;
+    if (dc.pos != dc.n) return ZGEC_ERR_INTERNAL; /* every NEW used once */
     if (rem != 0) return ZGEC_ERR_TRUNCATED; /* V8: exact descriptor use */
     return ZGEC_OK;
 }
@@ -1052,6 +1166,7 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     if (seg == NULL || seg_buf == NULL || hp == NULL || cur == NULL)
         return ZGEC_ERR_INVAL;
     h = *hp; /* shallow copy; class_map stays borrowed, read-only */
+    h.new_descs = NULL; h.n_new = 0; h.cap_new = 0; /* owned by caller */
     if (h.k > 1 && h.class_map == NULL) return ZGEC_ERR_INTERNAL;
     need_rs = (h.k > 1 && h.lit_coder != 0);
     memset(seg, 0, sizeof(*seg));
@@ -1394,9 +1509,10 @@ static zgec_err decode_segment(zgec_segment_arrays *seg,
     streams_total = (uint64_t)h.header_size + (uint64_t)h.lit_size +
                     (uint64_t)h.ll_size + (uint64_t)h.ml_size +
                     (uint64_t)h.of_size;
-    if (streams_total != (uint64_t)seg_size) return ZGEC_ERR_SEGMENT_SIZE;
-    if ((uint64_t)h.n_lit > (uint64_t)dir_raw_len) return ZGEC_ERR_RAW_LEN;
+    if (streams_total != (uint64_t)seg_size) { seg_hdr_free_descs(&h); return ZGEC_ERR_SEGMENT_SIZE; }
+    if ((uint64_t)h.n_lit > (uint64_t)dir_raw_len) { seg_hdr_free_descs(&h); return ZGEC_ERR_RAW_LEN; }
     e = seg_tables_build(cur, &h, seg_buf, seg_size, prev, is_first, 1);
+    seg_hdr_free_descs(&h);
     if (e != ZGEC_OK) return e;
     return decode_segment_streams(seg, seg_buf, seg_size, &h, cur,
                                   Ld, Ll, seg_out_start, dir_raw_len);
@@ -1762,6 +1878,7 @@ static zgec_err decode_segments_parallel(zgec_block_arrays *ba,
         return ZGEC_ERR_NOMEM;
     }
     memset(jobs, 0, n * sizeof(*jobs));
+    memset(hdrs, 0, n * sizeof(*hdrs));
     for (k = 0; k < n; k++) seg_tables_init(&tabs[k]);
 
     /* Serial header pass (cheap). */
@@ -1792,6 +1909,7 @@ static zgec_err decode_segments_parallel(zgec_block_arrays *ba,
                                        (k == 0u) ? NULL : &tabs[k - 1u],
                                        (k == 0u) ? 1 : 0,
                                        0);
+        seg_hdr_free_descs(&hdrs[k]);
         if (be != ZGEC_OK) {
             first = be;
             goto pdone;
@@ -1850,6 +1968,7 @@ static zgec_err decode_segments_parallel(zgec_block_arrays *ba,
 pdone:
     for (k = 0; k < n; k++) seg_tables_free(&tabs[k]);
     zgec_free(tabs);
+    for (k = 0; k < n; k++) seg_hdr_free_descs(&hdrs[k]);
     zgec_free(hdrs);
     zgec_free(jobs);
     zgec_free(ranges);
@@ -2123,10 +2242,12 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         if (e != ZGEC_OK) goto efail;
         if (h.lit_form != 0) { /* 6.3: plain only */
             e = ZGEC_ERR_LITREF_FORM;
+            seg_hdr_free_descs(&h);
             goto efail;
         }
         if (h.ctx_ll) { /* 6.3: no LL conditioning */
             e = ZGEC_ERR_LITREF_CTX;
+            seg_hdr_free_descs(&h);
             goto efail;
         }
         {
@@ -2135,11 +2256,13 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
                            (uint64_t)h.of_size;
             if (tot != (uint64_t)seg_size) {
                 e = ZGEC_ERR_SEGMENT_SIZE;
+                seg_hdr_free_descs(&h);
                 goto efail;
             }
         }
         e = seg_tables_build(&cur, &h, seg_buf, seg_size, &prev,
                              (i == 0) ? 1 : 0, 1);
+        seg_hdr_free_descs(&h);
         if (e != ZGEC_OK) goto efail;
         lit_stream = seg_buf + h.header_size;
         ll_stream = lit_stream + (size_t)h.lit_size;
