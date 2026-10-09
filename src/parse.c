@@ -524,14 +524,26 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         uint32_t cl = tl[hl];
         size_t cap = end - ip;
         size_t step;
-        uint32_t r0 = reps.rep[0];
 
-        /* 1. Repeat offset rep0 (4-byte minimum). */
-        if (r0 != 0u && (size_t)r0 <= ip && zgec_rd32(vb + ip - r0) == cur4) {
-            uint32_t len = fast_match_len(vb, ip, r0, cap);
-            if (len >= 4u) {
-                best_len = len;
-                best_off = r0;
+        /* 1. Repeat offsets rep0, rep1, rep2 (4-byte minimum). Probing the
+         * whole chain costs two extra 4-byte compares on the common path and
+         * recovers the ratio the repeat offsets carry on record, table and
+         * source data, where a single long-distance match repeats its offset
+         * many times. The move-to-front update below keeps the chain in step
+         * with the decoder exactly as the main tier's matcher does. */
+        {
+            uint32_t ri;
+            for (ri = 0; ri < 3u; ri++) {
+                uint32_t r = reps.rep[ri];
+                uint32_t len;
+                if (r == 0u || (size_t)r > ip) continue;
+                if (zgec_rd32(vb + ip - r) != cur4) continue;
+                len = fast_match_len(vb, ip, r, cap);
+                if (len >= 4u && (len > best_len ||
+                                  (len == best_len && r < best_off))) {
+                    best_len = len;
+                    best_off = r;
+                }
             }
         }
         /* 2. Long table. */
