@@ -179,12 +179,32 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     unsigned rem = 0u;
     for (unsigned lane = 0; lane < 8; lane++) if (len[lane] > full) rem++;
     zgec_err err = ZGEC_OK;
-    for (size_t round = 0; round < max_rounds && err == ZGEC_OK; round++) {
-        unsigned m = (round < full) ? 8u : rem;
-        for (unsigned lane = 0; lane < m; lane++) {
-            size_t j = start[lane] + round;
-            unsigned ti = 0u;
-            if (k > 1) {
+    if (k == 1) {
+        for (size_t round = 0; round < max_rounds && err == ZGEC_OK; round++) {
+            unsigned m = (round < full) ? 8u : rem;
+            for (unsigned lane = 0; lane < m; lane++) {
+                size_t j = start[lane] + round;
+                uint32_t x = state[lane];
+                uint32_t e = pk[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                uint32_t f = (e >> 8) & 0xFFFu;
+                if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                Z[j] = (uint8_t)e;
+                x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+                if (x < ZGEC_RANS_STATE_MIN) {
+                    if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
+                    x = (x << 16) | zgec_rd16(cursor);
+                    cursor += 2;
+                    remaining -= 2;
+                }
+                state[lane] = x;
+            }
+        }
+    } else {
+        for (size_t round = 0; round < max_rounds && err == ZGEC_OK; round++) {
+            unsigned m = (round < full) ? 8u : rem;
+            for (unsigned lane = 0; lane < m; lane++) {
+                size_t j = start[lane] + round;
+                unsigned ti = 0u;
                 if (j == start[lane] || runstart[j]) {
                     ti = (unsigned)k;   /* run-start table */
                 } else {
@@ -192,20 +212,20 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                     if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
                     ti = pidx;
                 }
+                uint32_t x = state[lane];
+                uint32_t e = pk[(size_t)ti * ZGEC_RANS_M + (x & (uint32_t)(ZGEC_RANS_M - 1))];
+                uint32_t f = (e >> 8) & 0xFFFu;
+                if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                Z[j] = (uint8_t)e;
+                x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+                if (x < ZGEC_RANS_STATE_MIN) {
+                    if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
+                    x = (x << 16) | zgec_rd16(cursor);
+                    cursor += 2;
+                    remaining -= 2;
+                }
+                state[lane] = x;
             }
-            uint32_t x = state[lane];
-            uint32_t e = pk[(size_t)ti * ZGEC_RANS_M + (x & (uint32_t)(ZGEC_RANS_M - 1))];
-            uint32_t f = (e >> 8) & 0xFFFu;
-            if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
-            Z[j] = (uint8_t)e;
-            x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-            if (x < ZGEC_RANS_STATE_MIN) {
-                if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
-                x = (x << 16) | zgec_rd16(cursor);
-                cursor += 2;
-                remaining -= 2;
-            }
-            state[lane] = x;
         }
     }
 
@@ -262,13 +282,49 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     size_t max_rounds = 0;
     for (unsigned lane = 0; lane < 8; lane++)
         if (len[lane] > max_rounds) max_rounds = len[lane];
-    for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
-        size_t round = round_p1 - 1;
-        for (int lane = 7; lane >= 0; lane--) {
-            if (round >= len[lane]) continue;
-            size_t j = start[lane] + round;
-            int table_idx = 0;
-            if (k > 1) {
+    if (k == 1) {
+        const zgec_rans_enc_table *tab = &tables[0];
+        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+            size_t round = round_p1 - 1;
+            for (int lane = 7; lane >= 0; lane--) {
+                if (round >= len[lane]) continue;
+                size_t j = start[lane] + round;
+                uint8_t s = Z[j];
+                uint64_t f = tab->f[s];
+                if (f == 0) { zgec_free(words); return 0; }
+                uint64_t xmax = f << 21;
+                uint32_t x = state[lane];
+                if ((uint64_t)x >= xmax) {
+                    if (nwords >= words_cap) { zgec_free(words); return 0; }
+                    words[nwords++] = (uint16_t)(x & 0xFFFFu);
+                    x >>= 16;
+                }
+                uint32_t recip = tab->f_recip[s];
+                uint32_t quo;
+                int64_t rems;
+                if (f == 1u) {
+                    quo = x;
+                    rems = 0;
+                } else {
+                    uint64_t prod = (uint64_t)x * (uint64_t)recip;
+                    quo = (uint32_t)(prod >> 32);
+                    rems = (int64_t)x - (int64_t)quo * (int64_t)f;
+                    if (rems < 0) {
+                        quo--;
+                        rems += (int64_t)f;
+                    }
+                }
+                x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+                state[lane] = x;
+            }
+        }
+    } else {
+        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+            size_t round = round_p1 - 1;
+            for (int lane = 7; lane >= 0; lane--) {
+                if (round >= len[lane]) continue;
+                size_t j = start[lane] + round;
+                int table_idx = 0;
                 if (j >= n_lit) { zgec_free(words); return 0; }
                 if (j == start[lane] || runstart[j]) {
                     table_idx = k;
@@ -279,43 +335,35 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     table_idx = (int)class_map[cls];
                 }
                 if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
-            }
-            const zgec_rans_enc_table *tab = &tables[table_idx];
-            uint8_t s = Z[j];
-            uint64_t f = tab->f[s];
-            if (f == 0) { zgec_free(words); return 0; }
-            uint64_t xmax = f << 21;
-            uint32_t x = state[lane];
-            if ((uint64_t)x >= xmax) {
-                if (nwords >= words_cap) { zgec_free(words); return 0; }
-                words[nwords++] = (uint16_t)(x & 0xFFFFu);
-                x >>= 16;
-            }
-            uint32_t recip = tab->f_recip[s];
-            /* Annex B.2: x = (x / f) << 11 | (x % f) + c.
-             * A hardware divide per literal was the most expensive
-             * instruction in this loop. After the renormalisation above,
-             * x < f << 21 <= 2^32 and f <= ZGEC_RANS_M, so with
-             * recip = floor(2^32 / f) + 1 the value floor(x * recip /
-             * 2^32) is either floor(x/f) or floor(x/f) + 1; one
-             * correction step makes quo and rems exact. f == 1 has no
-             * 32-bit reciprocal and is handled directly. */
-            uint32_t quo;
-            int64_t rems;
-            if (f == 1u) {
-                quo = x;
-                rems = 0;
-            } else {
-                uint64_t prod = (uint64_t)x * (uint64_t)recip;
-                quo = (uint32_t)(prod >> 32);
-                rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-                if (rems < 0) {
-                    quo--;
-                    rems += (int64_t)f;
+                const zgec_rans_enc_table *tab = &tables[table_idx];
+                uint8_t s = Z[j];
+                uint64_t f = tab->f[s];
+                if (f == 0) { zgec_free(words); return 0; }
+                uint64_t xmax = f << 21;
+                uint32_t x = state[lane];
+                if ((uint64_t)x >= xmax) {
+                    if (nwords >= words_cap) { zgec_free(words); return 0; }
+                    words[nwords++] = (uint16_t)(x & 0xFFFFu);
+                    x >>= 16;
                 }
+                uint32_t recip = tab->f_recip[s];
+                uint32_t quo;
+                int64_t rems;
+                if (f == 1u) {
+                    quo = x;
+                    rems = 0;
+                } else {
+                    uint64_t prod = (uint64_t)x * (uint64_t)recip;
+                    quo = (uint32_t)(prod >> 32);
+                    rems = (int64_t)x - (int64_t)quo * (int64_t)f;
+                    if (rems < 0) {
+                        quo--;
+                        rems += (int64_t)f;
+                    }
+                }
+                x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+                state[lane] = x;
             }
-            x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
-            state[lane] = x;
         }
     }
 
@@ -375,6 +423,20 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
         }
     }
 
+    if (n_tables == 1) {
+        size_t i = 0;
+        for (; i + 4 <= n_lit; i += 4) {
+            tables_counts[Z[i]]++;
+            tables_counts[Z[i + 1]]++;
+            tables_counts[Z[i + 2]]++;
+            tables_counts[Z[i + 3]]++;
+        }
+        for (; i < n_lit; i++) {
+            tables_counts[Z[i]]++;
+        }
+        return;
+    }
+
     size_t start[8];
     size_t len[8];
     zgec_lit_lane_geom(start, len, n_lit);
@@ -383,17 +445,15 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
         for (size_t t = 0; t < len[lane]; t++) {
             size_t j = start[lane] + t;
             int table_idx = 0;
-            if (n_tables > 1) {
-                if (j >= n_lit) return;
-                if (j == start[lane] || runstart[j]) {
-                    table_idx = n_tables - 1;
-                } else {
-                    unsigned cls = zgec_classify(ctx_mode, Z[j - 1]);
-                    if (cls >= 64u) return;
-                    table_idx = (int)class_map[cls];
-                }
-                if (table_idx < 0 || table_idx >= n_tables) return;
+            if (j >= n_lit) return;
+            if (j == start[lane] || runstart[j]) {
+                table_idx = n_tables - 1;
+            } else {
+                unsigned cls = zgec_classify(ctx_mode, Z[j - 1]);
+                if (cls >= 64u) return;
+                table_idx = (int)class_map[cls];
             }
+            if (table_idx < 0 || table_idx >= n_tables) return;
             tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
         }
     }
