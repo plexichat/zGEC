@@ -933,21 +933,15 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
 
 /* ---- sequence stream helpers (sections 8.4/8.5, V5) ---- */
 
-static zgec_err check_stream_sentinel(const uint8_t *s, size_t n)
-{
-    /* Shared V5 sentinel check (see zgec_internal.h). */
-    return zgec_check_stream_sentinel(s, n);
-}
-
 /* Single-table (or RLE) stream decode with V5 checks. */
 static zgec_err seq_decode_one(uint32_t *out, size_t n,
                                 zgec_fse_dec_table *t, int rle,
                                 const uint8_t *stream, size_t ssize)
 {
     zgec_br br;
-    zgec_err e = check_stream_sentinel(stream, ssize);
-    if (e != ZGEC_OK) return e;
-    zgec_br_init(&br, stream, ssize);
+    if (stream == NULL && ssize > 0) return ZGEC_ERR_TRUNCATED;
+    if (ssize == 0) return ZGEC_ERR_STREAM_SIZE;
+    zgec_br_init(&br, stream, ssize); /* fused V5 sentinel: last byte nonzero */
     if (br.overflow) return ZGEC_ERR_BITSTREAM_SENTINEL;
     if (rle >= 0)
         return zgec_seq_stream_decode(out, n, NULL, rle, &br,
@@ -986,8 +980,8 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     const uint8_t *ptr;
     size_t left;
     uint8_t *clsbuf = NULL;
-    zgec_err e = check_stream_sentinel(stream, ssize);
-    if (e != ZGEC_OK) return e;
+    if (stream == NULL && ssize > 0) return ZGEC_ERR_TRUNCATED;
+    if (ssize == 0) return ZGEC_ERR_STREAM_SIZE;
     if (!t[0] || !t[1] || !t[2]) return ZGEC_ERR_TABLE_MODE;
     if (!out || !ml) return ZGEC_ERR_INVAL;
     al = t[0]->al;
