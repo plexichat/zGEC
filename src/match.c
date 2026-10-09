@@ -197,6 +197,8 @@ struct zgec_matcher {
     uint8_t       *short_head;  /* per-bucket next write lane (ring) */
     uint32_t      *long_tab;    /* long_buckets entries */
     int            is_binary;   /* short hash uses 4 bytes */
+    uint32_t       probe_depth;
+    uint32_t       hash_bytes;
     size_t         vb_capacity; /* maximum referenceable offset */
     const uint8_t *vb;
     size_t         vb_size;
@@ -367,53 +369,44 @@ static inline __attribute__((always_inline)) uint32_t mf_len8(const uint8_t *src
  * cap. The caller guarantees d <= ip and
  * cap <= vb_size - ip, so neither side reads past the
  * virtual buffer. */
-static uint32_t mf_match_len_slow(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
+static uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32_t cap)
 {
-    const uint8_t *src = vb + ip - (size_t)d;
-    const uint8_t *dst = vb + ip;
-    uint32_t len = 0;
-    if (cap >= 8u) {
-        uint32_t first = mf_len8(src, dst);
-        if (first < 8u) {
-            return first;
-        }
-        len = 8u;
+    uint32_t len = 8u;
 #if defined(__AVX2__)
-        /* Extend beyond the first 8 bytes 32 at a time; a 32-byte
-         * movemask finds the first differing byte directly. */
-        while (len + 32u <= cap) {
-            __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(src + len));
-            __m256i b32 = _mm256_loadu_si256((const __m256i *)(const void *)(dst + len));
-            unsigned m32 = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b32));
-            if (m32 != 0xFFFFFFFFu) {
-                return len + (uint32_t)__builtin_ctz(~m32);
-            }
-            len += 32u;
+    /* Extend beyond the first 8 bytes 32 at a time; a 32-byte
+     * movemask finds the first differing byte directly. */
+    while (len + 32u <= cap) {
+        __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(src + len));
+        __m256i b32 = _mm256_loadu_si256((const __m256i *)(const void *)(dst + len));
+        unsigned m32 = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, b32));
+        if (m32 != 0xFFFFFFFFu) {
+            return len + (uint32_t)__builtin_ctz(~m32);
         }
+        len += 32u;
+    }
 #else
-        /* Extend beyond 8 bytes with wide compares in
-         * a loop that normally runs once. */
-        while (len + 32u <= cap) {
-            uint64_t d0 = (uint64_t)zgec_rd64(src + (size_t)len) ^
-                          (uint64_t)zgec_rd64(dst + (size_t)len);
-            uint64_t d1 = (uint64_t)zgec_rd64(src + (size_t)len + (size_t)8) ^
-                          (uint64_t)zgec_rd64(dst + (size_t)len + (size_t)8);
-            uint64_t d2 = (uint64_t)zgec_rd64(src + (size_t)len + (size_t)16) ^
-                          (uint64_t)zgec_rd64(dst + (size_t)len + (size_t)16);
-            uint64_t d3 = (uint64_t)zgec_rd64(src + (size_t)len + (size_t)24) ^
-                          (uint64_t)zgec_rd64(dst + (size_t)len + (size_t)24);
-            if ((d0 | d1 | d2 | d3) != (uint64_t)0) {
-                break;
-            }
-            len += 32u;
+    /* Extend beyond 8 bytes with wide compares in
+     * a loop that normally runs once. */
+    while (len + 32u <= cap) {
+        uint64_t d0 = (uint64_t)zgec_rd64(src + (size_t)len) ^
+                      (uint64_t)zgec_rd64(dst + (size_t)len);
+        uint64_t d1 = (uint64_t)zgec_rd64(src + (size_t)len + (size_t)8) ^
+                      (uint64_t)zgec_rd64(dst + (size_t)len + (size_t)8);
+        uint64_t d2 = (uint64_t)zgec_rd64(src + (size_t)len + (size_t)16) ^
+                      (uint64_t)zgec_rd64(dst + (size_t)len + (size_t)16);
+        uint64_t d3 = (uint64_t)zgec_rd64(src + (size_t)len + (size_t)24) ^
+                      (uint64_t)zgec_rd64(dst + (size_t)len + (size_t)24);
+        if ((d0 | d1 | d2 | d3) != (uint64_t)0) {
+            break;
         }
+        len += 32u;
+    }
 #endif
-        while (len + 8u <= cap) {
-            if (zgec_rd64(src + (size_t)len) != zgec_rd64(dst + (size_t)len)) {
-                break;
-            }
-            len += 8u;
+    while (len + 8u <= cap) {
+        if (zgec_rd64(src + (size_t)len) != zgec_rd64(dst + (size_t)len)) {
+            break;
         }
+        len += 8u;
     }
     while (len < cap && src[len] == dst[len]) {
         len++;
@@ -425,17 +418,24 @@ static uint32_t mf_match_len_slow(const uint8_t *vb, size_t ip, uint32_t d, uint
  * bytes are the overwhelmingly common case -- a source tree's matches are
  * about seven bytes long -- so they are compared here, inline, and only a
  * match that survives them pays for the wide-compare loop above. The
- * precondition is mf_match_len_slow's: d <= ip and cap <= vb_size - ip. */
+ * precondition is d <= ip and cap <= vb_size - ip. */
 static inline __attribute__((always_inline))
 uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
 {
+    const uint8_t *src = vb + ip - (size_t)d;
+    const uint8_t *dst = vb + ip;
     if (cap >= 8u) {
-        uint32_t first = mf_len8(vb + ip - (size_t)d, vb + ip);
+        uint32_t first = mf_len8(src, dst);
         if (first < 8u) {
             return first;
         }
+        return mf_match_len_slow(src, dst, cap);
     }
-    return mf_match_len_slow(vb, ip, d, cap);
+    uint32_t len = 0;
+    while (len < cap && src[len] == dst[len]) {
+        len++;
+    }
+    return len;
 }
 
 /* Hit mask of the short bucket: bit `lane` is set when entry `lane`
@@ -460,7 +460,7 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes)
     __m256i posmask = _mm256_set1_epi32((int)ZGEC_MF_POS_MASK);
     __m256i zero = _mm256_setzero_si256();
     for (; lane + 8u <= nlanes; lane += 8u) {
-        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(b + lane));
+        __m256i v = _mm256_load_si256((const __m256i *)(const void *)(b + lane));
         __m256i eq = _mm256_cmpeq_epi32(_mm256_and_si256(v, tagmask), tagv);
         __m256i pos = _mm256_and_si256(v, posmask);
         __m256i nz = _mm256_cmpeq_epi32(pos, zero);
@@ -522,21 +522,25 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
         m->nbuckets = ZGEC_MF_FAST_BUCKETS;
         m->nlanes = ZGEC_MF_FAST_LANES;
         m->long_buckets = ZGEC_MF_FAST_LONG_BUCKETS;
+        m->probe_depth = ZGEC_MF_PROBE_DEPTH_FAST;
         break;
     case ZGEC_TIER_MAIN:
         m->nbuckets = ZGEC_MF_MAIN_BUCKETS;
         m->nlanes = ZGEC_MF_MAIN_LANES;
         m->long_buckets = ZGEC_MF_MAIN_LONG_BUCKETS;
+        m->probe_depth = ZGEC_MF_PROBE_DEPTH;
         break;
     case ZGEC_TIER_HIGH:
         m->nbuckets = ZGEC_MF_HIGH_BUCKETS;
         m->nlanes = ZGEC_MF_HIGH_LANES;
         m->long_buckets = ZGEC_MF_HIGH_LONG_BUCKETS;
+        m->probe_depth = ZGEC_MF_PROBE_DEPTH_HIGH;
         break;
     default:
         zgec_free(m);
         return NULL;
     }
+    m->hash_bytes = ZGEC_MF_HASH_BYTES;
     /* Buckets and lanes must be nonzero powers of two for the `- 1u` masks
      * and the ring indexing, and nlanes must fit the 32-bit lane hit mask. */
     if (!mf_is_pow2_u32(m->nbuckets) || !mf_is_pow2_u32(m->long_buckets) ||
@@ -682,6 +686,8 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
             cls_len = vb_size - dict_size;
         }
         m->is_binary = mf_classify_binary(vb ? vb + cls_off : NULL, cls_len);
+        m->hash_bytes = m->is_binary ? (uint32_t)ZGEC_MF_HASH_BYTES_BIN
+                                     : (uint32_t)ZGEC_MF_HASH_BYTES;
     }
     /* Section 11.8 intent: hash the dictionary once
      * into a table snapshot and copy it (memcpy)
@@ -834,8 +840,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * lanes in newest-first order, and an empty mask simply ends the loop
      * after zero iterations. */
     {
-        size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
-                                   : (size_t)ZGEC_MF_HASH_BYTES;
+        size_t need = (size_t)m->hash_bytes;
         if (ip + need <= m->vb_size && hash_min <= cap) {
             uint32_t h = mf_hash_short(m, vb, ip);
             uint32_t bucket = h & (m->nbuckets - 1u);
@@ -851,9 +856,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             mf_prefetch_bucket((const void *)b);
             mask = mf_bucket_hits(b, tag, m->nlanes);
             nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
-            want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
-                 : (m->tier == ZGEC_TIER_FAST) ? ZGEC_MF_PROBE_DEPTH_FAST
-                                               : ZGEC_MF_PROBE_DEPTH;
+            want = m->probe_depth;
             nhit = (nmatch < want) ? nmatch : want;
             head = (uint32_t)m->short_head[bucket];
             /* The live entries walk backwards from the newest lane: the
@@ -924,7 +927,7 @@ void zgec_matcher_prefetch(zgec_matcher *m, const uint8_t *vb, size_t ip)
     if (!m || !vb || vb != m->vb || !m->short_tab || !m->long_tab) {
         return;
     }
-    need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN : (size_t)ZGEC_MF_HASH_BYTES;
+    need = (size_t)m->hash_bytes;
     if (ip + need > m->vb_size) {
         return;
     }
@@ -983,7 +986,7 @@ void zgec_matcher_insert(zgec_matcher *m, const uint8_t *vb, size_t ip)
     }
     /* The position must fit the 24-bit field; the
      * short hash reads 5 bytes (4 for binary). */
-    need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN : (size_t)ZGEC_MF_HASH_BYTES;
+    need = (size_t)m->hash_bytes;
     if (ip >= (size_t)ZGEC_MF_POS_LIMIT || ip > m->vb_size || need > m->vb_size - ip) {
         return;
     }
@@ -1035,18 +1038,44 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
                            ? (size_t)ZGEC_MF_MATCH_SAMPLES_FAST
                            : (size_t)ZGEC_MF_MATCH_SAMPLES;
         size_t t;
-        size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
-                                   : (size_t)ZGEC_MF_HASH_BYTES;
+        size_t need = (size_t)m->hash_bytes;
         if (nsamp > len) nsamp = len;
         if (nsamp < 1u) nsamp = 1u;
-        for (t = 0; t < nsamp; t++) {
-            uint64_t off = (nsamp > 1u)
-                               ? ((uint64_t)(len - 1u) * (uint64_t)t /
-                                  (uint64_t)(nsamp - 1u))
-                               : 0u;
-            size_t pos = start + (size_t)off;
-            if (pos < m->vb_size && need <= m->vb_size - pos) {
-                mf_insert_pos(m, vb, pos);
+        if (nsamp == len) {
+            for (t = 0; t < nsamp; t++) {
+                size_t pos = start + t;
+                if (pos < m->vb_size && need <= m->vb_size - pos) {
+                    mf_insert_pos(m, vb, pos);
+                }
+            }
+        } else if (nsamp == 16u) {
+            uint64_t span = (uint64_t)(len - 1u);
+            for (t = 0; t < 16u; t++) {
+                uint64_t off = (span * (uint64_t)t) / 15u;
+                size_t pos = start + (size_t)off;
+                if (pos < m->vb_size && need <= m->vb_size - pos) {
+                    mf_insert_pos(m, vb, pos);
+                }
+            }
+        } else if (nsamp == 3u) {
+            uint64_t span = (uint64_t)(len - 1u);
+            for (t = 0; t < 3u; t++) {
+                uint64_t off = (span * (uint64_t)t) >> 1;
+                size_t pos = start + (size_t)off;
+                if (pos < m->vb_size && need <= m->vb_size - pos) {
+                    mf_insert_pos(m, vb, pos);
+                }
+            }
+        } else {
+            for (t = 0; t < nsamp; t++) {
+                uint64_t off = (nsamp > 1u)
+                                   ? ((uint64_t)(len - 1u) * (uint64_t)t /
+                                      (uint64_t)(nsamp - 1u))
+                                   : 0u;
+                size_t pos = start + (size_t)off;
+                if (pos < m->vb_size && need <= m->vb_size - pos) {
+                    mf_insert_pos(m, vb, pos);
+                }
             }
         }
     }
