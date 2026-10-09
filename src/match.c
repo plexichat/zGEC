@@ -449,11 +449,33 @@ uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
 /* Hit mask of the short bucket: bit `lane` is set when entry `lane`
  * carries the wanted 8-bit tag and is not the empty sentinel. AVX2
  * compares eight lanes at once (fast/main/high use 4/8/16); the
- * remaining lanes stay scalar. */
-static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes)
+ * remaining lanes stay scalar. `want` is the caller's probe depth and
+ * `newest` is the newest-lane index ((head - 1) & (nlanes - 1)): both
+ * only gate work, the accessed range stays b[0 .. nlanes) and the hit
+ * semantics are unchanged. */
+static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
+                               uint32_t want, uint32_t newest)
 {
+    uint32_t e0;
     uint32_t mask = 0u;
     uint32_t lane = 0u;
+    if (want == 0u) {
+        return 0u;
+    }
+    /* Newest-lane gate before any vector work: table memory starts zeroed
+     * and a packed entry is never zero (pos + 1 keeps a low bit set), so
+     * an empty newest lane means the bucket was never written and the
+     * full compare could only produce an empty mask. Otherwise pre-test
+     * the newest tag: with want == 1 only the newest hit is scored, so a
+     * newest hit returns its single bit without the vector compare; a
+     * newest miss still falls through to the full compare. */
+    e0 = b[newest];
+    if (e0 == 0u) {
+        return 0u;
+    }
+    if (want == 1u && (((e0 >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK) == tag)) {
+        return (uint32_t)1u << newest;
+    }
     if (nlanes < 8u) {
         for (; lane < nlanes; lane++) {
             uint32_t e = b[lane];
@@ -869,13 +891,14 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             m->c_hs = h;
             m->c_flags |= 1u;
             mf_prefetch_bucket((const void *)b);
-            mask = mf_bucket_hits(b, tag, m->nlanes);
-            nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
             want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
                  : (m->tier == ZGEC_TIER_FAST) ? ZGEC_MF_PROBE_DEPTH_FAST
                                                : ZGEC_MF_PROBE_DEPTH;
-            nhit = (nmatch < want) ? nmatch : want;
             head = (uint32_t)m->short_head[bucket];
+            mask = mf_bucket_hits(b, tag, m->nlanes, want,
+                                  (head - 1u) & (m->nlanes - 1u));
+            nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
+            nhit = (nmatch < want) ? nmatch : want;
             /* The live entries walk backwards from the newest lane: the
              * ring head points one past the most recent write.
              *
