@@ -601,7 +601,8 @@ static zgec_err build_new_rans(zgec_rans_dec_table *out, const uint8_t **pp,
 /* Build the table set for a segment; REPEAT clones the previous one. */
 static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
                                   const uint8_t *seg_buf, size_t seg_size,
-                                  const seg_tables *prev, int is_first)
+                                  const seg_tables *prev, int is_first,
+                                  int can_move)
 {
     const uint8_t *p;
     size_t rem;
@@ -635,11 +636,21 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
             if (prev->lit_form != h->lit_form || prev->lit_k != h->k)
                 return ZGEC_ERR_TABLE_INHERIT;
             if (prev->n_lit_tbl != n_lit_tables) return ZGEC_ERR_TABLE_INHERIT;
-            cur->lit = (zgec_rans_dec_table *)zgec_alloc(
-                (size_t)n_lit_tables * sizeof(zgec_rans_dec_table), 64);
-            if (!cur->lit) return ZGEC_ERR_NOMEM;
-            memcpy(cur->lit, prev->lit,
-                   (size_t)n_lit_tables * sizeof(zgec_rans_dec_table));
+            if (can_move) {
+                /* Serial path: transfer prev's lit tables to cur. prev is
+                 * retired the moment this segment finishes (the caller frees
+                 * it and rotates cur into prev), so nulling its pointer here
+                 * leaves exactly one owner and seg_tables_free(&prev) simply
+                 * skips lit. Saves the per-REPEAT alloc+memcpy+free. */
+                cur->lit = prev->lit;
+                ((seg_tables *)prev)->lit = NULL;
+            } else {
+                cur->lit = (zgec_rans_dec_table *)zgec_alloc(
+                    (size_t)n_lit_tables * sizeof(zgec_rans_dec_table), 64);
+                if (!cur->lit) return ZGEC_ERR_NOMEM;
+                memcpy(cur->lit, prev->lit,
+                       (size_t)n_lit_tables * sizeof(zgec_rans_dec_table));
+            }
             cur->n_lit_tbl = n_lit_tables;
         } else if (lit_mode == ZGEC_TBL_RLE) {
             return ZGEC_ERR_TABLE_MODE;
@@ -674,6 +685,11 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
             if (prev->ll_rle[i] >= 0) {
                 cur->ll_rle[i] = prev->ll_rle[i];
                 cur->ll[i] = NULL;
+            } else if (can_move) {
+                /* Serial path: transfer ownership of this ll table. */
+                cur->ll[i] = prev->ll[i];
+                ((seg_tables *)prev)->ll[i] = NULL;
+                cur->ll_rle[i] = -1;
             } else {
                 cur->ll[i] = fse_clone(prev->ll[i]);
                 if (!cur->ll[i]) return ZGEC_ERR_NOMEM;
@@ -716,6 +732,11 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
         if (prev->ml_rle >= 0) {
             cur->ml_rle = prev->ml_rle;
             cur->ml = NULL;
+        } else if (can_move) {
+            /* Serial path: transfer ownership of the ml table. */
+            cur->ml = prev->ml;
+            ((seg_tables *)prev)->ml = NULL;
+            cur->ml_rle = -1;
         } else {
             cur->ml = fse_clone(prev->ml);
             if (!cur->ml) return ZGEC_ERR_NOMEM;
@@ -751,6 +772,11 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
             if (prev->of_rle[i] >= 0) {
                 cur->of_rle[i] = prev->of_rle[i];
                 cur->of[i] = NULL;
+            } else if (can_move) {
+                /* Serial path: transfer ownership of this of table. */
+                cur->of[i] = prev->of[i];
+                ((seg_tables *)prev)->of[i] = NULL;
+                cur->of_rle[i] = -1;
             } else {
                 cur->of[i] = fse_clone(prev->of[i]);
                 if (!cur->of[i]) return ZGEC_ERR_NOMEM;
@@ -1261,7 +1287,7 @@ static zgec_err decode_segment(zgec_segment_arrays *seg,
                     (uint64_t)h.of_size;
     if (streams_total != (uint64_t)seg_size) return ZGEC_ERR_SEGMENT_SIZE;
     if ((uint64_t)h.n_lit > (uint64_t)dir_raw_len) return ZGEC_ERR_RAW_LEN;
-    e = seg_tables_build(cur, &h, seg_buf, seg_size, prev, is_first);
+    e = seg_tables_build(cur, &h, seg_buf, seg_size, prev, is_first, 1);
     if (e != ZGEC_OK) return e;
     return decode_segment_streams(seg, seg_buf, seg_size, &h, cur,
                                   Ld, Ll, seg_out_start, dir_raw_len);
@@ -1655,7 +1681,8 @@ static zgec_err decode_segments_parallel(zgec_block_arrays *ba,
                                        payload + seg_offset,
                                        (size_t)comp_len,
                                        (k == 0u) ? NULL : &tabs[k - 1u],
-                                       (k == 0u) ? 1 : 0);
+                                       (k == 0u) ? 1 : 0,
+                                       0);
         if (be != ZGEC_OK) {
             first = be;
             goto pdone;
@@ -2003,7 +2030,7 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
             }
         }
         e = seg_tables_build(&cur, &h, seg_buf, seg_size, &prev,
-                             (i == 0) ? 1 : 0);
+                             (i == 0) ? 1 : 0, 1);
         if (e != ZGEC_OK) goto efail;
         lit_stream = seg_buf + h.header_size;
         ll_stream = lit_stream + (size_t)h.lit_size;
