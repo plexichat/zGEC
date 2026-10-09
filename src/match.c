@@ -67,6 +67,7 @@
 #include "zgec_match.h"
 
 #include <string.h>
+#include <assert.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
@@ -197,6 +198,13 @@ struct zgec_matcher {
     uint8_t       *short_head;  /* per-bucket next write lane (ring) */
     uint32_t      *long_tab;    /* long_buckets entries */
     int            is_binary;   /* short hash uses 4 bytes */
+    /* Invariant: an attached buffer always satisfies vb_size <= vb_capacity.
+     * zgec_matcher_create rejects capacity > 2^24 and reset refuses to attach
+     * when vb_size > vb_capacity, so every offset d <= ip < vb_size also
+     * satisfies d <= vb_capacity. Per-candidate capacity tests in find are
+     * therefore dead in-tree; find keeps one hoisted validation plus asserts
+     * and a single explicit check on the long-table path against an
+     * adversarially mutated matcher. */
     size_t         vb_capacity; /* maximum referenceable offset */
     const uint8_t *vb;
     size_t         vb_size;
@@ -740,6 +748,14 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     if (!m || !vb || vb != m->vb || ip >= m->vb_size) {
         return best;
     }
+    /* Hoisted capacity validation: vb_size <= vb_capacity holds for every
+     * attached buffer (see the struct invariant), so the per-candidate
+     * d <= vb_capacity tests below are dead. One check here covers all
+     * candidates; the assert documents the invariant in debug builds. */
+    assert(m->vb_size <= m->vb_capacity);
+    if (m->vb_size > m->vb_capacity) {
+        return best;
+    }
 
     /* Section 11.2: a 5-byte short hash cannot find a 4-byte match, so 5 is
      * the minimum for hash (non-repeat) candidates. The floor of 4 is for
@@ -776,9 +792,11 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     for (i = 0; i < nreps; i++) {
         uint32_t d = reps[i];
         uint32_t len;
-        if (d == 0u || (size_t)d > ip || (size_t)d > m->vb_capacity) {
+        if (d == 0u || (size_t)d > ip) {
             continue;
         }
+        /* Assert-style: d <= ip < vb_size <= vb_capacity (hoisted check). */
+        assert((size_t)d <= m->vb_capacity);
         /* min_match >= 4, so a repeat whose first four bytes differ cannot
          * qualify; one 4-byte compare replaces the length scan. */
         if (zgec_rd32(vb + ip - (size_t)d) != cur4) {
@@ -816,6 +834,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             pos = mf_pos(e);
             if ((size_t)pos < ip) {
                 d = (uint32_t)(ip - (size_t)pos);
+                /* Retained explicit capacity check on the long-table path:
+                 * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
                     len = mf_match_len(vb, ip, d, cap);
                     if (len >= hash_min) {
@@ -893,9 +913,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         continue;
                     }
                     d = (uint32_t)(ip - (size_t)pos);
-                    if ((size_t)d > m->vb_capacity) {
-                        continue;
-                    }
+                    /* Assert-style: d <= ip < vb_size <= vb_capacity. */
+                    assert((size_t)d <= m->vb_capacity);
                     /* A candidate can only beat `best` if it matches at
                      * best.length - 1 as well; one byte compare there skips
                      * the length scan for the candidates that cannot. */
