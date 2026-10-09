@@ -845,7 +845,18 @@ static zgec_err seq_decode_one(uint32_t *out, size_t n,
 
 /* Three-table conditioned stream decode (section 8.6).
  * Tables share one AL; class = mlclass(ML) (bit3) or
- * mlclass(prev ML), class 0 for i == 0 (bit4). ML-first. */
+ * mlclass(prev ML), class 0 for i == 0 (bit4). ML-first.
+ *
+ * Fast-reader treatment mirroring zgec_fse_decode: the class byte for
+ * every sequence is precomputed up front (branchless, one byte each),
+ * then a fused refill/two-take loop runs while at least 16 bytes remain
+ * and the symbol is not final. Each symbol needs at most 30 (extra) +
+ * 11 (next-state) = 41 bits, so topping the accumulator up into 56..63
+ * bits with one 8-byte load always covers a whole symbol. The `left >
+ * 16u` guard keeps the load at ptr-7 inside the stream. A generic
+ * zgec_br_read loop finishes the tail; bit order and the consumed bit
+ * count are identical, and all validity checks (nbits > 32,
+ * next-bounds, overflow, br_done) are preserved on both paths. */
 static zgec_err seq_decode_cond(uint32_t *out, size_t n,
                                  zgec_fse_dec_table *const t[3],
                                  const uint32_t *ml, int use_prev,
@@ -856,47 +867,145 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     unsigned S = 0;
     int al;
     size_t i;
+    uint64_t acc;
+    unsigned nacc;
+    const uint8_t *ptr;
+    size_t left;
+    uint8_t *clsbuf = NULL;
     zgec_err e = check_stream_sentinel(stream, ssize);
     if (e != ZGEC_OK) return e;
     if (!t[0] || !t[1] || !t[2]) return ZGEC_ERR_TABLE_MODE;
+    if (!out || !ml) return ZGEC_ERR_INVAL;
     al = t[0]->al;
     if (t[1]->al != al || t[2]->al != al) return ZGEC_ERR_FSE_AL; /* V6 */
+    if (n == 0) {
+        zgec_br_init(&br, stream, ssize);
+        if (br.overflow) return ZGEC_ERR_BITSTREAM_SENTINEL;
+        S = (unsigned)1 << (unsigned)al;
+        state = zgec_br_read(&br, (unsigned)al);
+        if (br.overflow) return ZGEC_ERR_BITSTREAM;
+        if (state >= S) return ZGEC_ERR_BITSTREAM;
+        if (!zgec_br_done(&br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
+        return ZGEC_OK;
+    }
+    clsbuf = (uint8_t *)zgec_alloc(n, _Alignof(uint8_t));
+    if (!clsbuf) return ZGEC_ERR_NOMEM;
+    if (use_prev) {
+        clsbuf[0] = 0;
+        for (i = 1; i < n; i++)
+            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
+    } else {
+        for (i = 0; i < n; i++)
+            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
+    }
     zgec_br_init(&br, stream, ssize);
-    if (br.overflow) return ZGEC_ERR_BITSTREAM_SENTINEL;
+    if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM_SENTINEL; }
     S = (unsigned)1 << (unsigned)al;
     state = zgec_br_read(&br, (unsigned)al);
-    if (br.overflow) return ZGEC_ERR_BITSTREAM;
-    if (state >= S) return ZGEC_ERR_BITSTREAM;
-    for (i = 0; i < n; i++) {
-        unsigned cls;
+    if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+    if (state >= S) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+    acc = br.acc;
+    nacc = br.nacc;
+    ptr = br.ptr;
+    left = br.left;
+    i = 0;
+    /* Fast loop: unconditional 8-byte refill to 56..63 bits, then two
+     * branchless takes (extra bits, next-state bits). Only validity
+     * checks branch, never taken on a valid stream. nacc is at most 59
+     * on entry and never exceeds 63 after, so `w >> nacc` never shifts
+     * by 64. Hands over with reader state fully up to date. */
+    while (i + 1 < n && left > 16u) {
+        unsigned cls = clsbuf[i];
+        const zgec_fse_dec_entry *en;
+        unsigned sym;
+        unsigned xb;
+        uint32_t extra;
+        unsigned nbq;
+        uint32_t bits;
+        int32_t next;
+        unsigned nb;
+        uint64_t w;
+        if (cls > 2u) goto bad_internal;
+        en = &t[cls]->e[state];
+        if (en->symbol < 0 || en->symbol >= ZGEC_NSYM_SEQ) goto bad_symbol;
+        sym = (unsigned)en->symbol;
+        xb = (unsigned)zgec_seq_nbits[sym];
+        if (xb > 32u) goto bad_symbol;
+        nb = (63u - nacc) >> 3;
+        w = zgec_rd64(ptr - 7);
+        acc |= w >> nacc;
+        nacc += 8u * nb;
+        ptr -= nb;
+        left -= nb;
+        /* (acc >> 1) >> (63 - k) is acc >> (64 - k) for k >= 1 and 0
+         * for k == 0, without a branch. */
+        extra = (uint32_t)((acc >> 1) >> (63u - xb));
+        acc <<= xb;
+        nacc -= xb;
+        out[i] = zgec_seq_base[sym] + extra;
+        nbq = en->nb_bits;
+        bits = (uint32_t)((acc >> 1) >> (63u - nbq));
+        acc <<= nbq;
+        nacc -= nbq;
+        next = en->baseline + (int32_t)bits;
+        if (next < 0 || (unsigned)next >= S) goto bad_stream;
+        state = (unsigned)next;
+        i++;
+    }
+    br.acc = acc;
+    br.nacc = nacc;
+    br.ptr = ptr;
+    br.left = left;
+    for (; i < n; i++) {
+        unsigned cls = clsbuf[i];
         const zgec_fse_dec_entry *en;
         int sym;
         uint32_t extra = 0;
         uint32_t bits = 0;
         int32_t next = 0;
-        if (use_prev)
-            cls = (i == 0) ? 0u : zgec_mlclass(ml[i - 1]);
-        else
-            cls = zgec_mlclass(ml[i]);
-        if (cls > 2u) return ZGEC_ERR_INTERNAL;
+        if (cls > 2u) { zgec_free(clsbuf); return ZGEC_ERR_INTERNAL; }
         en = &t[cls]->e[state];
         sym = (int)en->symbol;
-        if (sym < 0 || sym >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL;
+        if (sym < 0 || sym >= ZGEC_NSYM_SEQ) { zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
+        if (zgec_seq_nbits[sym] > 32u) { zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
         if (zgec_seq_nbits[sym] > 0) {
             extra = zgec_br_read(&br, (unsigned)zgec_seq_nbits[sym]);
-            if (br.overflow) return ZGEC_ERR_BITSTREAM;
+            if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
         }
         out[i] = zgec_seq_base[sym] + extra;
         if (i + 1 < n) {
             bits = zgec_br_read(&br, (unsigned)en->nb_bits);
-            if (br.overflow) return ZGEC_ERR_BITSTREAM;
+            if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
             next = en->baseline + (int32_t)bits;
-            if (next < 0 || (unsigned)next >= S) return ZGEC_ERR_BITSTREAM;
+            if (next < 0 || (unsigned)next >= S) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
             state = (unsigned)next;
         }
     }
+    zgec_free(clsbuf);
     if (!zgec_br_done(&br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED; /* V5 */
     return ZGEC_OK;
+bad_internal:
+    br.acc = acc;
+    br.nacc = nacc;
+    br.ptr = ptr;
+    br.left = left;
+    zgec_free(clsbuf);
+    return ZGEC_ERR_INTERNAL;
+bad_symbol:
+    br.acc = acc;
+    br.nacc = nacc;
+    br.ptr = ptr;
+    br.left = left;
+    zgec_free(clsbuf);
+    return ZGEC_ERR_FSE_SYMBOL;
+bad_stream:
+    br.acc = acc;
+    br.nacc = nacc;
+    br.ptr = ptr;
+    br.left = left;
+    br.overflow = 1;
+    zgec_free(clsbuf);
+    return ZGEC_ERR_BITSTREAM;
 }
 
 /* ---- Phase A: decode one segment (section 10.2) ---- */

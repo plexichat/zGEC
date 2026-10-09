@@ -89,9 +89,8 @@ static inline uint32_t zgec_reps_encode(const zgec_reps *r, uint32_t d) {
    (ML 7..18), 2 otherwise. */
 static inline unsigned zgec_mlclass(uint32_t ml) {
     uint32_t m = ml - 3;
-    if (m < 4)  return 0;
-    if (m < 16) return 1;
-    return 2;
+    /* Branchless: 0 if m < 4, 1 if m < 16, 2 otherwise. */
+    return (unsigned)(m >= 4u) + (unsigned)(m >= 16u);
 }
 
 /* ---- stream decode / encode ---- */
