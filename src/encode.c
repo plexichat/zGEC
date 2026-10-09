@@ -423,10 +423,14 @@ static void zgec_enc_runstart(uint8_t *runstart, size_t n_lit,
 static void zgec_enc_rewrite_offbase_from_dist(zgec_parse *parse,
                                                const size_t *bounds,
                                                size_t n_segments,
-                                               const uint32_t *dist)
+                                               const uint32_t *dist,
+                                               int *changed)
 {
     size_t s;
     size_t i;
+    if (changed) {
+        *changed = 0;
+    }
     if (!parse || !bounds || !dist) return;
     for (s = 0; s < n_segments; s++) {
         zgec_reps seg;
@@ -434,7 +438,12 @@ static void zgec_enc_rewrite_offbase_from_dist(zgec_parse *parse,
         for (i = bounds[s]; i < bounds[s + 1] && i < parse->n_seq; i++) {
             uint32_t ob = zgec_reps_encode(&seg, dist[i]);
             (void)zgec_reps_resolve(&seg, ob);
-            parse->seq[i].offbase = ob;
+            if (parse->seq[i].offbase != ob) {
+                if (changed) {
+                    *changed = 1;
+                }
+                parse->seq[i].offbase = ob;
+            }
         }
     }
 }
@@ -2570,9 +2579,16 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                     zgec_reps_resolve(&whole, parse->seq[s].offbase);
             }
         }
+        int offbase_changed = 0;
         zgec_enc_rewrite_offbase_from_dist(parse, bounds, n_segments,
-                                           seg_dist);
-        {
+                                           seg_dist, &offbase_changed);
+        /* P6a: the re-merge exists to price the OF classes actually
+         * emitted under per-segment rep chains. If the first rewrite left
+         * every offbase untouched, the OF statistics are identical to what
+         * the first merge already priced, so a deterministic re-merge would
+         * reproduce the same bounds and the second rewrite would again be a
+         * no-op. Skip both; the result is provably identical. */
+        if (offbase_changed) {
             size_t *bounds2 = NULL;
             size_t n_seg2 = 0;
             if (zgec_segment_greedy(parse, &bounds2, &n_seg2) == ZGEC_OK) {
@@ -2582,9 +2598,9 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             }
             /* On re-segment failure keep the first bounds (still valid,
              * just priced from pre-rewrite OF stats). */
+            zgec_enc_rewrite_offbase_from_dist(parse, bounds, n_segments,
+                                               seg_dist, NULL);
         }
-        zgec_enc_rewrite_offbase_from_dist(parse, bounds, n_segments,
-                                           seg_dist);
         zgec_free(seg_dist);
     }
 
