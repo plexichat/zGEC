@@ -373,21 +373,6 @@ static size_t zgec_enc_seq_desc_size(const uint32_t *hist)
     return zgec_fse_write_counts(tmp, sizeof(tmp), counts, ZGEC_NSYM_SEQ, 10);
 }
 
-/* Exact serialised size in bytes of one literal-table description
- * (AL=11, 256 symbols). */
-static size_t zgec_enc_lit_desc_size(const uint32_t *hist)
-{
-    int16_t counts[ZGEC_NSYM_LIT];
-    uint8_t tmp[2048];
-    zgec_err err = zgec_rans_normalise(counts, hist);
-    if (err != ZGEC_OK) return ZGEC_ENC_RANS_TABLE_BYTES;
-    {
-        size_t n = zgec_fse_write_counts(tmp, sizeof(tmp), counts,
-                                         ZGEC_NSYM_LIT, ZGEC_LIT_AL);
-        return (n > 0) ? n : (size_t)ZGEC_ENC_RANS_TABLE_BYTES;
-    }
-}
-
 static int zgec_enc_all_same_byte(const uint8_t *src, size_t n)
 {
     uint64_t w;
@@ -1058,11 +1043,10 @@ static double zgec_score_lit_cand(const uint32_t *hist, size_t n_syms,
     double body;
     double hdr;
     /* P4: the caller passes n_syms, the histogram's known total. */
+    body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n_syms);
     if (n_tables <= 1) {
-        body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n_syms);
-        hdr = (double)zgec_enc_lit_desc_size(hist) * 8.0 + 32.0 * 8.0;
+        hdr = (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 + 32.0 * 8.0;
     } else {
-        body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n_syms);
         hdr = (double)(unsigned)n_tables *
                   (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 +
               32.0 * 8.0;
