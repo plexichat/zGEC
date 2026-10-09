@@ -14,7 +14,9 @@
 
 #include "zgec.h"
 
+#include <assert.h>
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -327,11 +329,26 @@ static zgec_err zgec_payload_grow(uint8_t **buf, size_t *cap, size_t used, size_
 /* Histogram normalisation lives in seq.c (zgec_normalize_counts,
  * see zgec_internal.h); the former byte-identical copy here was removed. */
 
-/* Shannon entropy estimate in bits of a histogram. */
-static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym)
+/* Shannon entropy estimate in bits of a histogram. P4: callers that
+ * already know the symbol total pass it so the accumulation loop over
+ * nsym entries is skipped; pass ZGEC_ENC_TOTAL_UNKNOWN to accumulate.
+ * Bit-identical either way (debug builds verify the supplied total). */
+#define ZGEC_ENC_TOTAL_UNKNOWN UINT64_MAX
+static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym,
+                                        uint64_t known_total)
 {
-    uint64_t total = 0;
-    for (int s = 0; s < nsym; s++) total += (uint64_t)hist[s];
+    uint64_t total = known_total;
+    if (total == ZGEC_ENC_TOTAL_UNKNOWN) {
+        total = 0;
+        for (int s = 0; s < nsym; s++) total += (uint64_t)hist[s];
+    }
+#ifndef NDEBUG
+    else {
+        uint64_t check = 0;
+        for (int s = 0; s < nsym; s++) check += (uint64_t)hist[s];
+        assert(check == total);
+    }
+#endif
     if (total == 0) return 0.0;
     {
         double tlog = zgec_fast_log2_u64(total);
@@ -521,16 +538,18 @@ typedef struct {
     uint32_t of[ZGEC_NSYM_SEQ];
     uint64_t extra_bits;
     size_t n_seq;
+    uint64_t lit_total; /* P4: sum of lit[] (literals owned by granule) */
 } zgec_granule;
 
 static double zgec_granule_cost_bits(const zgec_granule *g)
 {
     double bits;
     if (g->n_seq == 0) return 0.0;
-    bits = zgec_enc_entropy_bits_u32(g->lit, ZGEC_NSYM_LIT);
-    bits += zgec_enc_entropy_bits_u32(g->ll, ZGEC_NSYM_SEQ);
-    bits += zgec_enc_entropy_bits_u32(g->ml, ZGEC_NSYM_SEQ);
-    bits += zgec_enc_entropy_bits_u32(g->of, ZGEC_NSYM_SEQ);
+    /* P4: lit total is tracked; each seq stream sums to n_seq. */
+    bits = zgec_enc_entropy_bits_u32(g->lit, ZGEC_NSYM_LIT, g->lit_total);
+    bits += zgec_enc_entropy_bits_u32(g->ll, ZGEC_NSYM_SEQ, (uint64_t)g->n_seq);
+    bits += zgec_enc_entropy_bits_u32(g->ml, ZGEC_NSYM_SEQ, (uint64_t)g->n_seq);
+    bits += zgec_enc_entropy_bits_u32(g->of, ZGEC_NSYM_SEQ, (uint64_t)g->n_seq);
     bits += (double)g->extra_bits;
     bits += ZGEC_ENC_SEG_OVERHEAD_BITS;
     return bits;
@@ -547,6 +566,7 @@ static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
     }
     dst->extra_bits += src->extra_bits;
     dst->n_seq += src->n_seq;
+    dst->lit_total += src->lit_total;
 }
 
 /* Split the parse into ~16K-sequence granules with additive histograms,
@@ -636,12 +656,18 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
             g->extra_bits += (uint64_t)nb;
             g->n_seq++;
             for (t = lit_of_seq[i]; t < lit_of_seq[i + 1]; t++) {
-                if (t < parse->n_lit) g->lit[parse->lit[t]]++;
+                if (t < parse->n_lit) {
+                    g->lit[parse->lit[t]]++;
+                    g->lit_total++;
+                }
             }
         }
     }
     /* Tail literals belong to the last granule. */
-    for (i = lit_pos; i < parse->n_lit; i++) grans[n_gran - 1].lit[parse->lit[i]]++;
+    for (i = lit_pos; i < parse->n_lit; i++) {
+        grans[n_gran - 1].lit[parse->lit[i]]++;
+        grans[n_gran - 1].lit_total++;
+    }
 
     /* Greedy adjacent merge passes. P5: per-granule costs are cached
      * once per pass (the old code re-evaluated both inputs' entropy on
@@ -718,10 +744,11 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
 #define ZGEC_ENC_NCLASS 64
 #define ZGEC_ENC_MAXCTX 8
 
-/* Entropy of one 256-entry class histogram. */
-static double zgec_class_entropy(const uint32_t *h)
+/* Entropy of one 256-entry class histogram. P4: tot is the row's
+ * known symbol total (merges add them, so no rescan). */
+static double zgec_class_entropy(const uint32_t *h, uint64_t tot)
 {
-    return zgec_enc_entropy_bits_u32(h, ZGEC_NSYM_LIT);
+    return zgec_enc_entropy_bits_u32(h, ZGEC_NSYM_LIT, tot);
 }
 
 /* Portable thread-local storage (S3): MSVC's C11 mode historically lacks
@@ -780,19 +807,23 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
     uint8_t nmem[ZGEC_ENC_NCLASS];
     int alive[ZGEC_ENC_NCLASS];
     double cent[ZGEC_ENC_NCLASS];   /* cached entropy of each live cluster */
+    uint64_t ctot[ZGEC_ENC_NCLASS];   /* P4: cached symbol total per cluster */
     int ncl = ZGEC_ENC_NCLASS;
     int c;
     int s;
     double total = 0.0;
 
     for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
+        uint64_t t = 0;
         for (s = 0; s < ZGEC_NSYM_LIT; s++) {
             work[(size_t)c][(size_t)s] = cls_hist[(size_t)c * 256u + (uint32_t)s];
+            t += (uint64_t)work[(size_t)c][(size_t)s];
         }
+        ctot[(size_t)c] = t;
         members[(size_t)c][0] = (uint8_t)c;
         nmem[(size_t)c] = 1;
         alive[(size_t)c] = 1;
-        cent[(size_t)c] = zgec_class_entropy(work[(size_t)c]);
+        cent[(size_t)c] = zgec_class_entropy(work[(size_t)c], ctot[(size_t)c]);
         total += cent[(size_t)c];
     }
     memset(assign_out, 0, 4u * ZGEC_ENC_NCLASS);
@@ -805,12 +836,13 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
     for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
         int bb;
         for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+            uint64_t mt = ctot[(size_t)c] + ctot[(size_t)bb];
             for (s = 0; s < ZGEC_NSYM_LIT; s++) {
                 merged[(size_t)s] =
                     work[(size_t)c][(size_t)s] + work[(size_t)bb][(size_t)s];
             }
             dlt[(size_t)c][(size_t)bb] =
-                zgec_class_entropy(merged) - cent[(size_t)c] - cent[(size_t)bb];
+                zgec_class_entropy(merged, mt) - cent[(size_t)c] - cent[(size_t)bb];
         }
     }
 
@@ -854,7 +886,10 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             }
             nmem[(size_t)best_a] = (uint8_t)((unsigned)nm + (unsigned)nmem[(size_t)best_b]);
         }
-        cent[(size_t)best_a] = zgec_class_entropy(work[(size_t)best_a]);
+        cent[(size_t)best_a] = zgec_class_entropy(work[(size_t)best_a],
+                                                     ctot[(size_t)best_a] +
+                                                     ctot[(size_t)best_b]);
+        ctot[(size_t)best_a] += ctot[(size_t)best_b];
         alive[best_b] = 0;
         total += best_delta;
         ncl--;
@@ -870,7 +905,9 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
                     work[(size_t)lo][(size_t)s] + work[(size_t)hi][(size_t)s];
             }
             dlt[(size_t)lo][(size_t)hi] =
-                zgec_class_entropy(merged) - cent[(size_t)lo] - cent[(size_t)hi];
+                zgec_class_entropy(merged,
+                                   ctot[(size_t)lo] + ctot[(size_t)hi]) -
+                cent[(size_t)lo] - cent[(size_t)hi];
         }
     }
     *bits_k1 = total;
@@ -1020,11 +1057,12 @@ static double zgec_score_lit_cand(const uint32_t *hist, size_t n_syms,
 {
     double body;
     double hdr;
+    /* P4: the caller passes n_syms, the histogram's known total. */
     if (n_tables <= 1) {
-        body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT);
+        body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n_syms);
         hdr = (double)zgec_enc_lit_desc_size(hist) * 8.0 + 32.0 * 8.0;
     } else {
-        body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT);
+        body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n_syms);
         hdr = (double)(unsigned)n_tables *
                   (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 +
               32.0 * 8.0;
@@ -1098,11 +1136,14 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
 {
     double body = 0.0;
     uint32_t rs_hist[ZGEC_NSYM_LIT];
+    uint64_t rs_total = 0; /* P4: symbols routed to rs_hist */
+    uint64_t grp_total[ZGEC_ENC_MAXCTX]; /* P4: per-group symbol totals */
     size_t start[ZGEC_NLANES];
     size_t j;
     int g;
     memset(cls_hist, 0, (size_t)64 * 256u * sizeof(uint32_t));
     memset(rs_hist, 0, sizeof(rs_hist));
+    memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
     {
         /* Lane starts are at most 8 positions: mark them once instead of
@@ -1120,6 +1161,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             size_t li;
             if (runstart && runstart[j]) {
                 rs_hist[z[j]]++;
+                rs_total++;
                 continue;
             }
             for (li = 0; li < n_lane; li++) {
@@ -1128,10 +1170,12 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             (void)lane_mark;
         if (is_lane_start) {
             rs_hist[z[j]]++;
+            rs_total++;
             continue;
         }
         if (j == 0) {
             rs_hist[z[j]]++;
+            rs_total++;
             continue;
         }
         cls = zgec_classify(ctx_mode, z[j - 1]);
@@ -1140,14 +1184,15 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             unsigned grp = (unsigned)cmap[cls];
             if (grp >= (unsigned)k) grp = 0u;
             cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+            grp_total[grp]++;
         }
     }
     }
     for (g = 0; g < k; g++) {
         body += zgec_enc_entropy_bits_u32(cls_hist + (size_t)g * 256u,
-                                          ZGEC_NSYM_LIT);
+                                          ZGEC_NSYM_LIT, grp_total[g]);
     }
-    body += zgec_enc_entropy_bits_u32(rs_hist, ZGEC_NSYM_LIT);
+    body += zgec_enc_entropy_bits_u32(rs_hist, ZGEC_NSYM_LIT, rs_total);
     return body;
 }
 
@@ -1212,9 +1257,9 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                  params->lambda * ZGEC_ENC_CYC_RAW_PER_SYM *
                      (double)(uint64_t)n_lit_slice;
 
-    seq_bits = zgec_enc_entropy_bits_u32(h_ll, ZGEC_NSYM_SEQ) +
-               zgec_enc_entropy_bits_u32(h_ml, ZGEC_NSYM_SEQ) +
-               zgec_enc_entropy_bits_u32(h_of, ZGEC_NSYM_SEQ) +
+    seq_bits = zgec_enc_entropy_bits_u32(h_ll, ZGEC_NSYM_SEQ, (uint64_t)n) +
+               zgec_enc_entropy_bits_u32(h_ml, ZGEC_NSYM_SEQ, (uint64_t)n) +
+               zgec_enc_entropy_bits_u32(h_of, ZGEC_NSYM_SEQ, (uint64_t)n) +
                (double)extra_bits;
     (void)seq_bits;
 
@@ -2364,7 +2409,7 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
     for (i = 1; i < n; i++) {
         if (p[i] == p[i - 1]) runs++;
     }
-    *h0_out = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT);
+    *h0_out = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n);
     *runs_out = runs;
 }
 
@@ -3702,6 +3747,22 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
                     zgec_free(r0.lit);
                     goto frame_fail_out;
                 }
+                {
+                    const char *env = getenv("ZGEC_LITREF_LOG");
+                    if (env && env[0]) {
+                        long long delta = (long long)r0.payload_size -
+                                          (long long)r1.payload_size;
+                        fprintf(stderr,
+                                "LITREF blk=%u bs=%zu lrlen=%zu lruse=%zu "
+                                "r0=%zu r1=%zu delta=%lld r0exp=%d r1exp=%d "
+                                "r0filt=%d r1filt=%d r0lit=%zu win=%d\n",
+                                (unsigned)i, bs, lr_region_len, lr_use,
+                                r0.payload_size, r1.payload_size, delta,
+                                r0.exportable, r1.exportable, r0.filtered,
+                                r1.filtered, r0.lit_size,
+                                (r1.payload_size < r0.payload_size) ? 1 : 0);
+                    }
+                }
                 if (r1.payload_size < r0.payload_size) {
                     zgec_free(r0.payload);
                     zgec_free(r0.lit);
@@ -3712,6 +3773,15 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
                     zgec_free(r1.payload);
                     zgec_free(r1.lit);
                     zgec_block_result_init(&r1);
+                }
+            } else if (jobs[i].kind != ZGEC_REC_RLE) {
+                const char *env = getenv("ZGEC_LITREF_LOG");
+                if (env && env[0]) {
+                    fprintf(stderr,
+                            "LITREF blk=%u bs=%zu SKIP lrlen=%zu r0=%zu "
+                            "r0filt=%d r0exp=%d r0lit=%zu\n",
+                            (unsigned)i, bs, lr_region_len, r0.payload_size,
+                            r0.filtered, r0.exportable, r0.lit_size);
                 }
             }
             payload = r0.payload;
