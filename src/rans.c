@@ -138,8 +138,14 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
      * most ZGEC_RANS_M (2048, 12 bits) and the bias is below it, so both
      * fields fit the widths above. */
     unsigned ntab = (k > 1) ? (unsigned)k + 1u : 1u;
-    uint32_t *pk = (uint32_t *)zgec_alloc((size_t)ntab * ZGEC_RANS_M * sizeof(uint32_t), 64);
-    if (!pk) return ZGEC_ERR_NOMEM;
+    uint32_t pk_stack[ZGEC_RANS_M];
+    uint32_t *pk = NULL;
+    if (ntab == 1) {
+        pk = pk_stack;
+    } else {
+        pk = (uint32_t *)zgec_alloc((size_t)ntab * ZGEC_RANS_M * sizeof(uint32_t), 64);
+        if (!pk) return ZGEC_ERR_NOMEM;
+    }
     for (unsigned t = 0; t < ntab; t++) {
         const zgec_rans_dec_table *tb = &tables[t];
         uint32_t *dst = pk + (size_t)t * ZGEC_RANS_M;
@@ -215,7 +221,7 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
         }
     }
     if (err == ZGEC_OK && remaining != 0) err = ZGEC_ERR_RANS_CURSOR;
-    zgec_free(pk);
+    if (ntab > 1) zgec_free(pk);
     return err;
 }
 

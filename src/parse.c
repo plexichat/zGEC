@@ -652,6 +652,25 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 }
 #endif /* ZGEC_FASTDFAST_OFF */
 
+
+static inline uint32_t parse_match_len(const uint8_t *vb, size_t ip, size_t d, size_t cap)
+{
+    const uint8_t *a = vb + ip - d;
+    const uint8_t *b = vb + ip;
+    size_t len = 0;
+    while (len + 8u <= cap) {
+        uint64_t x = zgec_rd64(a + len) ^ zgec_rd64(b + len);
+        if (x != 0u) {
+            return (uint32_t)(len + ((unsigned)__builtin_ctzll(x) >> 3));
+        }
+        len += 8u;
+    }
+    while (len < cap && a[len] == b[len]) {
+        len++;
+    }
+    return (uint32_t)len;
+}
+
 zgec_err zgec_parse_block_ex(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
                           const uint8_t *dict, size_t dict_size,
@@ -832,7 +851,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         uint32_t need;
         uint32_t is_rep;
         uint32_t offbase;
-        double cur_score;
+        double cur_score = 0.0;
         uint32_t cur_len = 0;
         uint32_t cur_off = 0;
         zgec_match match;
@@ -869,6 +888,35 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                 if (cur_score > 0.0) {
                     cur_len = match.length;
                     cur_off = match.offset;
+                }
+            }
+        }
+        /* Evaluate repeat offset candidates (offbase 1, 2, 3) directly.
+         * zgec_matcher_find selects candidates solely based on match length,
+         * discarding repeat offsets when a non-repeat match is 1 byte longer.
+         * However, repeat offsets carry 0 extra bits for offset coding, so
+         * a repeat match can yield a significantly higher parse_score (net bit
+         * savings) than a longer non-repeat match with a large offset. */
+        {
+            size_t cap = end - ip;
+            unsigned nreps = (tier == ZGEC_TIER_FAST) ? 1u : 3u;
+            for (unsigned ri = 0u; ri < nreps; ri++) {
+                uint32_t roff = reps.rep[ri];
+                if (roff != 0u && (size_t)roff <= ip && (size_t)roff <= (1u << 24)) {
+                    if (cap >= 4u && zgec_rd32(vb + ip - roff) == zgec_rd32(vb + ip)) {
+                        uint32_t rlen = parse_match_len(vb, ip, roff, cap);
+                        if (rlen >= 4u) {
+                            uint32_t roffbase = parse_offbase(roff, &reps);
+                            double rscore = parse_score(rlen, ll, roffbase,
+                                                        ll_hist, ml_hist, of_hist, l2tot,
+                                                        lbar, lscale);
+                            if (rscore > cur_score) {
+                                cur_score = rscore;
+                                cur_len = rlen;
+                                cur_off = roff;
+                            }
+                        }
+                    }
                 }
             }
         }

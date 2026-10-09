@@ -124,7 +124,7 @@ size_t zgec_seg_header_emit(uint8_t *buf, size_t cap,
 /* The table modes byte packs four 2-bit modes:
  * bits 0-1 literal, 2-3 LL, 4-5 ML, 6-7 OF. */
 static inline unsigned zgec_tbl_mode(uint8_t table_modes, unsigned which) {
-    return (table_modes >> (2 * which)) & ZGEC_TBL_MASK;
+    return ((unsigned)table_modes >> (2u * which)) & ZGEC_TBL_MASK;
 }
 
 /* A table descriptor is either:
