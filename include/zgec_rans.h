@@ -29,11 +29,16 @@
 #define ZGEC_RANS_M 2048        /* probability scale */
 #define ZGEC_RANS_STATE_MIN 65536u
 
-/* Decoder tables (Annex B.1). One per context (plus the run-start table). */
+/* Decoder tables (Annex B.1). One per context (plus the run-start table).
+ * packed[] holds the per-slot decode entry (symbol | f<<8 | bias<<20,
+ * 0 = invalid slot), built once by zgec_rans_build_dec and reused by
+ * every decode, including REPEAT/cloned segments (a plain memcpy of the
+ * table carries the pack along; it is freed with the table). */
 typedef struct {
     uint16_t symbol_of_slot[ZGEC_RANS_M];  /* 2048 entries */
     uint16_t f[ZGEC_NSYM_LIT];             /* frequency of each symbol (0 allowed) */
     uint16_t c[ZGEC_NSYM_LIT];             /* cumulative start */
+    uint32_t packed[ZGEC_RANS_M];          /* per-slot decode entries */
 } zgec_rans_dec_table;
 
 /* Encoder tables (Annex B.2). */
