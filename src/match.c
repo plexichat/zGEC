@@ -1079,6 +1079,14 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
         size_t t;
         size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
                                    : (size_t)ZGEC_MF_HASH_BYTES;
+        /* Adaptive sampling: short matches need few inserts to cover the
+         * range, so cap the sample count at 2 + (len >> 2). Matches < 8
+         * bytes insert ~2-3 positions; the full count applies only for
+         * len >= ~56. */
+        {
+            size_t cap = (size_t)2 + (len >> 2);
+            if (nsamp > cap) nsamp = cap;
+        }
         if (nsamp > len) nsamp = len;
         if (nsamp < 1u) nsamp = 1u;
         for (t = 0; t < nsamp; t++) {
