@@ -237,16 +237,16 @@ static uint32_t mf_hash4(const uint8_t *vb, size_t ip)
 }
 
 /* 8-byte hash for the long table (one entry per
- * bucket). The caller must guarantee
- * ip + 8 <= vb_size. */
+ * bucket). Xorshift/multiply/xorshift: the final shift xors the high
+ * bits down, so the returned low 32 bits mix all eight input bytes.
+ * The caller must guarantee ip + 8 <= vb_size. */
 static uint32_t mf_hash8(const uint8_t *vb, size_t ip)
 {
     uint64_t x = (uint64_t)zgec_rd64(vb + ip);
-    x += 0x9E3779B97F4A7C15ULL;
-    x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
-    x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
-    x ^= x >> 31;
-    return (uint32_t)(x ^ (x >> 32));
+    x ^= x >> 33;
+    x *= 0xD6E8FEB86659FD93ULL;
+    x ^= x >> 33;
+    return (uint32_t)x;
 }
 
 /* Short hash selected by the binary classification. */
