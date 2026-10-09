@@ -208,9 +208,9 @@ struct zgec_matcher {
     size_t         vb_capacity; /* maximum referenceable offset */
     const uint8_t *vb;
     size_t         vb_size;
-    size_t         c_ip;        /* hash cache: position the cached hashes belong to */
-    uint32_t       c_hs, c_hl;  /* cached short / long hash */
-    uint32_t       c_flags;     /* bit0: c_hs valid, bit1: c_hl valid */
+    size_t         c_ip[2];     /* hash cache: positions the cached hashes belong to */
+    uint32_t       c_hs[2], c_hl[2]; /* cached short / long hashes */
+    uint32_t       c_flags[2];  /* bit0: c_hs valid, bit1: c_hl valid */
 };
 
 /* Multiplicative hash of the 5 bytes at ip
@@ -344,15 +344,18 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos)
         }
     }
     /* The finder at this position has already computed both hashes; when it
-     * hands the same position to insert, reuse them instead of recomputing. */
-    h = (m->c_ip == pos && (m->c_flags & 1u)) ? m->c_hs : mf_hash_short(m, vb, pos);
+     * hands the same position to insert, reuse them instead of recomputing.
+     * Two parity-indexed slots keep the main probe at ip and the lazy probe
+     * at ip + 1 live at once, so the speculative find does not evict the
+     * hashes the insert below needs. */
+    h = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 1u)) ? m->c_hs[pos & 1u] : mf_hash_short(m, vb, pos);
     bucket = h & (m->nbuckets - 1u);
     tag = (h >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
     entry = mf_pack((uint32_t)pos, tag);
     mf_insert_short(m, bucket, entry);
 
     if (pos + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
-        uint32_t hl = (m->c_ip == pos && (m->c_flags & 2u)) ? m->c_hl : mf_hash8(vb, pos);
+        uint32_t hl = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 2u)) ? m->c_hl[pos & 1u] : mf_hash8(vb, pos);
         uint32_t lb = hl & (m->long_buckets - 1u);
         uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         mf_insert_long(m, lb, mf_pack((uint32_t)pos, ltag));
@@ -608,10 +611,14 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     memset(m->short_head, 0, m->nbuckets);
     memset(m->long_tab, 0, long_n * sizeof(uint32_t));
     /* No position has cached hashes yet. */
-    m->c_ip = (size_t)-1;
-    m->c_hs = 0u;
-    m->c_hl = 0u;
-    m->c_flags = 0u;
+    m->c_ip[0] = (size_t)-1;
+    m->c_ip[1] = (size_t)-1;
+    m->c_hs[0] = 0u;
+    m->c_hs[1] = 0u;
+    m->c_hl[0] = 0u;
+    m->c_hl[1] = 0u;
+    m->c_flags[0] = 0u;
+    m->c_flags[1] = 0u;
     return m;
 }
 
@@ -659,8 +666,10 @@ void zgec_matcher_reset(zgec_matcher *m, const uint8_t *vb, size_t vb_size,
     /* The cache describes the previous block's buffer, so drop it: a stale
      * hash could otherwise be reused for the same position in an unrelated
      * buffer. */
-    m->c_ip = (size_t)-1;
-    m->c_flags = 0u;
+    m->c_ip[0] = (size_t)-1;
+    m->c_ip[1] = (size_t)-1;
+    m->c_flags[0] = 0u;
+    m->c_flags[1] = 0u;
     /* This interface returns void, so inconsistent state is rejected by
      * refusing to attach a buffer rather than by reporting an error. Every
      * entry point below starts with a vb_size bound check, so a detached
@@ -831,9 +840,11 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     }
 
     /* The hashes this find computes for ip are the ones an insert of ip
-     * needs, so leave them behind for mf_insert_pos. */
-    m->c_ip = ip;
-    m->c_flags = 0u;
+     * needs, so leave them behind for mf_insert_pos. The slot is parity
+     * indexed, so the lazy probe at ip + 1 lands in the other slot and
+     * leaves this position's hashes intact for the main probe's insert. */
+    m->c_ip[ip & 1u] = ip;
+    m->c_flags[ip & 1u] = 0u;
     /* 2. Long table: 8-byte hash, one entry per
      * bucket, tag-checked before any length work. */
     if (ip + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
@@ -846,8 +857,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         uint32_t pos;
         uint32_t d;
         uint32_t len;
-        m->c_hl = hl;
-        m->c_flags |= 2u;
+        m->c_hl[ip & 1u] = hl;
+        m->c_flags[ip & 1u] |= 2u;
         mf_prefetch_bucket((const void *)le);
         e = *le;
         ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
@@ -894,8 +905,8 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             uint32_t want;
             uint32_t nhit;
             uint32_t cur4s;
-            m->c_hs = h;
-            m->c_flags |= 1u;
+            m->c_hs[ip & 1u] = h;
+            m->c_flags[ip & 1u] |= 1u;
             mf_prefetch_bucket((const void *)b);
             want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
                  : (m->tier == ZGEC_TIER_FAST) ? ZGEC_MF_PROBE_DEPTH_FAST
