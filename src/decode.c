@@ -1698,6 +1698,11 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                 if (ba->raw_size > 64 &&
                     out_pos + (uint64_t)ml > (uint64_t)ba->raw_size - 64) {
                     for (k = 0; k < mlen; k++) d[k] = msrc[k];
+                } else if (moff == 1) {
+                    /* RLE: every copied byte repeats the one immediately
+                     * before the match, so the byte-at-a-time order is
+                     * one memset. msrc == d - 1 is in bounds. */
+                    memset(d, msrc[0], mlen);
                 } else if (moff >= 32 && mlen >= 32) {
                     exec_match_wide(d, msrc, mlen, 32);
                 } else if (moff >= 16 && mlen >= 16) {

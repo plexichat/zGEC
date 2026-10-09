@@ -1052,14 +1052,14 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
     memset(d, 0, sizeof(*d));
     if (raw_size == 0) {
         d->data = (uint8_t *)zgec_alloc(ZGEC_OUTPUT_SLACK, 64);
-        if (!d->data) { zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_NOMEM; }
+        if (!d->data) { zgec_free(dir); zgec_free(d); return ZGEC_ERR_NOMEM; }
         d->raw_size = 0;
         zgec_free(dir);
         *out = d;
         return ZGEC_OK;
     }
     d->data = (uint8_t *)zgec_alloc((size_t)raw_size + ZGEC_OUTPUT_SLACK, 64);
-    if (!d->data) { zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_NOMEM; }
+    if (!d->data) { zgec_free(dir); zgec_free(d); return ZGEC_ERR_NOMEM; }
     d->raw_size = raw_size;
 
     size_t seg_offset = params_len + (size_t)segment_count * 8;
