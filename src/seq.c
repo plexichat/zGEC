@@ -198,43 +198,48 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
     if (nsym <= 0 || nsym > ZGEC_NSYM_SEQ) return 0;
     S = 1u << (unsigned)al;
 
-    /* The symbols are derived on the fly rather than materialised in an
-       n-byte array (entry 10): this validator pass costs no allocation and
-       still rejects a value outside the alphabet before anything is
-       written, so a failed encode leaves the bitstream untouched. */
+    /* The symbols are materialised in an n-byte array, as the plain path
+       already does above: the validator pass stores each code, and the
+       write loop below reuses it instead of deriving it a second time.
+       Validation still runs to completion before the first write, so a
+       failed encode leaves the bitstream untouched. */
+    uint8_t *syms = (uint8_t *)zgec_alloc(n, 1);
+    if (!syms) return 0;
     for (i = 0; i < n; i++) {
         uint8_t nb;
         uint8_t code = zgec_seq_code_of(values[i], &nb);
         uint32_t extra;
-        if ((int)code >= nsym) return 0;
+        if ((int)code >= nsym) { zgec_free(syms); return 0; }
         /* Bound the value against its symbol's range here too, not only in
            the write loop below: the range test can reject for a custom
            base/nbits pair, and doing it here is what keeps the promise that
            a failed encode leaves the bitstream untouched (finding 3). The
            accepted set is identical to the loop's, so this rejects nothing
            the loop would have accepted. */
-        if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra))
+        if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra)) {
+            zgec_free(syms);
             return 0;
+        }
+        syms[i] = code;
     }
 
-    {
-        uint8_t nb;
-        last_s = zgec_seq_code_of(values[n - 1], &nb);
-    }
+    last_s = syms[n - 1];
     last_cls = use_prev ? ((n >= 2) ? zgec_mlclass(ml[n - 2]) : 0u)
                         : zgec_mlclass(ml[n - 1]);
     /* zgec_mlclass() is total on 0..2, but the index must not depend on
        that staying true (entry 3). */
-    if (last_cls >= 3u) return 0;
+    if (last_cls >= 3u) { zgec_free(syms); return 0; }
     first_entry = enc[last_cls]->e[(size_t)last_s * (size_t)S];
     state = first_entry.new_state;
-    if (state >= S) return 0;
+    if (state >= S) { zgec_free(syms); return 0; }
     if (nbits[last_s] > 0) {
         uint32_t extra;
-        if (!zgec_seq_get_extra(values[n - 1], last_s, base, nbits, &extra))
+        if (!zgec_seq_get_extra(values[n - 1], last_s, base, nbits, &extra)) {
+            zgec_free(syms);
             return 0;
+        }
         zgec_bw_write(bw, extra, (unsigned)nbits[last_s]);
-        if (bw->overflow) return 0;
+        if (bw->overflow) { zgec_free(syms); return 0; }
     }
 
     for (i = n - 1; i > 0; i--) {
@@ -242,14 +247,11 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         unsigned c;
         zgec_fse_enc_entry entry;
         uint32_t bits;
-        {
-            uint8_t nb;
-            s = zgec_seq_code_of(values[i - 1], &nb);
-        }
+        s = syms[i - 1];
         c = use_prev ? ((i >= 2) ? zgec_mlclass(ml[i - 2]) : 0u)
                      : zgec_mlclass(ml[i - 1]);
-        if (c >= 3u) return 0;
-        if ((int)s >= enc[c]->nsym) return 0;
+        if (c >= 3u) { zgec_free(syms); return 0; }
+        if ((int)s >= enc[c]->nsym) { zgec_free(syms); return 0; }
         entry = enc[c]->e[(size_t)s * (size_t)S + (size_t)state];
         bits = (state >= (uint32_t)entry.baseline)
                    ? (uint32_t)(state - (uint32_t)entry.baseline)
@@ -263,20 +265,25 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
            to a different value and still return a byte count as on success
            (finding 1). nb_bits < 32 so the shift below is defined. */
         if ((unsigned)entry.nb_bits < 32u &&
-            bits >= (UINT32_C(1) << (unsigned)entry.nb_bits))
+            bits >= (UINT32_C(1) << (unsigned)entry.nb_bits)) {
+            zgec_free(syms);
             return 0;
+        }
         zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
         if (nbits[s] > 0) {
             uint32_t extra;
-            if (!zgec_seq_get_extra(values[i - 1], s, base, nbits, &extra))
+            if (!zgec_seq_get_extra(values[i - 1], s, base, nbits, &extra)) {
+                zgec_free(syms);
                 return 0;
+            }
             zgec_bw_write(bw, extra, (unsigned)nbits[s]);
         }
-        if (bw->overflow) return 0;
+        if (bw->overflow) { zgec_free(syms); return 0; }
         state = entry.new_state;
-        if (state >= S) return 0;
+        if (state >= S) { zgec_free(syms); return 0; }
     }
 
+    zgec_free(syms);
     zgec_bw_write(bw, state, (unsigned)al);
     if (bw->overflow) return 0;
     if (zgec_bw_finish(bw) == 0) return 0;
