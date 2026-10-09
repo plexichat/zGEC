@@ -1527,13 +1527,30 @@ static zgec_err decode_segment(zgec_segment_arrays *seg,
  * copy stays inside [d, d+n) and reads only bytes [s, s+n), so it is
  * exact and cannot overrun either buffer.
  *
- * For n >= 8 an aligned 8-byte stride is used and the final 8 bytes are
- * re-copied (overlapping the last full chunk) rather than handled as a
+ * For n >= 32 a 32-byte stride is used, for n >= 16 a 16-byte stride,
+ * for n >= 8 an 8-byte stride; the final quantum is re-copied
+ * (overlapping the last full chunk) rather than handled as a
  * remainder; for n < 8 a 4/2/1 cascade copies the head and the tail of
  * the run, which together cover it. */
 static void exec_copy_literals(uint8_t *d, const uint8_t *s, size_t n)
 {
     size_t i = 0;
+    if (n >= 32) {
+        while (i + 32 <= n) {
+            memcpy(d + i, s + i, 32);
+            i += 32;
+        }
+        memcpy(d + n - 32, s + n - 32, 32);
+        return;
+    }
+    if (n >= 16) {
+        while (i + 16 <= n) {
+            memcpy(d + i, s + i, 16);
+            i += 16;
+        }
+        memcpy(d + n - 16, s + n - 16, 16);
+        return;
+    }
     if (n >= 8) {
         while (i + 8 <= n) {
             memcpy(d + i, s + i, 8);
@@ -1589,55 +1606,34 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
     }
 }
 
-/* Copy one match.
+/* Match copy (inlined into exec_block per sequence).
  *
  * Spec 6.1/Annex D: a match copies byte by byte in increasing order, so
  * an overlapping match (len > off) replicates the bytes just written.
- * When off >= 8 that ordering is exactly what 8-byte chunks produce: each
- * chunk at offset i reads [i-off, i-off+8) and writes [i, i+8), and
- * off >= 8 puts every source byte strictly before every destination byte
- * of the same chunk, so the source is always final. Chunking therefore
- * replaces the out-of-line memmove call with a handful of 8-byte moves
- * while preserving the byte-at-a-time result. For off < 8 the copy must
- * stay byte at a time, because the source can run into the bytes this
- * match is itself producing. src is the VB position of the match; it is
- * never below the virtual buffer because V2 checked off <= Ld + Ll + pos. */
-static zgec_err exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
-                           size_t raw_size, size_t LdLl)
+ * When off >= 32 that ordering is exactly what 32-byte chunks produce:
+ * each chunk at offset i reads [i-off, i-off+32) and writes [i, i+32),
+ * and off >= 32 puts every source byte strictly before every destination
+ * byte of the same chunk, so the source is always final; likewise for
+ * 16-byte chunks when off >= 16 and 8-byte chunks when off >= 8.
+ * Chunking therefore replaces the out-of-line memmove call with a handful
+ * of wide moves while preserving the byte-at-a-time result. For off < 8
+ * the copy must stay byte at a time, because the source can run into the
+ * bytes this match is itself producing.
+ *
+ * Wide-copy helper: copies [d, d+len) from [src, src+len) using the
+ * widest quantum the offset allows (32/16/8 dispatched by the caller on
+ * off), with the final quantum re-copied overlapping the last full chunk
+ * (within [0, len)) rather than handled as a remainder. Requires
+ * off >= quantum so chunk sources are always final. */
+static void exec_match_wide(uint8_t *d, const uint8_t *src, size_t len,
+                            size_t quantum)
 {
     size_t i = 0;
-    uint8_t *d;
-    const uint8_t *src;
-    if (len == 0) return ZGEC_OK;
-    if (off < 1) return ZGEC_ERR_OFFSET;
-    /* Defensive re-validation (Phase A proved all of this): without these
-     * the pointer arithmetic below is UB before any byte is touched. */
-    if (len > raw_size || pos > raw_size - len) return ZGEC_ERR_RAW_LEN;
-    if ((uint64_t)off > (uint64_t)LdLl + (uint64_t)pos)
-        return ZGEC_ERR_OFFSET;
-    d = dst + pos; /* pos + len <= raw_size: stays inside OUT */
-    src = d - off; /* off <= LdLl + pos: at or after the VB start */
-    if (raw_size > 64 && pos + len > raw_size - 64) {
-        for (i = 0; i < len; i++) d[i] = src[i]; /* safe scalar tail */
-        return ZGEC_OK;
+    while (i + quantum <= len) {
+        memcpy(d + i, src + i, quantum);
+        i += quantum;
     }
-    if (off >= 8) {
-        if (len >= 8) {
-            while (i + 8 <= len) {
-                memcpy(d + i, src + i, 8);
-                i += 8;
-            }
-            memcpy(d + len - 8, src + len - 8, 8); /* within [0,len) */
-            return ZGEC_OK;
-        }
-        if (len >= 4) {
-            memcpy(d, src, 4);
-            memcpy(d + len - 4, src + len - 4, 4);
-            return ZGEC_OK;
-        }
-    }
-    for (i = 0; i < len; i++) d[i] = src[i];
-    return ZGEC_OK;
+    memcpy(d + len - quantum, src + len - quantum, quantum);
 }
 
 static zgec_err exec_block(zgec_block_arrays *ba)
@@ -1691,9 +1687,36 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                 lit_rem -= (size_t)ll;
             }
             out_pos += (uint64_t)ll;
-            me = exec_match(ba->out, (size_t)off, (size_t)ml,
-                            (size_t)out_pos, ba->raw_size, LdLl);
-            if (me != ZGEC_OK) return me;
+            /* Inlined match (was exec_match call): one assert-style offset
+             * check per seq; length bounds already proven by the
+             * out_pos + ll + ml check above, full validation lives at the
+             * segment boundaries. */
+            if (ml > 0) {
+                uint8_t *d = ba->out + (size_t)out_pos;
+                const uint8_t *msrc;
+                size_t mlen = (size_t)ml;
+                size_t moff = (size_t)off;
+                size_t k;
+                if (moff < 1 ||
+                    (uint64_t)moff > (uint64_t)LdLl + out_pos)
+                    return ZGEC_ERR_OFFSET;
+                msrc = d - moff; /* off <= LdLl + pos: at/after VB start */
+                if (ba->raw_size > 64 &&
+                    out_pos + (uint64_t)ml > (uint64_t)ba->raw_size - 64) {
+                    for (k = 0; k < mlen; k++) d[k] = msrc[k];
+                } else if (moff >= 32 && mlen >= 32) {
+                    exec_match_wide(d, msrc, mlen, 32);
+                } else if (moff >= 16 && mlen >= 16) {
+                    exec_match_wide(d, msrc, mlen, 16);
+                } else if (moff >= 8 && mlen >= 8) {
+                    exec_match_wide(d, msrc, mlen, 8);
+                } else if (moff >= 8 && mlen >= 4) {
+                    memcpy(d, msrc, 4);
+                    memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                } else {
+                    for (k = 0; k < mlen; k++) d[k] = msrc[k];
+                }
+            }
             out_pos += (uint64_t)ml;
         }
         /* Tail literals always copied (n_lit - sumLL). */
