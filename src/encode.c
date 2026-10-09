@@ -1416,7 +1416,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                 unsigned cl = zgec_mlclass(ml_arr[k] + 3u);
                 cond_hist[(size_t)cl * ZGEC_NSYM_SEQ + (size_t)cd]++;
             }
-            if (zgec_cond_net_gain(cond_hist, h_of) > 64.0) {
+            if (zgec_cond_net_gain(cond_hist, h_of) > 0.0) {
                 best.seq_cond_of = 1;
             }
             /* LL(i) on mlclass(ML(i-1)), class 0 for i == 0. */
@@ -1430,7 +1430,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                                            : zgec_mlclass(ml_arr[k - 1] + 3u);
                     cond_hist[(size_t)cl * ZGEC_NSYM_SEQ + (size_t)cd]++;
                 }
-                if (zgec_cond_net_gain(cond_hist, h_ll) > 64.0) {
+                if (zgec_cond_net_gain(cond_hist, h_ll) > 0.0) {
                     best.seq_cond_ll = 1;
                 }
             }

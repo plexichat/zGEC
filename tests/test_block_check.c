@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdint.h>
+#include "zgec.h"
 #include "zgec_block.h"
 #include "zgec_bitstream.h"
 #include "zgec_fse.h"
@@ -284,6 +285,30 @@ static void test_bitstream(void)
     printf("bitstream ok\n");
 }
 
+
+static void test_corrupted_bitstreams(void)
+{
+    uint8_t dummy[1024];
+    memset(dummy, 0xFF, sizeof(dummy));
+    uint8_t *out = NULL;
+    size_t out_size = 0;
+
+    zgec_err err = zgec_decompress(dummy, 10, &out, &out_size);
+    CHECK(err != ZGEC_OK, "truncated header rejected");
+    zgec_free(out); out = NULL;
+
+    err = zgec_decompress(dummy, sizeof(dummy), &out, &out_size);
+    CHECK(err != ZGEC_OK, "bad magic rejected");
+    zgec_free(out); out = NULL;
+
+    for (size_t len = 1; len <= 128; len += 7) {
+        err = zgec_decompress(dummy, len, &out, &out_size);
+        CHECK(err != ZGEC_OK, "random noise length rejected");
+        zgec_free(out); out = NULL;
+    }
+    printf("corrupted bitstreams ok\n");
+}
+
 int main(void)
 {
     test_block_params();
@@ -292,6 +317,7 @@ int main(void)
     test_seg_x3();
     test_seg_k3();
     test_bitstream();
+    test_corrupted_bitstreams();
     if (fails == 0) printf("ALL BLOCK/BITSTREAM CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);
     return fails ? 1 : 0;

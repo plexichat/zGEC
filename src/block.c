@@ -211,7 +211,7 @@ static size_t zgec_seg_desc_bytes_count(uint8_t table_modes,
        REPEAT carries nothing (caller omits it), and RLE is not defined for
        literals (section 7.3), so any other mode is an error. */
     if (lit_coder != 0) {
-        uint8_t lit_mode = (uint8_t)((table_modes >> 0) & ZGEC_TBL_MASK);
+        uint8_t lit_mode = (uint8_t)(((unsigned)table_modes >> 0) & ZGEC_TBL_MASK);
         if (lit_mode != ZGEC_TBL_REPEAT) {
             int n_lit_tables;
             if (lit_mode != ZGEC_TBL_NEW) return (size_t)-1;
@@ -233,7 +233,7 @@ static size_t zgec_seg_desc_bytes_count(uint8_t table_modes,
        always consumes one byte per table, the NEW form one description per
        table, and REPEAT consumes nothing. */
     {
-        uint8_t ll_mode = (uint8_t)((table_modes >> 2) & ZGEC_TBL_MASK);
+        uint8_t ll_mode = (uint8_t)(((unsigned)table_modes >> 2) & ZGEC_TBL_MASK);
         int n_ll = seq_ctx_ll ? 3 : 1;
         if (ll_mode == ZGEC_TBL_RLE) {
             for (int i = 0; i < n_ll; i++) {
@@ -260,7 +260,7 @@ static size_t zgec_seg_desc_bytes_count(uint8_t table_modes,
 
     /* ML: always 1. */
     {
-        uint8_t ml_mode = (uint8_t)((table_modes >> 4) & ZGEC_TBL_MASK);
+        uint8_t ml_mode = (uint8_t)(((unsigned)table_modes >> 4) & ZGEC_TBL_MASK);
         if (ml_mode != ZGEC_TBL_REPEAT) {
             size_t a = (avail > total) ? (avail - total) : 0;
             size_t n = 0;
@@ -278,7 +278,7 @@ static size_t zgec_seg_desc_bytes_count(uint8_t table_modes,
 
     /* OF: 1 normally, 3 when seq_ctx_of. Same hoist as LL (entry 11). */
     {
-        uint8_t of_mode = (uint8_t)((table_modes >> 6) & ZGEC_TBL_MASK);
+        uint8_t of_mode = (uint8_t)(((unsigned)table_modes >> 6) & ZGEC_TBL_MASK);
         int n_of = seq_ctx_of ? 3 : 1;
         if (of_mode == ZGEC_TBL_RLE) {
             for (int i = 0; i < n_of; i++) {
@@ -338,12 +338,12 @@ size_t zgec_seg_header_parse_ex(zgec_seg_header *sh,
     /* ---- table_modes ---- */
     uint8_t table_modes = buf[pos++];
     for (int i = 0; i < 4; i++) {
-        uint8_t mode = (table_modes >> (2 * i)) & ZGEC_TBL_MASK;
+        uint8_t mode = (uint8_t)(((unsigned)table_modes >> (2u * (unsigned)i)) & ZGEC_TBL_MASK);
         if (mode > 2) return 0;                     /* ZGEC_ERR_TABLE_MODE */
     }
     /* Spec 7.3: literal tables are 0=new, 1=repeat; RLE is not defined for
        the 256-symbol literal alphabet (decode.c rejects it as well). */
-    if (((table_modes >> 0) & ZGEC_TBL_MASK) == ZGEC_TBL_RLE) return 0;
+    if ((((unsigned)table_modes >> 0) & ZGEC_TBL_MASK) == ZGEC_TBL_RLE) return 0;
 
     /* ---- n_seq varint ---- */
     uint32_t n_seq;
@@ -528,11 +528,11 @@ size_t zgec_seg_header_emit(uint8_t *buf, size_t cap,
     }
 
     for (int i = 0; i < 4; i++) {
-        uint8_t mode = (sh->table_modes >> (2 * i)) & ZGEC_TBL_MASK;
+        uint8_t mode = (uint8_t)(((unsigned)sh->table_modes >> (2u * (unsigned)i)) & ZGEC_TBL_MASK);
         if (mode > 2) return 0;                      /* ZGEC_ERR_TABLE_MODE */
     }
     /* No RLE for literal tables (section 7.3). */
-    if (((sh->table_modes >> 0) & ZGEC_TBL_MASK) == ZGEC_TBL_RLE) return 0;
+    if ((((unsigned)sh->table_modes >> 0) & ZGEC_TBL_MASK) == ZGEC_TBL_RLE) return 0;
 
     size_t pos = 0;
 

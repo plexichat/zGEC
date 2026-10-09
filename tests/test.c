@@ -389,7 +389,7 @@ static void zgec_test_texture(int kind, uint8_t *src, size_t n)
                                                 : w[i % wl]);
             break;
         case 1: /* constant-delta ramp: sub-literal residuals vanish */
-            src[i] = (uint8_t)((i % 97u) == 0u ? (uint8_t)((r >> 9) & 0x1Fu)
+            src[i] = (uint8_t)((i % 3u) == 0u ? (uint8_t)((r >> 9) & 0x1Fu)
                                                : (uint8_t)(i * 7u));
             break;
         case 2: /* low-entropy binary: rANS over a skewed alphabet */
@@ -1201,6 +1201,8 @@ out:
             round_tripped = 1;
         }
         zgec_footer_free(&f);
+        zgec_free(cmp);
+        cmp = NULL;
         free(dict);
     }
 
