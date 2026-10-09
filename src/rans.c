@@ -216,7 +216,7 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
          * selected once per stream by a single bitmap scan. */
         int has_rs = 0;
         for (size_t i = 0; i < n_lit; i++) {
-            if (runstart[i]) { has_rs = 1; break; }
+            if (zgec_rs_get(runstart, i)) { has_rs = 1; break; }
         }
         unsigned m0 = (0 < full) ? 8u : rem;
         for (unsigned lane = 0; lane < m0 && err == ZGEC_OK; lane++) {
@@ -242,7 +242,7 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                     for (unsigned lane = 0; lane < m; lane++) {
                         size_t j = start[lane] + round;
                         unsigned ti;
-                        if (runstart[j]) {
+                        if (zgec_rs_get(runstart, j)) {
                             ti = (unsigned)k;
                         } else {
                             uint8_t pidx = idx_lut[Z[j - 1]];
@@ -353,7 +353,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
             int table_idx = 0;
             if (k > 1) {
                 if (j >= n_lit) { zgec_free(words); return 0; }
-                if (j == start[lane] || runstart[j]) {
+                if (j == start[lane] || zgec_rs_get(runstart, j)) {
                     table_idx = k;
                 } else {
                     uint8_t pidx = idx_lut[Z[j - 1]];
@@ -470,7 +470,7 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
             int table_idx = 0;
             if (n_tables > 1) {
                 if (j >= n_lit) return;
-                if (j == start[lane] || runstart[j]) {
+                if (j == start[lane] || zgec_rs_get(runstart, j)) {
                     table_idx = n_tables - 1;
                 } else {
                     uint8_t pidx = idx_lut[Z[j - 1]];

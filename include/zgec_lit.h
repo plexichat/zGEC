@@ -4,6 +4,8 @@
 #include "zgec_common.h"
 #include "zgec_rans.h"
 
+#include <string.h>
+
 /*
  * Literal coding per zGEC section 9.
  *
@@ -39,11 +41,38 @@ zgec_err zgec_class_map_decode(uint8_t *map /* 64 entries */,
 void zgec_class_map_encode(uint8_t *packed /* 24 bytes */,
                                  const uint8_t *map /* 64 entries */);
 
-/* Compute the run-start bitmap from the LL values.
- * runstart[j] != 0 if literal j is the first literal of a
- * literal run (section 9.3). n_lit is the total literal
- * count; ll[0..n_seq-1] are the literal lengths; the tail
- * literal count is n_lit - sum(ll).
+/* Run-start bitmap (9.3), packed one bit per literal, least significant
+ * bit first: literal j is a run start exactly when bit (j & 7) of byte
+ * (j >> 3) is set. The map is derived from the LL values, never stored in
+ * a frame, so packing changes no emitted byte -- it only cuts the
+ * per-segment fill and what the rANS context loop reads from n_lit bytes
+ * to n_lit/8. Allocate zgec_rs_bytes(n_lit) bytes and use only these
+ * accessors. */
+static inline size_t zgec_rs_bytes(size_t n_lit)
+{
+    return (n_lit + 7u) / 8u;
+}
+
+static inline void zgec_rs_clear(uint8_t *map, size_t n_lit)
+{
+    if (map != NULL && n_lit != 0) memset(map, 0, zgec_rs_bytes(n_lit));
+}
+
+static inline void zgec_rs_set(uint8_t *map, size_t j)
+{
+    uint8_t bit = (uint8_t)(1u << (j & 7u));
+    map[j >> 3] = (uint8_t)(map[j >> 3] | bit);
+}
+
+static inline int zgec_rs_get(const uint8_t *map, size_t j)
+{
+    return (int)((map[j >> 3] >> (j & 7u)) & 1u);
+}
+
+/* Compute the run-start bitmap from the LL values: bit j set if literal j
+ * is the first literal of a literal run (section 9.3). n_lit is the total
+ * literal count; ll[0..n_seq-1] are the literal lengths; the tail literal
+ * count is n_lit - sum(ll). The output must be zgec_rs_bytes(n_lit) bytes.
  * Returns ZGEC_OK or an error (V1: sum of LL exceeds
  * n_lit). */
 zgec_err zgec_lit_runstart(uint8_t *runstart, size_t n_lit,

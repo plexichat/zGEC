@@ -1304,9 +1304,9 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
      * traffic, so the allocation (and its writes) are skipped there.
      * Every index remains range-checked before use. */
     if (need_rs && seg->n_lit > 0) {
-        runstart = (uint8_t *)zgec_alloc(seg->n_lit, 1);
+        runstart = (uint8_t *)zgec_alloc(zgec_rs_bytes(seg->n_lit), 1);
         if (!runstart) return ZGEC_ERR_NOMEM;
-        memset(runstart, 0, seg->n_lit);
+        zgec_rs_clear(runstart, seg->n_lit);
     }
     if (seg->n_seq > 0 && seg->ll == NULL) {
         zgec_free(runstart);
@@ -1329,7 +1329,7 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                     zgec_free(runstart);
                     return ZGEC_ERR_INTERNAL;
                 }
-                runstart[start] = 1;
+                zgec_rs_set(runstart, start);
             }
         }
     }
@@ -1348,7 +1348,7 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                 zgec_free(runstart);
                 return ZGEC_ERR_LL_SUM;
             }
-            runstart[(size_t)sum_ll] = 1; /* tail run start (9.3) */
+            zgec_rs_set(runstart, (size_t)sum_ll); /* tail run start (9.3) */
         }
     }
 
@@ -2284,12 +2284,12 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         lit_stream = seg_buf + h.header_size;
         ll_stream = lit_stream + (size_t)h.lit_size;
         if (h.n_lit > 0 && h.lit_coder != 0 && h.k > 1) {
-            runstart = (uint8_t *)zgec_alloc((size_t)h.n_lit, 1);
+            runstart = (uint8_t *)zgec_alloc(zgec_rs_bytes((size_t)h.n_lit), 1);
             if (!runstart) {
                 e = ZGEC_ERR_NOMEM;
                 goto efail;
             }
-            memset(runstart, 0, (size_t)h.n_lit);
+            zgec_rs_clear(runstart, (size_t)h.n_lit);
         }
         /* The LL array is allocated, tested and read inside one block, so
          * that the read is dominated by its own NULL test. Split across
@@ -2321,11 +2321,11 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
                     goto efail;
                 }
                 if (ll[j] > 0 && runstart)
-                    runstart[(size_t)sum_ll - (size_t)ll[j]] = 1;
+                    zgec_rs_set(runstart, (size_t)sum_ll - (size_t)ll[j]);
             }
         }
         if (sum_ll < (uint64_t)h.n_lit && h.n_lit > 0 && runstart)
-            runstart[(size_t)sum_ll] = 1;
+            zgec_rs_set(runstart, (size_t)sum_ll);
         if (lit_len + (size_t)h.n_lit < lit_len) {
             zgec_free(ll);
             zgec_free(runstart);

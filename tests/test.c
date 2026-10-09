@@ -128,9 +128,9 @@ static int zgec_test_runstart(void)
     uint8_t runstart[16];
     uint32_t ll[] = {5, 3, 2};
     if (zgec_lit_runstart(runstart, 10, ll, 3) != ZGEC_OK) return 0;
-    if (!runstart[0]) return 0;
-    if (!runstart[5]) return 0;
-    if (!runstart[8]) return 0;
+    if (!zgec_rs_get(runstart, 0)) return 0;
+    if (!zgec_rs_get(runstart, 5)) return 0;
+    if (!zgec_rs_get(runstart, 8)) return 0;
     return 1;
 }
 

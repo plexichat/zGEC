@@ -409,7 +409,7 @@ static void zgec_enc_runstart(uint8_t *runstart, size_t n_lit,
     if (n_lit == 0) return;
     if (runstart == NULL) return;
     if (zgec_lit_runstart(runstart, n_lit, ll, n_seq) != ZGEC_OK) {
-        memset(runstart, 0, n_lit);
+        zgec_rs_clear(runstart, n_lit);
     }
 }
 
@@ -969,7 +969,7 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         memset(cmap_out, 0, ZGEC_ENC_NCLASS);
         return ZGEC_OK;
     }
-    runstart = (uint8_t *)zgec_alloc(n_lit, 1);
+    runstart = (uint8_t *)zgec_alloc(zgec_rs_bytes(n_lit), 1);
     hist4 = (uint32_t *)zgec_alloc(4u * hist_bytes, 64);
     if (!runstart || !hist4) {
         zgec_free(runstart);
@@ -992,7 +992,7 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
             unsigned c0, c1, c2, c3;
             uint32_t nxt;
             uint8_t prev;
-            if (runstart[j]) continue; /* run starts use their own table */
+            if (zgec_rs_get(runstart, j)) continue; /* own table */
             prev = lit[j - 1];
             nxt = (uint32_t)lit[j];
             c0 = (unsigned)(prev & 63u);
@@ -1221,7 +1221,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
         for (j = 0; j < n_z; j++) {
             int is_lane_start = 0;
             size_t li;
-            if (runstart && runstart[j]) {
+            if (runstart && zgec_rs_get(runstart, j)) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
@@ -1348,8 +1348,8 @@ static zgec_err zgec_select_coder(const zgec_params *params,
         /* Candidate: rANS with block contexts on plain literals,
          * partitioned through the block's real (mode, class map). */
         if (params->use_contexts && block_k > 1 && block_cmap) {
-            runstart = (uint8_t *)zgec_alloc(n_lit_slice ? n_lit_slice : 1,
-                                             1);
+            runstart = (uint8_t *)zgec_alloc(
+                n_lit_slice ? zgec_rs_bytes(n_lit_slice) : 1, 1);
             cls_hist = scratch_cls;
             if (!runstart) {
                 zgec_free(hist);
@@ -1369,12 +1369,13 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                 /* Rebuild run starts for this slice from its LL array. */
                 size_t pos = 0;
                 size_t t;
-                memset(runstart, 0, n_lit_slice);
+                zgec_rs_clear(runstart, n_lit_slice);
                 for (t = 0; t < n; t++) {
-                    if (ll_arr[t] > 0 && pos < n_lit_slice) runstart[pos] = 1;
+                    if (ll_arr[t] > 0 && pos < n_lit_slice)
+                        zgec_rs_set(runstart, pos);
                     pos += (size_t)ll_arr[t];
                 }
-                if (pos < n_lit_slice) runstart[pos] = 1;
+                if (pos < n_lit_slice) zgec_rs_set(runstart, pos);
             }
             {
                 double body = zgec_ctx_body_bits(seg_lit, n_lit_slice,
@@ -1442,7 +1443,8 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                 double hdr;
                 double s;
                 if (!runstart) {
-                    runstart = (uint8_t *)zgec_alloc(n_lit_slice, 1);
+                    runstart = (uint8_t *)zgec_alloc(
+                        zgec_rs_bytes(n_lit_slice), 1);
                     if (!runstart) {
                         zgec_free(hist);
                         if (cls_owned) zgec_free(cls_hist);
@@ -1453,13 +1455,13 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                 {
                     size_t pos = 0;
                     size_t t2;
-                    memset(runstart, 0, n_lit_slice);
+                    zgec_rs_clear(runstart, n_lit_slice);
                     for (t2 = 0; t2 < n; t2++) {
                         if (ll_arr[t2] > 0 && pos < n_lit_slice)
-                            runstart[pos] = 1;
+                            zgec_rs_set(runstart, pos);
                         pos += (size_t)ll_arr[t2];
                     }
-                    if (pos < n_lit_slice) runstart[pos] = 1;
+                    if (pos < n_lit_slice) zgec_rs_set(runstart, pos);
                 }
                 if (!cls_hist) {
                     cls_hist = (uint32_t *)zgec_alloc(
@@ -1663,7 +1665,7 @@ static zgec_err zgec_emit_lit_stream(uint8_t **desc, size_t *desc_size,
     }
 
     if (k > 1) {
-        runstart = (uint8_t *)zgec_alloc(lit_n, 1);
+        runstart = (uint8_t *)zgec_alloc(zgec_rs_bytes(lit_n), 1);
         if (!runstart) { err = ZGEC_ERR_NOMEM; goto done; }
         zgec_enc_runstart(runstart, lit_n, ll, n_seq);
     }

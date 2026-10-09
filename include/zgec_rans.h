@@ -68,8 +68,8 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts);
  * k:          number of contexts (1, 2, 4 or 8).
  * ctx_mode:   classification function (ZGEC_CTX_*).
  * class_map:  map from class (0..63) to context (0..k-1); NULL if k == 1.
- * runstart:   run-start bitmap, runstart[j] != 0 if literal j is a run
- *             start; NULL if k == 1.
+ * runstart:   run-start bitmap, bit j set if literal j is a run start
+ *             (packed; see zgec_rs_get in zgec_lit.h); NULL if k == 1.
  *
  * On success returns ZGEC_OK and the stream is exactly consumed (V5).
  */

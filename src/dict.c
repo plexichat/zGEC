@@ -623,7 +623,7 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
             }
         }
         if (seg->n_lit > 0) {
-            uint8_t *rs = (uint8_t *)zgec_alloc(seg->n_lit, 1);
+            uint8_t *rs = (uint8_t *)zgec_alloc(zgec_rs_bytes(seg->n_lit), 1);
             const uint8_t *lit_stream = seg_buf + hdr_size;
             if (!rs) { zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
             e0 = zgec_lit_runstart(rs, seg->n_lit, NULL, 0);
@@ -902,7 +902,7 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
 
         /* Run-start bitmap (section 9.3, incl. tail start). */
         if (seg->n_lit > 0) {
-            rs = (uint8_t *)zgec_alloc(seg->n_lit, 1);
+            rs = (uint8_t *)zgec_alloc(zgec_rs_bytes(seg->n_lit), 1);
             if (!rs) { derr = ZGEC_ERR_NOMEM; goto lit_seq_fail; }
             derr = zgec_lit_runstart(rs, seg->n_lit, seg->ll, seg->n_seq);
             if (derr != ZGEC_OK) goto lit_seq_fail;

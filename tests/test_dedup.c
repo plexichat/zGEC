@@ -114,8 +114,9 @@ static void test_runstart(void)
     uint32_t ll[2] = { 3, 4 };
     /* 3 + 4 = 7, tail 3 -> starts at 0, 3, 7. */
     CHECK(zgec_lit_runstart(rs, 10, ll, 2) == ZGEC_OK, "runstart ok");
-    CHECK(rs[0] == 1 && rs[3] == 1 && rs[7] == 1, "runstart bits");
-    CHECK(rs[1] == 0 && rs[4] == 0, "runstart gaps");
+    CHECK(zgec_rs_get(rs, 0) == 1 && zgec_rs_get(rs, 3) == 1 &&
+          zgec_rs_get(rs, 7) == 1, "runstart bits");
+    CHECK(zgec_rs_get(rs, 1) == 0 && zgec_rs_get(rs, 4) == 0, "runstart gaps");
     /* Over-sum rejected, buffer untouched is checked by caller contract. */
     {
         uint32_t bad[1] = { 11 };

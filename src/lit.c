@@ -191,18 +191,18 @@ zgec_err zgec_lit_runstart(uint8_t *runstart,
 
     /* Pass 2: fill. Pass 1 proved pos <= n_lit at every step, so both
      * the index below and the advance are in range. */
-    memset(runstart, 0, n_lit);
+    zgec_rs_clear(runstart, n_lit);
     size_t pos = 0;
     for (size_t i = 0; i < n_seq; i++) {
         size_t add = (size_t)ll[i];
         if (add != 0) {
-            runstart[pos] = 1;
+            zgec_rs_set(runstart, pos);
         }
         pos += add;
     }
     /* Tail start (j == sum LL) when tail literals exist. */
     if (pos < n_lit) {
-        runstart[pos] = 1;
+        zgec_rs_set(runstart, pos);
     }
     return ZGEC_OK;
 }
