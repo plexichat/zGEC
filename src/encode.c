@@ -902,14 +902,14 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
 /* Choose the context mode and count for the block (plain literals).
  * Builds the 64-class next-byte histogram (run starts skipped) for each
  * of LSB6/MSB6/TEXT/SIGNED in one pass over the literals, then clusters
- * each mode's classes greedily and jointly picks the (mode, k in
- * {1,2,4,8}) minimising body bits plus the block-parameter header
- * (2 bytes for k=1, 26 bytes otherwise). Every mode is clustered: how
- * far merging lowers the body depends on the mode, so ranking the modes
- * by their 64-class entropy is not a valid short cut. k=1 canonicalises
+ * the two most promising modes greedily and jointly picks the (mode, k
+ * in {1,2,4,8}) minimising body bits plus the block-parameter header
+ * (2 bytes for k=1, 26 bytes otherwise). Modes are ranked by their free
+ * 64-class singleton total (sum of class entropies, a prefix of the
+ * greedy run); only the best 2 are clustered. k=1 canonicalises
  * to mode 0. The map is emitted once per block; segments only pick
  * tables.
- * Cost note (P8): one 4*64*256-u32 histogram build plus 4 greedy
+ * Cost note (P8): one 4*64*256-u32 histogram build plus 2 greedy
  * clusterings (each O(64^2*256) seed + 63 merges with one refreshed
  * row each). Once per block; acceptable next to parse/emit. */
 static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
@@ -975,14 +975,48 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
 
     {
         double best_total = 0.0;
+        double sing[4];
+        int order[4] = { 0, 1, 2, 3 };
+        int oi;
         int first = 1;
+        /* Free mode ranking: sum of singleton class entropies, a strict
+         * prefix of the greedy run (no merges yet). One 64x256 scan per
+         * mode versus a full O(64^2*256) clustering each. */
         for (mi = 0; mi < 4; mi++) {
+            const uint32_t *hm =
+                hist4 + (size_t)mi * (size_t)64 * 256u;
+            double t = 0.0;
+            int c;
+            for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
+                const uint32_t *row = hm + (size_t)c * 256u;
+                uint64_t rt = 0;
+                int s;
+                for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+                    rt += (uint64_t)row[(size_t)s];
+                }
+                t += zgec_class_entropy(row, rt);
+            }
+            sing[(size_t)mi] = t;
+        }
+        /* Insertion sort of 4 mode indices by singleton total. */
+        for (oi = 1; oi < 4; oi++) {
+            int key = order[(size_t)oi];
+            double keyv = sing[(size_t)key];
+            int jj = oi - 1;
+            while (jj >= 0 && sing[(size_t)order[(size_t)jj]] > keyv) {
+                order[(size_t)(jj + 1)] = order[(size_t)jj];
+                jj--;
+            }
+            order[(size_t)(jj + 1)] = key;
+        }
+        for (oi = 0; oi < 2; oi++) {
             double b8 = 0.0;
             double b4 = 0.0;
             double b2 = 0.0;
             double b1 = 0.0;
             uint8_t assign[4][ZGEC_ENC_NCLASS];
             int ki;
+            mi = order[(size_t)oi];
             zgec_cluster_greedy(hist4 + (size_t)mi * (size_t)64 * 256u,
                                 &b8, &b4, &b2, &b1, assign);
             for (ki = 0; ki < 4; ki++) {
