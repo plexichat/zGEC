@@ -1203,11 +1203,22 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
         size_t lane_pos[ZGEC_NLANES];
         size_t n_lane = 0;
         unsigned lane;
+        /* Byte -> context group, resolved once (estimate-only: out-of-range
+         * classes/groups fold to 0, as the per-byte clamps below did). */
+        uint8_t grp_lut[256];
+        unsigned b;
         for (lane = 0; lane < (unsigned)ZGEC_NLANES; lane++) {
             if (start[lane] < n_z) lane_pos[n_lane++] = start[lane];
         }
+        for (b = 0; b < 256u; b++) {
+            unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
+            unsigned grp;
+            if (cls >= 64u) cls = 0u;
+            grp = (unsigned)cmap[cls];
+            if (grp >= (unsigned)k) grp = 0u;
+            grp_lut[b] = (uint8_t)grp;
+        }
         for (j = 0; j < n_z; j++) {
-            unsigned cls;
             int is_lane_start = 0;
             size_t li;
             if (runstart && runstart[j]) {
@@ -1229,11 +1240,8 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             rs_total++;
             continue;
         }
-        cls = zgec_classify(ctx_mode, z[j - 1]);
-        if (cls >= 64u) cls = 0u;
         {
-            unsigned grp = (unsigned)cmap[cls];
-            if (grp >= (unsigned)k) grp = 0u;
+            unsigned grp = (unsigned)grp_lut[z[j - 1]];
             cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
             grp_total[grp]++;
         }

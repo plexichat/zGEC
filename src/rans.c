@@ -21,6 +21,21 @@ static int zgec_rans_ctx_mode_valid(int ctx_mode)
            ctx_mode == ZGEC_CTX_SIGNED;
 }
 
+/* Byte -> context-table index for one (mode, map, k), resolved once.
+ * 0xFF marks a byte whose class maps outside the table set; callers
+ * reject it when a literal follows it. k <= 8, so a real index never
+ * collides with the sentinel. Same table the decoder builds inline. */
+static void zgec_rans_build_idx_lut(uint8_t lut[256], int ctx_mode,
+                                    const uint8_t *class_map, int k)
+{
+    unsigned b;
+    for (b = 0; b < 256u; b++) {
+        unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
+        if (cls >= 64u || (int)class_map[cls] >= k) lut[b] = 0xFFu;
+        else lut[b] = class_map[cls];
+    }
+}
+
 /* ---- decoder tables (Annex B.1) ---- */
 
 zgec_err zgec_rans_build_dec(zgec_rans_dec_table *t, const int16_t *counts)
@@ -260,8 +275,10 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     for (unsigned lane = 0; lane < 8; lane++) state[lane] = ZGEC_RANS_STATE_MIN;
 
     size_t max_rounds = 0;
+    uint8_t idx_lut[256];
     for (unsigned lane = 0; lane < 8; lane++)
         if (len[lane] > max_rounds) max_rounds = len[lane];
+    if (k > 1) zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, k);
     for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
         size_t round = round_p1 - 1;
         for (int lane = 7; lane >= 0; lane--) {
@@ -273,10 +290,9 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 if (j == start[lane] || runstart[j]) {
                     table_idx = k;
                 } else {
-                    unsigned cls = zgec_classify(ctx_mode, Z[j - 1]);
-                    if (cls >= 64u) { zgec_free(words); return 0; }
-                    if ((int)class_map[cls] >= k) { zgec_free(words); return 0; }
-                    table_idx = (int)class_map[cls];
+                    uint8_t pidx = idx_lut[Z[j - 1]];
+                    if (pidx == 0xFFu) { zgec_free(words); return 0; }
+                    table_idx = (int)pidx;
                 }
                 if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
             }
@@ -377,7 +393,10 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
 
     size_t start[8];
     size_t len[8];
+    uint8_t idx_lut[256];
     zgec_lit_lane_geom(start, len, n_lit);
+    if (n_tables > 1)
+        zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
 
     for (unsigned lane = 0; lane < 8; lane++) {
         for (size_t t = 0; t < len[lane]; t++) {
@@ -388,9 +407,9 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
                 if (j == start[lane] || runstart[j]) {
                     table_idx = n_tables - 1;
                 } else {
-                    unsigned cls = zgec_classify(ctx_mode, Z[j - 1]);
-                    if (cls >= 64u) return;
-                    table_idx = (int)class_map[cls];
+                    uint8_t pidx = idx_lut[Z[j - 1]];
+                    if (pidx == 0xFFu) return;
+                    table_idx = (int)pidx;
                 }
                 if (table_idx < 0 || table_idx >= n_tables) return;
             }
