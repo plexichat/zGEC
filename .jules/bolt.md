@@ -85,3 +85,14 @@ When designing multi-threaded compressors or decoders, use atomic fetch-add for 
 
 **Action:**
 Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-lane hash buckets with 128-bit SIMD masks, and consolidate multi-table hash input loads into a single 64-bit load.
+
+## 2026-10-14 - Encode Path AVX2 SIMD Vectorization across Sequence Preparation and Histograms
+
+**Learning:**
+1. In `zgec_seg_prep_build` (`src/encode.c`), extracting sequence fields (`ll`, `mlv`, `ofv`, `mls`, `ml_sum`) operated sequentially. Vectorizing 8 sequences at a time using 256-bit AVX2 SIMD intrinsics (`_mm256_sub_epi32`, `_mm256_max_epi32`, `_mm256_add_epi32`, and SIMD stores) accelerates segment preparation overhead.
+2. In `zgec_enc_entropy_bits_u32` and `zgec_select_contexts` (`src/encode.c`), 256-element histogram summation previously used scalar accumulation. Vectorizing with AVX2 (`_mm256_loadu_si256` and `_mm256_add_epi32`) reduces histogram total computation time.
+3. In `zgec_rans_histograms` (`src/rans.c`), single-table histogram generation previously suffered from loop-carried dependencies when consecutive identical symbols appeared. Using 4 parallel accumulation buffers followed by 256-bit AVX2 vector additions eliminates dependency stalls while preserving exact counts.
+4. In `zgec_seq_rle_symbol` (`src/seq.c`), evaluating sequence values for RLE candidates previously checked each value individually. Comparing 8 values per iteration with `_mm256_cmpeq_epi32` rapidly confirms uniform sequence symbols.
+
+**Action:**
+Vectorize sequence array transformations and 256-element histogram summations with AVX2 SIMD, and use parallel accumulation arrays to eliminate loop-carried dependencies in symbol counting loops.

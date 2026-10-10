@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_seq.h"
 #include "zgec_internal.h"
 
@@ -295,7 +298,22 @@ int zgec_seq_rle_symbol(const uint32_t *values, size_t n)
     if (n == 0 || values == NULL) return -1;
     uint8_t dummy;
     uint8_t code0 = zgec_seq_code_of(values[0], &dummy);
-    for (size_t i = 1; i < n; i++) {
+    size_t i = 1;
+#if defined(__AVX2__)
+    __m256i v0 = _mm256_set1_epi32((int)values[0]);
+    while (i + 8 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
+        unsigned mask = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, v0)));
+        if (mask != 0xFFu) {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t c = zgec_seq_code_of(values[i + k], &dummy);
+                if (c != code0) return -1;
+            }
+        }
+        i += 8;
+    }
+#endif
+    for (; i < n; i++) {
         uint8_t c = zgec_seq_code_of(values[i], &dummy);
         if (c != code0) return -1;
     }

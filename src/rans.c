@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_rans.h"
 
 #include "zgec_lit.h"
@@ -493,15 +496,33 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
          * streams; with one table it is pure overhead. Counts match the
          * lane loop byte for byte. */
         size_t i = 0;
+        uint32_t c0[ZGEC_NSYM_LIT] = {0};
+        uint32_t c1[ZGEC_NSYM_LIT] = {0};
+        uint32_t c2[ZGEC_NSYM_LIT] = {0};
+        uint32_t c3[ZGEC_NSYM_LIT] = {0};
         for (; i + 4 <= n_lit; i += 4) {
-            tables_counts[Z[i]]++;
-            tables_counts[Z[i + 1]]++;
-            tables_counts[Z[i + 2]]++;
-            tables_counts[Z[i + 3]]++;
+            c0[Z[i]]++;
+            c1[Z[i + 1]]++;
+            c2[Z[i + 2]]++;
+            c3[Z[i + 3]]++;
         }
         for (; i < n_lit; i++) {
-            tables_counts[Z[i]]++;
+            c0[Z[i]]++;
         }
+#if defined(__AVX2__)
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+            __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+            __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+            _mm256_storeu_si256((__m256i *)(tables_counts + s), sum);
+        }
+#else
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
+            tables_counts[s] = c0[s] + c1[s] + c2[s] + c3[s];
+        }
+#endif
         return;
     }
 
