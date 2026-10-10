@@ -216,8 +216,8 @@ static void cli_usage(FILE *f, const char *argv0)
         "\n"
         "options:\n"
         "  -l, --level N       1 (fastest) .. 25 (best ratio); default 6.\n"
-        "                      Levels 4-10 and 12 are implemented; 1-3 and\n"
-        "                      11, 13-25 are reserved and rejected.\n"
+        "                      Levels 4-10 and 12-25 are implemented; 1-3 and\n"
+        "                      11 are reserved and rejected.\n"
         "  -T, --threads N     worker threads (0 = one per core); default 0\n"
         "      --tier T        match finder tier: fast, main, high\n"
         "      --block-log2 N  block size log2, 16..26 (default: the level\n"
@@ -323,19 +323,19 @@ static const cli_level cli_levels[CLI_LEVEL_MAX] = {
     /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 1 },
     /* 11 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
     /* 12 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21, 1 },
-    /* 13 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 14 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 15 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 16 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 17 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 18 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 19 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 20 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 21 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 22 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 23 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 24 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 25 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 }
+    /* 13 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 1, 21, 1 },
+    /* 14 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 21, 1 },
+    /* 15 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 1 },
+    /* 16 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 1 },
+    /* 17 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 1 },
+    /* 18 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 1 },
+    /* 19 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
+    /* 20 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
+    /* 21 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
+    /* 22 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
+    /* 23 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
+    /* 24 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
+    /* 25 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)
@@ -498,7 +498,7 @@ int main(int argc, char **argv)
                  * learns the number is valid and simply not built yet. */
                 if (!cli_levels[(int)num - 1].impl) {
                     fprintf(stderr, "zgec: level %ld is not implemented "
-                                    "(implemented levels: 4-10 and 12)\n",
+                                    "(implemented levels: 4-10 and 12-25)\n",
                             num);
                     return 1;
                 }
