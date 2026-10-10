@@ -186,8 +186,45 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     for (unsigned lane = 0; lane < 8; lane++) if (len[lane] > full) rem++;
     zgec_err err = ZGEC_OK;
     if (k == 1) {
-        for (size_t round = 0; round < max_rounds && err == ZGEC_OK; round++) {
-            unsigned m = (round < full) ? 8u : rem;
+        size_t round = 0;
+        uint32_t x0 = state[0], x1 = state[1], x2 = state[2], x3 = state[3];
+        uint32_t x4 = state[4], x5 = state[5], x6 = state[6], x7 = state[7];
+        size_t s0 = start[0], s1 = start[1], s2 = start[2], s3 = start[3];
+        size_t s4 = start[4], s5 = start[5], s6 = start[6], s7 = start[7];
+
+        for (; round < full; round++) {
+#define RANS_DECODE_LANE(x, s) do { \
+                uint32_t e = pk[x & (uint32_t)(ZGEC_RANS_M - 1)]; \
+                uint32_t f = (e >> 8) & 0xFFFu; \
+                if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; } \
+                Z[s + round] = (uint8_t)e; \
+                x = f * (x >> ZGEC_RANS_L) + (e >> 20); \
+                if (x < ZGEC_RANS_STATE_MIN) { \
+                    if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } \
+                    x = (x << 16) | zgec_rd16(cursor); \
+                    cursor += 2; \
+                    remaining -= 2; \
+                } \
+            } while (0)
+
+            RANS_DECODE_LANE(x0, s0);
+            RANS_DECODE_LANE(x1, s1);
+            RANS_DECODE_LANE(x2, s2);
+            RANS_DECODE_LANE(x3, s3);
+            RANS_DECODE_LANE(x4, s4);
+            RANS_DECODE_LANE(x5, s5);
+            RANS_DECODE_LANE(x6, s6);
+            RANS_DECODE_LANE(x7, s7);
+
+#undef RANS_DECODE_LANE
+            if (err != ZGEC_OK) break;
+        }
+
+        state[0] = x0; state[1] = x1; state[2] = x2; state[3] = x3;
+        state[4] = x4; state[5] = x5; state[6] = x6; state[7] = x7;
+
+        for (; round < max_rounds && err == ZGEC_OK; round++) {
+            unsigned m = rem;
             for (unsigned lane = 0; lane < m; lane++) {
                 size_t j = start[lane] + round;
                 uint32_t x = state[lane];
