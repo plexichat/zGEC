@@ -286,6 +286,47 @@ static void test_bitstream(void)
 }
 
 
+#include "zgec_rans.h"
+
+static void test_rans_context_bounds(void)
+{
+    /* Test zgec_rans_decode with invalid class_map bounds and malformed streams */
+    uint8_t Z[64] = {0};
+    uint8_t stream[64] = {0};
+    zgec_rans_dec_table tables[9];
+    uint8_t class_map[64];
+    uint8_t runstart[64] = {0};
+
+    /* Build a valid dummy dec table */
+    int16_t counts[256];
+    for (int i = 0; i < 256; i++) counts[i] = (i < 8) ? 256 : 0;
+    for (int t = 0; t < 9; t++) {
+        zgec_err e = zgec_rans_build_dec(&tables[t], counts);
+        CHECK(e == ZGEC_OK, "build dec table");
+    }
+
+    /* Set up stream header state (state >= ZGEC_RANS_STATE_MIN = 65536) */
+    for (int lane = 0; lane < 8; lane++) {
+        zgec_wr32(stream + 4 * lane, 65536);
+    }
+
+    /* Invalid class_map entry >= k (k=2, entry=2) */
+    memset(class_map, 0, sizeof(class_map));
+    class_map[0] = 2; /* invalid for k=2 */
+
+    zgec_err err = zgec_rans_decode(Z, 16, stream, sizeof(stream),
+                                    tables, 2, ZGEC_CTX_LSB6, class_map, runstart);
+    CHECK(err == ZGEC_ERR_CLASS_MAP, "invalid class_map entry rejected");
+
+    /* Valid class_map but truncated stream (stream_size < 32) */
+    class_map[0] = 0;
+    err = zgec_rans_decode(Z, 16, stream, 16,
+                            tables, 2, ZGEC_CTX_LSB6, class_map, runstart);
+    CHECK(err == ZGEC_ERR_TRUNCATED, "short stream rejected");
+
+    printf("rans context bounds ok\n");
+}
+
 static void test_corrupted_bitstreams(void)
 {
     uint8_t dummy[1024];
@@ -317,6 +358,7 @@ int main(void)
     test_seg_x3();
     test_seg_k3();
     test_bitstream();
+    test_rans_context_bounds();
     test_corrupted_bitstreams();
     if (fails == 0) printf("ALL BLOCK/BITSTREAM CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);
