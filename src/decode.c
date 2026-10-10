@@ -979,7 +979,9 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     unsigned nacc;
     const uint8_t *ptr;
     size_t left;
+    uint8_t stack_clsbuf[1024];
     uint8_t *clsbuf = NULL;
+    int clsbuf_allocated = 0;
     if (stream == NULL && ssize > 0) return ZGEC_ERR_TRUNCATED;
     if (ssize == 0) return ZGEC_ERR_STREAM_SIZE;
     if (!t[0] || !t[1] || !t[2]) return ZGEC_ERR_TABLE_MODE;
@@ -996,8 +998,13 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         if (!zgec_br_done(&br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
         return ZGEC_OK;
     }
-    clsbuf = (uint8_t *)zgec_alloc(n, _Alignof(uint8_t));
-    if (!clsbuf) return ZGEC_ERR_NOMEM;
+    if (n <= sizeof(stack_clsbuf)) {
+        clsbuf = stack_clsbuf;
+    } else {
+        clsbuf = (uint8_t *)zgec_alloc(n, _Alignof(uint8_t));
+        if (!clsbuf) return ZGEC_ERR_NOMEM;
+        clsbuf_allocated = 1;
+    }
     if (use_prev) {
         clsbuf[0] = 0;
         for (i = 1; i < n; i++)
@@ -1007,11 +1014,11 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
     }
     zgec_br_init(&br, stream, ssize);
-    if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM_SENTINEL; }
+    if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM_SENTINEL; }
     S = (unsigned)1 << (unsigned)al;
     state = zgec_br_read(&br, (unsigned)al);
-    if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
-    if (state >= S) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+    if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+    if (state >= S) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
     acc = br.acc;
     nacc = br.nacc;
     ptr = br.ptr;
@@ -1072,25 +1079,25 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         uint32_t extra = 0;
         uint32_t bits = 0;
         int32_t next = 0;
-        if (cls > 2u) { zgec_free(clsbuf); return ZGEC_ERR_INTERNAL; }
+        if (cls > 2u) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_INTERNAL; }
         en = &t[cls]->e[state];
         sym = (int)en->symbol;
-        if (sym < 0 || sym >= ZGEC_NSYM_SEQ) { zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
-        if (zgec_seq_nbits[sym] > 32u) { zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
+        if (sym < 0 || sym >= ZGEC_NSYM_SEQ) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
+        if (zgec_seq_nbits[sym] > 32u) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
         if (zgec_seq_nbits[sym] > 0) {
             extra = zgec_br_read(&br, (unsigned)zgec_seq_nbits[sym]);
-            if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+            if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
         }
         out[i] = zgec_seq_base[sym] + extra;
         if (i + 1 < n) {
             bits = zgec_br_read(&br, (unsigned)en->nb_bits);
-            if (br.overflow) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+            if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
             next = en->baseline + (int32_t)bits;
-            if (next < 0 || (unsigned)next >= S) { zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+            if (next < 0 || (unsigned)next >= S) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
             state = (unsigned)next;
         }
     }
-    zgec_free(clsbuf);
+    if (clsbuf_allocated) zgec_free(clsbuf);
     if (!zgec_br_done(&br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED; /* V5 */
     return ZGEC_OK;
 bad_internal:
@@ -1098,14 +1105,14 @@ bad_internal:
     br.nacc = nacc;
     br.ptr = ptr;
     br.left = left;
-    zgec_free(clsbuf);
+    if (clsbuf_allocated) zgec_free(clsbuf);
     return ZGEC_ERR_INTERNAL;
 bad_symbol:
     br.acc = acc;
     br.nacc = nacc;
     br.ptr = ptr;
     br.left = left;
-    zgec_free(clsbuf);
+    if (clsbuf_allocated) zgec_free(clsbuf);
     return ZGEC_ERR_FSE_SYMBOL;
 bad_stream:
     br.acc = acc;
@@ -1113,7 +1120,7 @@ bad_stream:
     br.ptr = ptr;
     br.left = left;
     br.overflow = 1;
-    zgec_free(clsbuf);
+    if (clsbuf_allocated) zgec_free(clsbuf);
     return ZGEC_ERR_BITSTREAM;
 }
 
