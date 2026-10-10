@@ -829,10 +829,17 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     uint32_t state = 0;
     unsigned S = 0;
     int al;
-    size_t i;
+    size_t i = 0;
+    uint64_t acc;
+    unsigned nacc;
+    const uint8_t *ptr;
+    size_t left;
+    zgec_err err = ZGEC_ERR_BITSTREAM;
+
     zgec_err e = check_stream_sentinel(stream, ssize);
     if (e != ZGEC_OK) return e;
     if (!t[0] || !t[1] || !t[2]) return ZGEC_ERR_TABLE_MODE;
+    if (!t[0]->e || !t[1]->e || !t[2]->e) return ZGEC_ERR_TABLE_MODE;
     al = t[0]->al;
     if (t[1]->al != al || t[2]->al != al) return ZGEC_ERR_FSE_AL; /* V6 */
     zgec_br_init(&br, stream, ssize);
@@ -841,7 +848,68 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     state = zgec_br_read(&br, (unsigned)al);
     if (br.overflow) return ZGEC_ERR_BITSTREAM;
     if (state >= S) return ZGEC_ERR_BITSTREAM;
-    for (i = 0; i < n; i++) {
+
+    acc = br.acc;
+    nacc = br.nacc;
+    ptr = br.ptr;
+    left = br.left;
+
+    while (i < n && left > 16u) {
+        unsigned cls;
+        const zgec_fse_dec_entry *en;
+        unsigned sym;
+        unsigned xb = 0u;
+        uint32_t extra = 0u;
+        unsigned nbq;
+        uint32_t bits;
+        int32_t next;
+        unsigned nb;
+        uint64_t w;
+
+        if (use_prev)
+            cls = (i == 0) ? 0u : zgec_mlclass(ml[i - 1]);
+        else
+            cls = zgec_mlclass(ml[i]);
+
+        en = &t[cls]->e[state];
+        if (en->symbol < 0 || en->symbol >= ZGEC_NSYM_SEQ) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+        sym = (unsigned)en->symbol;
+
+        xb = (unsigned)zgec_seq_nbits[sym];
+
+        /* refill to 56..63 bits */
+        nb = (63u - nacc) >> 3;
+        w = zgec_rd64(ptr - 7);
+        acc |= w >> nacc;
+        nacc += 8u * nb;
+        ptr -= nb;
+        left -= nb;
+
+        extra = (uint32_t)((acc >> 1) >> (63u - xb));
+        acc <<= xb;
+        nacc -= xb;
+
+        out[i] = zgec_seq_base[sym] + extra;
+
+        if (i + 1 < n) {
+            nbq = (unsigned)en->nb_bits;
+            bits = (uint32_t)((acc >> 1) >> (63u - nbq));
+            acc <<= nbq;
+            nacc -= nbq;
+
+            next = en->baseline + (int32_t)bits;
+            if (next < 0 || (unsigned)next >= S) { err = ZGEC_ERR_BITSTREAM; goto bad; }
+            state = (unsigned)next;
+        }
+        i++;
+    }
+
+    br.acc = acc;
+    br.nacc = nacc;
+    br.ptr = ptr;
+    br.left = left;
+
+    for (; i < n; i++) {
         unsigned cls;
         const zgec_fse_dec_entry *en;
         int sym;
@@ -871,6 +939,13 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     }
     if (!zgec_br_done(&br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED; /* V5 */
     return ZGEC_OK;
+
+bad:
+    br.acc = acc;
+    br.nacc = nacc;
+    br.ptr = ptr;
+    br.left = left;
+    return err;
 }
 
 /* ---- Phase A: decode one segment (section 10.2) ---- */
@@ -1282,31 +1357,22 @@ static zgec_err decode_segment(zgec_segment_arrays *seg,
  * the run, which together cover it. */
 static void exec_copy_literals(uint8_t *d, const uint8_t *s, size_t n)
 {
-    size_t i = 0;
-    if (n >= 16) {
-        while (i + 16 <= n) {
-            memcpy(d + i, s + i, 16);
-            i += 16;
-        }
-        memcpy(d + n - 16, s + n - 16, 16);
+    if (n <= 8) {
+        if (n == 0) return;
+        memcpy(d, s, 8);
         return;
     }
-    if (n >= 8) {
+    if (n <= 16) {
         memcpy(d, s, 8);
         memcpy(d + n - 8, s + n - 8, 8);
         return;
     }
-    if (n >= 4) {
-        memcpy(d, s, 4);
-        memcpy(d + n - 4, s + n - 4, 4);
-        return;
+    size_t i = 0;
+    while (i + 16 <= n) {
+        memcpy(d + i, s + i, 16);
+        i += 16;
     }
-    if (n >= 2) {
-        memcpy(d, s, 2);
-        memcpy(d + n - 2, s + n - 2, 2);
-        return;
-    }
-    if (n == 1) d[0] = s[0];
+    memcpy(d + n - 16, s + n - 16, 16);
 }
 
 static zgec_err exec_literals_plain(uint8_t *dst, const uint8_t *lit, size_t n,
