@@ -1425,7 +1425,6 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
 static zgec_err exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
                            size_t raw_size, size_t LdLl)
 {
-    size_t i = 0;
     uint8_t *d;
     const uint8_t *src;
     if (len == 0) return ZGEC_OK;
@@ -1438,42 +1437,101 @@ static zgec_err exec_match(uint8_t *dst, size_t off, size_t len, size_t pos,
     d = dst + pos; /* pos + len <= raw_size: stays inside OUT */
     src = d - off; /* off <= LdLl + pos: at or after the VB start */
     if (raw_size > 64 && pos + len > raw_size - 64) {
-        for (i = 0; i < len; i++) d[i] = src[i]; /* safe scalar tail */
+        if (off == 1) {
+            memset(d, src[0], len);
+            return ZGEC_OK;
+        }
+        for (size_t i = 0; i < len; i++) d[i] = src[i]; /* safe scalar tail */
         return ZGEC_OK;
     }
     if (off == 1) {
         memset(d, src[0], len);
         return ZGEC_OK;
     }
+    if (off == 2) {
+        uint16_t v16 = zgec_rd16(src);
+        uint64_t v64 = (uint64_t)v16 * 0x0001000100010001ULL;
+        size_t i = 0;
+        while (i + 8 <= len) {
+            memcpy(d + i, &v64, 8);
+            i += 8;
+        }
+        if (i < len) {
+            memcpy(d + i, &v64, 8);
+        }
+        return ZGEC_OK;
+    }
+    if (off == 3) {
+        uint8_t s0 = src[0], s1 = src[1], s2 = src[2];
+        size_t i = 0;
+        while (i + 3 <= len) {
+            d[i] = s0; d[i + 1] = s1; d[i + 2] = s2;
+            i += 3;
+        }
+        if (i < len) {
+            d[i] = s0;
+            if (i + 1 < len) d[i + 1] = s1;
+        }
+        return ZGEC_OK;
+    }
     if (off >= 16) {
-        if (len <= 8) {
-            memcpy(d, src, 8);
+        if (len == 3) {
+            d[0] = src[0]; d[1] = src[1]; d[2] = src[2];
             return ZGEC_OK;
         }
-        if (len <= 16) {
+        if (len < 8) {
+            memcpy(d, src, 4);
+            memcpy(d + len - 4, src + len - 4, 4);
+            return ZGEC_OK;
+        }
+        if (len < 16) {
             memcpy(d, src, 8);
             memcpy(d + len - 8, src + len - 8, 8);
             return ZGEC_OK;
         }
+        size_t i = 0;
         while (i + 16 <= len) {
             memcpy(d + i, src + i, 16);
             i += 16;
         }
-        memcpy(d + len - 16, src + len - 16, 16);
+        if (i < len) {
+            memcpy(d + len - 16, src + len - 16, 16);
+        }
         return ZGEC_OK;
-    } else if (off >= 8) {
-        if (len <= 8) {
-            memcpy(d, src, 8);
+    }
+    if (off >= 8) {
+        if (len == 3) {
+            d[0] = src[0]; d[1] = src[1]; d[2] = src[2];
             return ZGEC_OK;
         }
+        if (len < 8) {
+            memcpy(d, src, 4);
+            memcpy(d + len - 4, src + len - 4, 4);
+            return ZGEC_OK;
+        }
+        size_t i = 0;
         while (i + 8 <= len) {
             memcpy(d + i, src + i, 8);
             i += 8;
         }
-        memcpy(d + len - 8, src + len - 8, 8);
+        if (i < len) {
+            memcpy(d + len - 8, src + len - 8, 8);
+        }
         return ZGEC_OK;
     }
-    for (i = 0; i < len; i++) d[i] = src[i];
+    /* 4 <= off < 8 */
+    if (len == 3) {
+        d[0] = src[0]; d[1] = src[1]; d[2] = src[2];
+        return ZGEC_OK;
+    }
+    size_t i = 0;
+    while (i + 4 <= len) {
+        memcpy(d + i, src + i, 4);
+        i += 4;
+    }
+    if (i < len) {
+        memcpy(d + len - 4, src + len - 4, 4);
+    }
     return ZGEC_OK;
 }
 
