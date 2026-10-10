@@ -85,3 +85,15 @@ When designing multi-threaded compressors or decoders, use atomic fetch-add for 
 
 **Action:**
 Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-lane hash buckets with 128-bit SIMD masks, and consolidate multi-table hash input loads into a single 64-bit load.
+
+## 2026-10-13 - Comprehensive AVX2 SIMD Vectorization in Decompression Hot Paths
+
+**Learning:**
+1. In Phase B decompression (`exec_copy_literals` and `exec_match_wide`), replacing byte/word loops with 256-bit AVX2 vector loads and stores (`_mm256_loadu_si256`/`_mm256_storeu_si256`) accelerates literal copying and match reconstruction across 32-byte blocks.
+2. For small match offsets (`moff = 2, 4, 8, 16`), broadcasting pattern registers into 256-bit AVX2 vectors (`_mm256_set1_epi16`, `_mm256_set1_epi32`, `_mm256_set1_epi64x`, `_mm256_broadcastsi128_si256`) enables writing 32 repeated bytes per store without scalar byte iterations.
+3. In sub-literal prediction decoding (`exec_literals_sub`), when `rep0 >= 32`, vectorizing residual addition with 256-bit `_mm256_add_epi8` computes 32 decoded sub-literals per SIMD instruction.
+4. In 8-lane rANS decoding (`zgec_rans_decode`), gathering packed slots across 8 lanes simultaneously with `_mm256_i32gather_epi32` and computing state transitions with `_mm256_mullo_epi32` accelerates rANS symbol decoding during full rounds when no lane requires state renormalization.
+5. In inverse pre-filtering (`zgec_filter_inverse` DELTA mode), 128-bit vector shifts (`_mm_slli_si128`) and byte additions (`_mm_add_epi8`) compute 16-byte prefix sums in parallel.
+
+**Action:**
+Always use 256-bit AVX2 vector operations for literal copies, pattern broadcasts, sub-literal residual additions, rANS 8-lane state gathers, and delta filter inverse prefix sums in decompression hot paths.
