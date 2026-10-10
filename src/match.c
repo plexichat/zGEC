@@ -823,9 +823,16 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             if ((size_t)pos < ip) {
                 d = (uint32_t)(ip - (size_t)pos);
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
-                    len = mf_match_len(vb, ip, d, cap);
-                    if (len >= hash_min) {
-                        mf_candidate(d, len, &best);
+                    /* A candidate can only beat `best` if it matches at
+                     * best.length - 1 as well; one byte compare there skips
+                     * the length scan for the candidates that cannot. */
+                    if (best.length == 0u || best.length > cap ||
+                        vb[ip - (size_t)d + (size_t)best.length - 1u] ==
+                        vb[ip + (size_t)best.length - 1u]) {
+                        len = mf_match_len(vb, ip, d, cap);
+                        if (len >= hash_min) {
+                            mf_candidate(d, len, &best);
+                        }
                     }
                 }
             }
