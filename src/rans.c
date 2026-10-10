@@ -300,6 +300,38 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     return err;
 }
 
+static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_t s,
+                                          uint32_t *state_ptr, uint16_t *words,
+                                          size_t *nwords_ptr, size_t words_cap)
+{
+    uint64_t f = tab->f[s];
+    if (f == 0) return -1;
+    uint64_t xmax = f << 21;
+    uint32_t x = *state_ptr;
+    if ((uint64_t)x >= xmax) {
+        if (*nwords_ptr >= words_cap) return -1;
+        words[(*nwords_ptr)++] = (uint16_t)(x & 0xFFFFu);
+        x >>= 16;
+    }
+    uint32_t recip = tab->f_recip[s];
+    uint32_t quo;
+    int64_t rems;
+    if (f == 1u) {
+        quo = x;
+        rems = 0;
+    } else {
+        uint64_t prod = (uint64_t)x * (uint64_t)recip;
+        quo = (uint32_t)(prod >> 32);
+        rems = (int64_t)x - (int64_t)quo * (int64_t)f;
+        if (rems < 0) {
+            quo--;
+            rems += (int64_t)f;
+        }
+    }
+    *state_ptr = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+    return 0;
+}
+
 /* ---- 8-lane rANS encode (section 9.5) ---- */
 
 size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
@@ -345,14 +377,41 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     for (unsigned lane = 0; lane < 8; lane++)
         if (len[lane] > max_rounds) max_rounds = len[lane];
     if (k > 1) zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, k);
-    for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
-        size_t round = round_p1 - 1;
-        for (int lane = 7; lane >= 0; lane--) {
-            int table_idx = 0;
-            size_t j;
-            if (round >= len[lane]) continue;
-            j = start[lane] + round;
-            if (k > 1) {
+    if (k == 1) {
+        const zgec_rans_enc_table *tab = &tables[0];
+        size_t full = len[7];
+        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+            size_t round = round_p1 - 1;
+            if (round < full) {
+                for (int lane = 7; lane >= 0; lane--) {
+                    size_t j = start[lane] + round;
+                    uint8_t s = Z[j];
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                        zgec_free(words);
+                        return 0;
+                    }
+                }
+            } else {
+                for (int lane = 7; lane >= 0; lane--) {
+                    size_t j;
+                    if (round >= len[lane]) continue;
+                    j = start[lane] + round;
+                    uint8_t s = Z[j];
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                        zgec_free(words);
+                        return 0;
+                    }
+                }
+            }
+        }
+    } else {
+        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+            size_t round = round_p1 - 1;
+            for (int lane = 7; lane >= 0; lane--) {
+                int table_idx = 0;
+                size_t j;
+                if (round >= len[lane]) continue;
+                j = start[lane] + round;
                 if (j >= n_lit) { zgec_free(words); return 0; }
                 if (j == start[lane] || zgec_rs_get(runstart, j)) {
                     table_idx = k;
@@ -362,45 +421,15 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     table_idx = (int)pidx;
                 }
                 if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
-            }
                 const zgec_rans_enc_table *tab = &tables[table_idx];
                 uint8_t s = Z[j];
-                uint64_t f = tab->f[s];
-                if (f == 0) { zgec_free(words); return 0; }
-                uint64_t xmax = f << 21;
-                uint32_t x = state[lane];
-                if ((uint64_t)x >= xmax) {
-                    if (nwords >= words_cap) { zgec_free(words); return 0; }
-                    words[nwords++] = (uint16_t)(x & 0xFFFFu);
-                    x >>= 16;
+                if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                    zgec_free(words);
+                    return 0;
                 }
-                uint32_t recip = tab->f_recip[s];
-                /* Annex B.2: x = (x / f) << 11 | (x % f) + c.
-                 * A hardware divide per literal was the most expensive
-                 * instruction in this loop. After the renormalisation above,
-                 * x < f << 21 <= 2^32 and f <= ZGEC_RANS_M, so with
-                 * recip = floor(2^32 / f) + 1 the value floor(x * recip /
-                 * 2^32) is either floor(x/f) or floor(x/f) + 1; one
-                 * correction step makes quo and rems exact. f == 1 has no
-                 * 32-bit reciprocal and is handled directly. */
-                uint32_t quo;
-                int64_t rems;
-                if (f == 1u) {
-                    quo = x;
-                    rems = 0;
-                } else {
-                    uint64_t prod = (uint64_t)x * (uint64_t)recip;
-                    quo = (uint32_t)(prod >> 32);
-                    rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-                    if (rems < 0) {
-                        quo--;
-                        rems += (int64_t)f;
-                    }
-                }
-                x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
-                state[lane] = x;
             }
         }
+    }
 
     /* Size the whole result -- header plus words -- before writing any of
      * it, so a capacity failure leaves the caller's buffer untouched. The

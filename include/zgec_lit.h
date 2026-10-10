@@ -66,7 +66,7 @@ static inline void zgec_rs_set(uint8_t *map, size_t j)
 
 static inline int zgec_rs_get(const uint8_t *map, size_t j)
 {
-    return (int)((map[j >> 3] >> (j & 7u)) & 1u);
+    return (int)(((unsigned)map[j >> 3] >> (j & 7u)) & 1u);
 }
 
 /* Compute the run-start bitmap from the LL values: bit j set if literal j

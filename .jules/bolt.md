@@ -74,3 +74,14 @@ In LZ match parsers and match finders, compare 64-bit candidate loads with `ctzl
 
 **Action:**
 When designing multi-threaded compressors or decoders, use atomic fetch-add for work unit distribution and combine block-level and segment-level parallelism to prevent core idling on low-block-count inputs while preserving byte-for-byte output determinism.
+## 2026-10-13 - AVX2 Match Length Extension, 4-Lane Bucket SIMD Masking, and Single-Load Position Insertion
+
+**Learning:**
+1. In `fast_parse` (`src/parse.c`), `fast_match_len` previously relied on a scalar 8-byte XOR loop for match length extension. Adding 32-byte AVX2 SIMD equality scans (`_mm256_loadu_si256` + `_mm256_cmpeq_epi8` + `_mm256_movemask_epi8`) accelerates long match scans across fast-tier encoding.
+2. In `mf_bucket_hits` (`src/match.c`), fast-tier buckets (`nlanes == 4`) fell through to a scalar 4-iteration loop. Adding a 128-bit SIMD (`_mm_loadu_si128`) comparison evaluates all 4 packed entries branchlessly in a single vector operation.
+3. In `mf_classify_binary` (`src/match.c`), printable ASCII classification operated on scalar single bytes. Vectorizing 32 bytes at a time with AVX2 (`_mm256_cmpgt_epi8`) calculates non-text character counts efficiently.
+4. In `mf_insert_pos` (`src/match.c`), short and long hashes previously triggered redundant memory loads. Consolidating into a single 64-bit load (`zgec_rd64(vb + pos)`) when `pos + 8 <= m->vb_size` derives both `mf_hash5_v` / `mf_hash4_v` and `mf_hash8_v` without re-reading memory, dropping `mf_insert_pos` from gprof hotspot lists.
+5. In `zgec_rans_encode` (`src/rans.c`) for default `k = 1` streams, separating full rounds (`round < full`) where all 8 lanes are active eliminates per-lane round boundary branches (`round >= len[lane]`) and enables ILP across all 8 rANS state transitions.
+
+**Action:**
+Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-lane hash buckets with 128-bit SIMD masks, and consolidate multi-table hash input loads into a single 64-bit load.

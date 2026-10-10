@@ -441,6 +441,17 @@ static inline uint32_t fast_match_len(const uint8_t *vb, size_t ip, size_t d, si
     const uint8_t *a = vb + ip - d;
     const uint8_t *b = vb + ip;
     size_t len = 0;
+#if defined(__AVX2__)
+    while (len + 32u <= cap) {
+        __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(a + len));
+        __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(b + len));
+        unsigned m32 = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb256));
+        if (m32 != 0xFFFFFFFFu) {
+            return (uint32_t)(len + (unsigned)__builtin_ctz(~m32));
+        }
+        len += 32u;
+    }
+#endif
     while (len + 8u <= cap) {
         uint64_t x = zgec_rd64(a + len) ^ zgec_rd64(b + len);
         if (x != 0u) {
