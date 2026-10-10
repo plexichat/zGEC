@@ -1054,39 +1054,11 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         nbq = en->nb_bits;
         bits = (uint32_t)((acc >> 1) >> (63u - nbq));
         acc <<= nbq;
-        extra = (uint32_t)((acc >> 1) >> (63u - xb));
-        acc <<= xb;
-        nacc -= xb;
-
-        out[i] = zgec_seq_base[sym] + extra;
-
-        if (i + 1 < n) {
-            unsigned cls2 = clsbuf[i + 1];
-            const zgec_fse_dec_entry *en2;
-            unsigned sym2;
-            nbq = (unsigned)en->nb_bits;
-            bits = (uint32_t)((acc >> 1) >> (63u - nbq));
-            acc <<= nbq;
-            nacc -= nbq;
-            next = en->baseline + (int32_t)bits;
-            if (next < 0 || (unsigned)next >= S) goto bad_stream;
-            state = (unsigned)next;
-
-            if (cls2 > 2u) goto bad_internal;
-            en2 = &t[cls2]->e[state];
-            if (en2->symbol < 0 || en2->symbol >= ZGEC_NSYM_SEQ) goto bad_symbol;
-            sym2 = (unsigned)en2->symbol;
-            if ((unsigned)zgec_seq_nbits[sym2] > 32u) goto bad_symbol;
-            if (sym2 < 32u) {
-                out[i + 1] = zgec_seq_base[sym2];
-            } else {
-                out[i + 1] = zgec_seq_base[sym2] +
-                             (uint32_t)((acc >> 1) >> (63u - (unsigned)zgec_seq_nbits[sym2]));
-                acc <<= zgec_seq_nbits[sym2];
-                nacc -= zgec_seq_nbits[sym2];
-            }
-        }
-        i += 2u;
+        nacc -= nbq;
+        next = en->baseline + (int32_t)bits;
+        if (next < 0 || (unsigned)next >= S) goto bad_stream;
+        state = (unsigned)next;
+        i++;
     }
 
     br.acc = acc;
