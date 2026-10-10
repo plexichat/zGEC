@@ -327,10 +327,44 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
         if (len[lane] > max_rounds) max_rounds = len[lane];
     if (k == 1) {
         const zgec_rans_enc_table *tab = &tables[0];
-        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+        size_t full = len[7];
+        for (size_t round_p1 = max_rounds; round_p1 > full; round_p1--) {
             size_t round = round_p1 - 1;
             for (int lane = 7; lane >= 0; lane--) {
                 if (round >= len[lane]) continue;
+                size_t j = start[lane] + round;
+                uint8_t s = Z[j];
+                uint64_t f = tab->f[s];
+                if (f == 0) { zgec_free(words); return 0; }
+                uint64_t xmax = f << 21;
+                uint32_t x = state[lane];
+                if ((uint64_t)x >= xmax) {
+                    if (nwords >= words_cap) { zgec_free(words); return 0; }
+                    words[nwords++] = (uint16_t)(x & 0xFFFFu);
+                    x >>= 16;
+                }
+                uint32_t recip = tab->f_recip[s];
+                uint32_t quo;
+                int64_t rems;
+                if (f == 1u) {
+                    quo = x;
+                    rems = 0;
+                } else {
+                    uint64_t prod = (uint64_t)x * (uint64_t)recip;
+                    quo = (uint32_t)(prod >> 32);
+                    rems = (int64_t)x - (int64_t)quo * (int64_t)f;
+                    if (rems < 0) {
+                        quo--;
+                        rems += (int64_t)f;
+                    }
+                }
+                x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+                state[lane] = x;
+            }
+        }
+        for (size_t round_p1 = full; round_p1 > 0; round_p1--) {
+            size_t round = round_p1 - 1;
+            for (int lane = 7; lane >= 0; lane--) {
                 size_t j = start[lane] + round;
                 uint8_t s = Z[j];
                 uint64_t f = tab->f[s];
