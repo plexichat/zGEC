@@ -834,7 +834,13 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         if (zgec_rd32(vb + ip - (size_t)d) != cur4) {
             continue;
         }
-        len = mf_match_len(vb, ip, d, cap);
+        if (has_v8) {
+            uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+            len = (diff == 0u) ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                               : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+        } else {
+            len = mf_match_len(vb, ip, d, cap);
+        }
         if (len >= min_match) {
             mf_candidate(d, len, &best);
         }
@@ -869,7 +875,13 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     if (best.length == 0u || best.length > cap ||
                         vb[ip - (size_t)d + (size_t)best.length - 1u] ==
                         vb[ip + (size_t)best.length - 1u]) {
-                        len = mf_match_len(vb, ip, d, cap);
+                        if (has_v8) {
+            uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+            len = (diff == 0u) ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                               : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+        } else {
+            len = mf_match_len(vb, ip, d, cap);
+        }
                         if (len >= hash_min) {
                             mf_candidate(d, len, &best);
                         }
@@ -954,7 +966,13 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         vb[ip + (size_t)best.length - 1u]) {
                         continue;
                     }
-                    len = mf_match_len(vb, ip, d, cap);
+                    if (has_v8) {
+            uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+            len = (diff == 0u) ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                               : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+        } else {
+            len = mf_match_len(vb, ip, d, cap);
+        }
                     if (len >= hash_min) {
                         mf_candidate(d, len, &best);
                     }
