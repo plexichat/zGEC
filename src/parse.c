@@ -199,8 +199,9 @@ static unsigned parse_skip_shift(zgec_tier tier)
 /* Fixed fallback minimum non-repeat length for the
  * first implementation: 5, 6 beyond 256 KiB
  * (section 11.4). Repeat offsets keep minimum 4. */
-static uint32_t parse_min_norep(size_t ip)
+static uint32_t parse_min_norep(size_t ip, zgec_tier tier)
 {
+    if (tier >= ZGEC_TIER_HIGH) return 5u;
     return (ip >= (size_t)262144) ? 6u : 5u;
 }
 
@@ -967,7 +968,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (match.length >= 4u) {
             is_rep = (match.offset == reps.rep[0] || match.offset == reps.rep[1] ||
                       match.offset == reps.rep[2]) ? 1u : 0u;
-            need = (is_rep != 0u) ? 4u : parse_min_norep(ip);
+            need = (is_rep != 0u) ? 4u : parse_min_norep(ip, tier);
             if (match.length >= need) {
                 offbase = parse_offbase(match.offset, &reps);
                 cur_score = parse_score(match.length, ll, offbase,
@@ -1022,7 +1023,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             uint32_t nis_rep = (nm.length >= 4u &&
                                 (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
                                  nm.offset == reps.rep[2])) ? 1u : 0u;
-            uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1);
+            uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1, tier);
             double base = cur_score;
             double nscore = -1.0;
             uint32_t defer;
