@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_encode.h"
 #include "zgec_block.h"
 #include "zgec_bitstream.h"
@@ -373,25 +376,29 @@ static size_t zgec_enc_lit_desc_size(const uint32_t *hist)
 
 static int zgec_enc_all_same_byte(const uint8_t *src, size_t n)
 {
-    uint64_t w;
-    size_t i;
-    size_t head;
+    size_t i = 0;
     if (n == 0) return 0;
-    if (n < 8) {
-        for (i = 1; i < n; i++) {
-            if (src[i] != src[0]) return 0;
+#if defined(__AVX2__)
+    if (n >= 32) {
+        __m256i target = _mm256_set1_epi8((char)src[0]);
+        while (i + 32 <= n) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target));
+            if (m != 0xFFFFFFFFu) return 0;
+            i += 32;
         }
-        return 1;
     }
-    w = 0;
-    memset(&w, src[0], sizeof(w));
-    head = n & ~(size_t)7;
-    for (i = 0; i < head; i += 8) {
-        uint64_t v = 0;
-        memcpy(&v, src + i, sizeof(v));
-        if (v != w) return 0;
+#endif
+    if (n - i >= 8) {
+        uint64_t w;
+        memset(&w, src[0], sizeof(w));
+        size_t head = i + ((n - i) & ~(size_t)7);
+        for (; i < head; i += 8) {
+            uint64_t v = zgec_rd64(src + i);
+            if (v != w) return 0;
+        }
     }
-    for (i = head; i < n; i++) {
+    for (; i < n; i++) {
         if (src[i] != src[0]) return 0;
     }
     return 1;
@@ -2342,7 +2349,17 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
     size_t runs = 0;
     memset(hist, 0, sizeof(hist));
     for (i = 0; i < n; i++) hist[p[i]]++;
-    for (i = 1; i < n; i++) {
+    i = 1;
+#if defined(__AVX2__)
+    while (i + 32 <= n) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(p + i - 1));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+        unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v1));
+        runs += (size_t)__builtin_popcount(m);
+        i += 32;
+    }
+#endif
+    for (; i < n; i++) {
         if (p[i] == p[i - 1]) runs++;
     }
     *h0_out = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT);
