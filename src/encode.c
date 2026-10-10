@@ -498,8 +498,23 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
         uint32_t r0 = rep0_before ? rep0_before[s] : 1u;
         uint32_t llen = ll ? ll[s] : 0u;
         uint32_t mlen = ml_coded ? (ml_coded[s] + 3u) : 0u;
-        uint32_t u;
-        for (u = 0; u < llen && li < n_lit; u++) {
+        uint32_t u = 0;
+#if defined(__AVX2__)
+        if (r0 != 0u) {
+            size_t r0_sz = (size_t)r0;
+            while (llen >= 32u && li + 32u <= n_lit && p >= r0_sz) {
+                __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li));
+                __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p - r0_sz));
+                __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                _mm256_storeu_si256((__m256i *)(void *)(z + li), vres);
+                u += 32u;
+                li += 32u;
+                p += 32u;
+                llen -= 32u;
+            }
+        }
+#endif
+        for (; u < llen && li < n_lit; u++) {
             uint8_t pred = 0;
             if (r0 != 0u && (size_t)r0 <= p) pred = vb[p - (size_t)r0];
             z[li] = (uint8_t)((unsigned)lit[li] - (unsigned)pred);
@@ -508,6 +523,19 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
         }
         p += (size_t)mlen;
     }
+#if defined(__AVX2__)
+    if (rep0_tail != 0u) {
+        size_t r0_sz = (size_t)rep0_tail;
+        while (li + 32u <= n_lit && p >= r0_sz) {
+            __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li));
+            __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p - r0_sz));
+            __m256i vres = _mm256_sub_epi8(vlit, vpred);
+            _mm256_storeu_si256((__m256i *)(void *)(z + li), vres);
+            li += 32u;
+            p += 32u;
+        }
+    }
+#endif
     for (; li < n_lit; li++) {
         uint8_t pred = 0;
         if (rep0_tail != 0u && (size_t)rep0_tail <= p)
@@ -1229,19 +1257,10 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
     {
-        /* Lane starts are at most 8 positions: mark them once instead of
-         * scanning all 8 per byte. */
-        uint8_t lane_mark = 0;
-        size_t lane_pos[ZGEC_NLANES];
-        size_t n_lane = 0;
-        unsigned lane;
         /* Byte -> context group, resolved once (estimate-only: out-of-range
          * classes/groups fold to 0, as the per-byte clamps below did). */
         uint8_t grp_lut[256];
         unsigned b;
-        for (lane = 0; lane < (unsigned)ZGEC_NLANES; lane++) {
-            if (start[lane] < n_z) lane_pos[n_lane++] = start[lane];
-        }
         for (b = 0; b < 256u; b++) {
             unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
             unsigned grp;
@@ -1251,27 +1270,17 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             grp_lut[b] = (uint8_t)grp;
         }
         for (j = 0; j < n_z; j++) {
-            int is_lane_start = 0;
-            size_t li;
             if (runstart && zgec_rs_get(runstart, j)) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
             }
-            for (li = 0; li < n_lane; li++) {
-                if (lane_pos[li] == j) { is_lane_start = 1; break; }
+            if (j == start[0] || j == start[1] || j == start[2] || j == start[3] ||
+                j == start[4] || j == start[5] || j == start[6] || j == start[7]) {
+                rs_hist[z[j]]++;
+                rs_total++;
+                continue;
             }
-            (void)lane_mark;
-        if (is_lane_start) {
-            rs_hist[z[j]]++;
-            rs_total++;
-            continue;
-        }
-        if (j == 0) {
-            rs_hist[z[j]]++;
-            rs_total++;
-            continue;
-        }
         {
             unsigned grp = (unsigned)grp_lut[z[j - 1]];
             cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;

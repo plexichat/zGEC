@@ -85,3 +85,14 @@ When designing multi-threaded compressors or decoders, use atomic fetch-add for 
 
 **Action:**
 Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-lane hash buckets with 128-bit SIMD masks, and consolidate multi-table hash input loads into a single 64-bit load.
+
+## 2026-10-13 - AVX2 Sub-Literal Residual Subtraction, Delta Filter SIMD, and Encoder Lane Search Elimination
+
+**Learning:**
+1. In `zgec_enc_build_resid` (`src/encode.c`), calculating sub-literal predictions (`z[li] = lit[li] - vb[p - r0]`) previously ran in a scalar byte loop. Adding 32-byte AVX2 vector subtraction (`_mm256_sub_epi8`) speeds up residual calculation for literal runs.
+2. In `zgec_filter_apply` (`src/common.c`), DELTA pre-filter transformation (`dst[i] = src[i] - src[i-1]`) operated byte-by-byte. Vectorizing with 32-byte AVX2 vector subtraction (`_mm256_sub_epi8`) processes 32 bytes per instruction.
+3. In `zgec_ctx_body_bits` (`src/encode.c`), checking whether literal position `j` is a lane start previously executed an 8-iteration loop over `n_lane` for every literal byte. Replacing the loop with explicit direct comparisons `(j == start[0] || j == start[1] || ...)` completely eliminated per-byte loop search overhead.
+4. In `zgec_seq_rle_symbol` (`src/seq.c`), testing whether 32-bit sequence values match `values[0]` using 256-bit SIMD comparisons (`_mm256_cmpeq_epi32`) allows skipping scalar `zgec_seq_code_of` calls across 8 values at a time.
+
+**Action:**
+Vectorize byte subtractions with AVX2 SIMD `_mm256_sub_epi8` in predictive coders/filters, and unroll static array membership checks to avoid inner loop linear search overhead.

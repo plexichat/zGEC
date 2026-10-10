@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
@@ -176,9 +179,18 @@ zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
         if (d - s < n || s - d < n) return ZGEC_ERR_INVAL;
     }
     if (mode == ZGEC_FILTER_DELTA) {
-        size_t i;
+        size_t i = 1;
         dst[0] = src[0];
-        for (i = 1; i < n; i++) {
+#if defined(__AVX2__)
+        while (i + 32u <= n) {
+            __m256i vcurr = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            __m256i vprev = _mm256_loadu_si256((const __m256i *)(const void *)(src + i - 1));
+            __m256i vdelta = _mm256_sub_epi8(vcurr, vprev);
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), vdelta);
+            i += 32u;
+        }
+#endif
+        for (; i < n; i++) {
             dst[i] = (uint8_t)((unsigned)src[i] - (unsigned)src[i - 1]);
         }
     } else {
