@@ -79,7 +79,7 @@
  * result does not depend on the claim order. */
 typedef struct {
     zgec_mu mu;
-    size_t     next;
+    volatile size_t next;
     size_t     n;
     void     (*fn)(void *, size_t);
     void      *ctx;
@@ -88,11 +88,7 @@ typedef struct {
 static void zgec_enc_work_run(zgec_enc_work *w)
 {
     for (;;) {
-        size_t i;
-        zgec_mu_lock(&w->mu);
-        i = w->next;
-        if (i < w->n) w->next = i + 1;
-        zgec_mu_unlock(&w->mu);
+        size_t i = zgec_atomic_fetch_add_size(&w->next, 1);
         if (i >= w->n) return;
         w->fn(w->ctx, i);
     }
@@ -2460,6 +2456,98 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
     }
 }
 
+typedef struct {
+    const zgec_params *params;
+    const zgec_parse *parse;
+    const size_t *bounds;
+    const size_t *lit_bounds;
+    const zgec_block_params *bp;
+    const uint8_t *vb_all;
+    size_t vb_seg_base;
+    const size_t *out_bases;
+    zgec_seg_dir_entry *dir;
+    uint8_t **seg_bufs;
+    size_t *seg_sizes;
+    zgec_err *errs;
+} zgec_enc_seg_pass;
+
+static void zgec_enc_seg_job(void *ctx, size_t s)
+{
+    zgec_enc_seg_pass *p = (zgec_enc_seg_pass *)ctx;
+    size_t s0 = p->bounds[s];
+    size_t s1 = p->bounds[s + 1];
+    size_t n = (s1 > s0) ? (s1 - s0) : 0;
+    size_t l0 = p->lit_bounds[s];
+    size_t l1 = p->lit_bounds[s + 1];
+    size_t n_lit_slice = (l1 > l0) ? (l1 - l0) : 0;
+    size_t out_base = p->out_bases[s];
+    uint32_t raw_len = 0;
+    zgec_coder_choice choice;
+    zgec_seg_prep prep;
+    uint32_t *scratch_cls = NULL;
+    uint32_t *scratch_cond = NULL;
+    uint8_t *seg_payload = NULL;
+    size_t seg_cap = 0;
+    size_t seg_off = 0;
+    zgec_err err = ZGEC_OK;
+
+    if (l0 > p->parse->n_lit) {
+        p->errs[s] = ZGEC_ERR_INTERNAL;
+        return;
+    }
+    if (l0 + n_lit_slice > p->parse->n_lit) {
+        n_lit_slice = p->parse->n_lit - l0;
+    }
+
+    if (p->params->use_contexts &&
+        (p->bp->plain.ctx_count > 1 || p->bp->sub.ctx_count > 1)) {
+        scratch_cls = (uint32_t *)zgec_alloc((size_t)64 * 256u * sizeof(uint32_t), 64);
+        if (!scratch_cls) { p->errs[s] = ZGEC_ERR_NOMEM; return; }
+    }
+    if (p->params->use_conditioning) {
+        scratch_cond = (uint32_t *)zgec_alloc(3u * ZGEC_NSYM_SEQ * sizeof(uint32_t), 64);
+        if (!scratch_cond) { zgec_free(scratch_cls); p->errs[s] = ZGEC_ERR_NOMEM; return; }
+    }
+
+    memset(&prep, 0, sizeof(prep));
+    err = zgec_seg_prep_build(
+        &prep, p->parse, s0, s1,
+        p->params->use_sublit && p->vb_all != NULL && n_lit_slice > 0,
+        (n_lit_slice > 0) ? p->parse->lit + l0 : NULL, n_lit_slice,
+        p->vb_all, p->vb_seg_base + out_base);
+    if (err != ZGEC_OK) goto sjob_done;
+
+    err = zgec_select_coder(
+        p->params, p->parse->lit + l0, n_lit_slice, prep.ll, prep.ml,
+        prep.of, n, prep.rep0 ? prep.rep0 : prep.ll,
+        prep.rep0_tail, p->vb_all, p->vb_seg_base + out_base,
+        (p->bp->plain.ctx_count > 1) ? p->bp->plain.class_map : NULL,
+        (int)p->bp->plain.ctx_count, (int)p->bp->plain.ctx_mode,
+        (p->bp->sub.ctx_count > 1) ? p->bp->sub.class_map : NULL,
+        (int)p->bp->sub.ctx_count, (int)p->bp->sub.ctx_mode,
+        prep.h_ll, prep.h_ml, prep.h_of, prep.xbits, prep.resid,
+        scratch_cls, scratch_cond,
+        p->params->use_litref ? 0 : 1, &choice);
+    if (err != ZGEC_OK) { zgec_seg_prep_free(&prep); goto sjob_done; }
+
+    err = zgec_emit_segment(&seg_payload, &seg_cap, &seg_off,
+                            &p->dir[s], &raw_len, p->parse, s0, s1, l0,
+                            n_lit_slice, p->bp, &choice, &prep, p->vb_all,
+                            p->vb_seg_base, out_base);
+    zgec_seg_prep_free(&prep);
+
+sjob_done:
+    zgec_free(scratch_cls);
+    zgec_free(scratch_cond);
+    p->errs[s] = err;
+    if (err == ZGEC_OK) {
+        p->seg_bufs[s] = seg_payload;
+        p->seg_sizes[s] = seg_off;
+    } else {
+        zgec_free(seg_payload);
+    }
+}
+
 /* ---- block pre-filter sampled gate (section 11.11) ---- */
 
 #define ZGEC_ENC_FILTER_GROUPS 16u
@@ -2997,101 +3085,82 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
 
     /* Per-segment coder selection (11.7) then emission, appended
      * directly after the reserved directory (P6). Selection and
-     * emission share one prep per segment (P1/P2); the class and
-     * conditioning histograms reuse block-level scratch (M2). The
-     * loop is sequential today; segments of a block share only the
-     * block tables, so per-segment work is parallel-ready (11.8). */
-    {
-        size_t out_base = 0; /* output offset of the segment start */
-        uint32_t *scratch_cls = NULL;
-        uint32_t *scratch_cond = NULL;
-        if (params.use_contexts &&
-            (bp.plain.ctx_count > 1 || bp.sub.ctx_count > 1)) {
-            scratch_cls = (uint32_t *)zgec_alloc(
-                (size_t)64 * 256u * sizeof(uint32_t), 64);
-            if (!scratch_cls) {
-                zgec_free(dir);
-                zgec_free(payload);
-                zgec_free(vb_all);
-                zgec_free(ll_all);
-                zgec_free(lit_bounds);
-                zgec_free(bounds);
-                zgec_parse_free(parse);
-                return ZGEC_ERR_NOMEM;
-            }
+     * emission share one prep per segment (P1/P2). */
+    if (n_segments > 0) {
+        size_t *out_bases = (size_t *)zgec_alloc(n_segments * sizeof(*out_bases), _Alignof(size_t));
+        uint8_t **seg_bufs = (uint8_t **)zgec_alloc(n_segments * sizeof(*seg_bufs), _Alignof(uint8_t *));
+        size_t *seg_sizes = (size_t *)zgec_alloc(n_segments * sizeof(*seg_sizes), _Alignof(size_t));
+        zgec_err *seg_errs = (zgec_err *)zgec_alloc(n_segments * sizeof(*seg_errs), _Alignof(zgec_err));
+        if (!out_bases || !seg_bufs || !seg_sizes || !seg_errs) {
+            zgec_free(out_bases);
+            zgec_free(seg_bufs);
+            zgec_free(seg_sizes);
+            zgec_free(seg_errs);
+            goto fail_seg;
         }
-        if (params.use_conditioning) {
-            scratch_cond = (uint32_t *)zgec_alloc(
-                3u * ZGEC_NSYM_SEQ * sizeof(uint32_t), 64);
-            if (!scratch_cond) {
-                zgec_free(scratch_cls);
-                zgec_free(dir);
-                zgec_free(payload);
-                zgec_free(vb_all);
-                zgec_free(ll_all);
-                zgec_free(lit_bounds);
-                zgec_free(bounds);
-                zgec_parse_free(parse);
-                return ZGEC_ERR_NOMEM;
+        memset(seg_bufs, 0, n_segments * sizeof(*seg_bufs));
+        memset(seg_sizes, 0, n_segments * sizeof(*seg_sizes));
+        memset(seg_errs, 0, n_segments * sizeof(*seg_errs));
+
+        size_t ob_accum = 0;
+        for (s = 0; s < n_segments; s++) {
+            out_bases[s] = ob_accum;
+            size_t s0 = bounds[s];
+            size_t s1 = bounds[s + 1];
+            size_t l0 = lit_bounds[s];
+            size_t l1 = lit_bounds[s + 1];
+            size_t nl = (l1 > l0) ? (l1 - l0) : 0;
+            size_t ml_sum = 0;
+            for (size_t k = s0; k < s1; k++) ml_sum += (size_t)parse->seq[k].ml;
+            ob_accum += nl + ml_sum;
+        }
+
+        zgec_enc_seg_pass sp;
+        sp.params = &params;
+        sp.parse = parse;
+        sp.bounds = bounds;
+        sp.lit_bounds = lit_bounds;
+        sp.bp = &bp;
+        sp.vb_all = vb_all;
+        sp.vb_seg_base = vb_seg_base;
+        sp.out_bases = out_bases;
+        sp.dir = dir;
+        sp.seg_bufs = seg_bufs;
+        sp.seg_sizes = seg_sizes;
+        sp.errs = seg_errs;
+
+        zgec_enc_parallel_for(params.n_threads, n_segments, zgec_enc_seg_job, &sp);
+
+        for (s = 0; s < n_segments; s++) {
+            if (seg_errs[s] != ZGEC_OK) {
+                err = seg_errs[s];
+                for (size_t k = 0; k < n_segments; k++) zgec_free(seg_bufs[k]);
+                zgec_free(out_bases);
+                zgec_free(seg_bufs);
+                zgec_free(seg_sizes);
+                zgec_free(seg_errs);
+                goto fail_seg;
             }
         }
         for (s = 0; s < n_segments; s++) {
-            size_t s0 = bounds[s];
-            size_t s1 = bounds[s + 1];
-            size_t n = (s1 > s0) ? (s1 - s0) : 0;
-            size_t l0 = lit_bounds[s];
-            size_t l1 = lit_bounds[s + 1];
-            size_t n_lit_slice = (l1 > l0) ? (l1 - l0) : 0;
-            uint32_t raw_len = 0;
-            zgec_coder_choice choice;
-            zgec_seg_prep prep;
-
-            /* S2: explicit guard; the old clamp underflows when
-             * l0 > parse->n_lit. */
-            if (l0 > parse->n_lit) {
-                err = ZGEC_ERR_INTERNAL;
-                goto fail_seg_scratch;
-            }
-            if (l0 + n_lit_slice > parse->n_lit) {
-                n_lit_slice = parse->n_lit - l0;
-            }
-            memset(&prep, 0, sizeof(prep));
-            err = zgec_seg_prep_build(
-                &prep, parse, s0, s1,
-                params.use_sublit && vb_all != NULL && n_lit_slice > 0,
-                (n_lit_slice > 0) ? parse->lit + l0 : NULL, n_lit_slice,
-                vb_all, vb_seg_base + out_base);
-            if (err != ZGEC_OK) goto fail_seg_scratch;
-            err = zgec_select_coder(
-                &params, parse->lit + l0, n_lit_slice, prep.ll, prep.ml,
-                prep.of, n, prep.rep0 ? prep.rep0 : prep.ll,
-                prep.rep0_tail, vb_all, vb_seg_base + out_base,
-                (bp.plain.ctx_count > 1) ? bp.plain.class_map : NULL,
-                (int)bp.plain.ctx_count, (int)bp.plain.ctx_mode,
-                (bp.sub.ctx_count > 1) ? bp.sub.class_map : NULL,
-                (int)bp.sub.ctx_count, (int)bp.sub.ctx_mode,
-                prep.h_ll, prep.h_ml, prep.h_of, prep.xbits, prep.resid,
-                scratch_cls, scratch_cond,
-                params.use_litref ? 0 : 1, &choice);
+            err = zgec_payload_grow(&payload, &payload_cap, payload_off, payload_off + seg_sizes[s]);
             if (err != ZGEC_OK) {
-                zgec_seg_prep_free(&prep);
-                goto fail_seg_scratch;
+                for (size_t k = 0; k < n_segments; k++) zgec_free(seg_bufs[k]);
+                zgec_free(out_bases);
+                zgec_free(seg_bufs);
+                zgec_free(seg_sizes);
+                zgec_free(seg_errs);
+                goto fail_seg;
             }
-            err = zgec_emit_segment(&payload, &payload_cap, &payload_off,
-                                    &dir[s], &raw_len, parse, s0, s1, l0,
-                                    n_lit_slice, &bp, &choice, &prep, vb_all,
-                                    vb_seg_base, out_base);
-            zgec_seg_prep_free(&prep);
-            if (err != ZGEC_OK) goto fail_seg_scratch;
-            out_base += (size_t)raw_len;
-            continue;
-        fail_seg_scratch:
-            zgec_free(scratch_cls);
-            zgec_free(scratch_cond);
-            goto fail_seg;
+            memcpy(payload + payload_off, seg_bufs[s], seg_sizes[s]);
+            payload_off += seg_sizes[s];
+            zgec_free(seg_bufs[s]);
+            seg_bufs[s] = NULL;
         }
-        zgec_free(scratch_cls);
-        zgec_free(scratch_cond);
+        zgec_free(out_bases);
+        zgec_free(seg_bufs);
+        zgec_free(seg_sizes);
+        zgec_free(seg_errs);
     }
     zgec_seg_dir_emit(payload + dir_off, dir, (uint32_t)n_segments);
     zgec_free(dir);

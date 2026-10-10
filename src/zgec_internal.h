@@ -80,6 +80,19 @@ static inline void zgec_mu_unlock(zgec_mu *m)
 #endif
 }
 
+static inline size_t zgec_atomic_fetch_add_size(volatile size_t *ptr, size_t val)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+#if defined(_WIN64)
+    return (size_t)InterlockedExchangeAdd64((LONG64 volatile *)ptr, (LONG64)val);
+#else
+    return (size_t)InterlockedExchangeAdd((LONG volatile *)ptr, (LONG)val);
+#endif
+#else
+    return __atomic_fetch_add(ptr, val, __ATOMIC_RELAXED);
+#endif
+}
+
 static inline unsigned zgec_cpu_count(void)
 {
 #if defined(_WIN32)

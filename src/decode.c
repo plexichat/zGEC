@@ -2649,8 +2649,8 @@ typedef struct {
     const size_t *sz;
     uint8_t *out;
     uint32_t nblk;
-    zgec_mu *mu;        /* guards next/err/err_idx */
-    uint32_t *next;
+    zgec_mu *mu;        /* guards err/err_idx */
+    volatile size_t *next;
     zgec_err *err;
     uint32_t *err_idx;
 } zgec_dec_block_job;
@@ -2659,14 +2659,11 @@ static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
 {
     if (jb == NULL) return;
     for (;;) {
-        uint32_t i;
+        uint32_t i = (uint32_t)zgec_atomic_fetch_add_size(jb->next, 1);
+        if (i >= jb->nblk) return;
         const uint8_t *p = NULL;
         size_t got = 0;
         zgec_err e;
-        zgec_mu_lock(jb->mu);
-        i = (*jb->next)++;
-        zgec_mu_unlock(jb->mu);
-        if (i >= jb->nblk) return;
         e = decode_block_record(jb->w, jb->src, jb->src_size, jb->fh, jb->f,
                                 &jb->f->blocks[i],
                                 jb->out + jb->off[i], jb->sz[i], &p, &got);
@@ -2793,7 +2790,7 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     zgec_decoder **ws = NULL;
     zgec_dec_block_job *jobs = NULL;
     zgec_mu mu;
-    uint32_t next = 0;
+    volatile size_t next = 0;
     uint32_t err_idx = nblk;
     zgec_err werr = ZGEC_OK;
     zgec_err err = ZGEC_OK;
@@ -2950,7 +2947,7 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
         goto done;
     }
 
-    /* Pass 2: one worker per block, each serial inside its block. */
+    /* Pass 2: one worker per block, with segment parallel inner workers when n_blocks < n_threads. */
     if (n_workers > (size_t)nblk) n_workers = (size_t)nblk;
     {
         size_t want = (d->limits.n_threads > 0) ? (size_t)d->limits.n_threads
@@ -3084,10 +3081,11 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
     }
 
     /* Block-parallel decode (10.6). Falls back to the scan below when the
-     * frame carries embedded dictionaries or has only one block. */
+     * frame carries embedded dictionaries. */
     if (have_footer && footer.block_count > 0u) {
-        size_t nw = dec_resolve_workers(d, (size_t)footer.block_count);
-        if (nw > 1u) {
+        size_t want = (d != NULL && d->limits.n_threads > 0) ? (size_t)d->limits.n_threads : (size_t)zgec_cpu_count();
+        if (want > 1u) {
+            size_t nw = dec_resolve_workers(d, (size_t)footer.block_count);
             int took = 0;
             err = zgec_dec_frame_blocks(d, src, src_size, &fh, &footer,
                                         scan_end, nw, &took, dst, dst_size);
