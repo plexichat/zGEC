@@ -300,6 +300,38 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     return err;
 }
 
+static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_t s,
+                                          uint32_t *state_ptr, uint16_t *words,
+                                          size_t *nwords_ptr, size_t words_cap)
+{
+    uint64_t f = tab->f[s];
+    if (f == 0) return -1;
+    uint64_t xmax = f << 21;
+    uint32_t x = *state_ptr;
+    if ((uint64_t)x >= xmax) {
+        if (*nwords_ptr >= words_cap) return -1;
+        words[(*nwords_ptr)++] = (uint16_t)(x & 0xFFFFu);
+        x >>= 16;
+    }
+    uint32_t recip = tab->f_recip[s];
+    uint32_t quo;
+    int64_t rems;
+    if (f == 1u) {
+        quo = x;
+        rems = 0;
+    } else {
+        uint64_t prod = (uint64_t)x * (uint64_t)recip;
+        quo = (uint32_t)(prod >> 32);
+        rems = (int64_t)x - (int64_t)quo * (int64_t)f;
+        if (rems < 0) {
+            quo--;
+            rems += (int64_t)f;
+        }
+    }
+    *state_ptr = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+    return 0;
+}
+
 /* ---- 8-lane rANS encode (section 9.5) ---- */
 
 size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
@@ -354,31 +386,10 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 for (int lane = 7; lane >= 0; lane--) {
                     size_t j = start[lane] + round;
                     uint8_t s = Z[j];
-                    uint64_t f = tab->f[s];
-                    if (f == 0) { zgec_free(words); return 0; }
-                    uint64_t xmax = f << 21;
-                    uint32_t x = state[lane];
-                    if ((uint64_t)x >= xmax) {
-                        if (nwords >= words_cap) { zgec_free(words); return 0; }
-                        words[nwords++] = (uint16_t)(x & 0xFFFFu);
-                        x >>= 16;
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                        zgec_free(words);
+                        return 0;
                     }
-                    uint32_t recip = tab->f_recip[s];
-                    uint32_t quo;
-                    int64_t rems;
-                    if (f == 1u) {
-                        quo = x;
-                        rems = 0;
-                    } else {
-                        uint64_t prod = (uint64_t)x * (uint64_t)recip;
-                        quo = (uint32_t)(prod >> 32);
-                        rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-                        if (rems < 0) {
-                            quo--;
-                            rems += (int64_t)f;
-                        }
-                    }
-                    state[lane] = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
                 }
             } else {
                 for (int lane = 7; lane >= 0; lane--) {
@@ -386,31 +397,10 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     if (round >= len[lane]) continue;
                     j = start[lane] + round;
                     uint8_t s = Z[j];
-                    uint64_t f = tab->f[s];
-                    if (f == 0) { zgec_free(words); return 0; }
-                    uint64_t xmax = f << 21;
-                    uint32_t x = state[lane];
-                    if ((uint64_t)x >= xmax) {
-                        if (nwords >= words_cap) { zgec_free(words); return 0; }
-                        words[nwords++] = (uint16_t)(x & 0xFFFFu);
-                        x >>= 16;
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                        zgec_free(words);
+                        return 0;
                     }
-                    uint32_t recip = tab->f_recip[s];
-                    uint32_t quo;
-                    int64_t rems;
-                    if (f == 1u) {
-                        quo = x;
-                        rems = 0;
-                    } else {
-                        uint64_t prod = (uint64_t)x * (uint64_t)recip;
-                        quo = (uint32_t)(prod >> 32);
-                        rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-                        if (rems < 0) {
-                            quo--;
-                            rems += (int64_t)f;
-                        }
-                    }
-                    state[lane] = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
                 }
             }
         }
@@ -433,32 +423,10 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
                 const zgec_rans_enc_table *tab = &tables[table_idx];
                 uint8_t s = Z[j];
-                uint64_t f = tab->f[s];
-                if (f == 0) { zgec_free(words); return 0; }
-                uint64_t xmax = f << 21;
-                uint32_t x = state[lane];
-                if ((uint64_t)x >= xmax) {
-                    if (nwords >= words_cap) { zgec_free(words); return 0; }
-                    words[nwords++] = (uint16_t)(x & 0xFFFFu);
-                    x >>= 16;
+                if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                    zgec_free(words);
+                    return 0;
                 }
-                uint32_t recip = tab->f_recip[s];
-                uint32_t quo;
-                int64_t rems;
-                if (f == 1u) {
-                    quo = x;
-                    rems = 0;
-                } else {
-                    uint64_t prod = (uint64_t)x * (uint64_t)recip;
-                    quo = (uint32_t)(prod >> 32);
-                    rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-                    if (rems < 0) {
-                        quo--;
-                        rems += (int64_t)f;
-                    }
-                }
-                x = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
-                state[lane] = x;
             }
         }
     }
