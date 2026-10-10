@@ -293,11 +293,32 @@ static int mf_classify_binary(const uint8_t *vb, size_t vb_size)
 {
     size_t sample = (vb_size < (size_t)4096) ? vb_size : (size_t)4096;
     size_t nontext = 0;
-    size_t i;
+    size_t i = 0;
     if (vb == NULL || sample == 0) {
         return 0;
     }
-    for (i = 0; i < sample; i++) {
+#if defined(__AVX2__)
+    __m256i v32 = _mm256_set1_epi8(32);
+    __m256i v9 = _mm256_set1_epi8(9);
+    __m256i v10 = _mm256_set1_epi8(10);
+    __m256i v13 = _mm256_set1_epi8(13);
+    __m256i v127 = _mm256_set1_epi8(127);
+    while (i + 32 <= sample) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(vb + i));
+        __m256i is_9 = _mm256_cmpeq_epi8(v, v9);
+        __m256i is_10 = _mm256_cmpeq_epi8(v, v10);
+        __m256i is_13 = _mm256_cmpeq_epi8(v, v13);
+        __m256i is_tab_lf_cr = _mm256_or_si256(_mm256_or_si256(is_9, is_10), is_13);
+        __m256i is_lt32_signed = _mm256_cmpgt_epi8(v32, v);
+        __m256i is_127 = _mm256_cmpeq_epi8(v, v127);
+        __m256i is_bad = _mm256_or_si256(is_lt32_signed, is_127);
+        __m256i is_nontext = _mm256_andnot_si256(is_tab_lf_cr, is_bad);
+        unsigned m = (unsigned)_mm256_movemask_epi8(is_nontext);
+        nontext += (size_t)__builtin_popcount(m);
+        i += 32;
+    }
+#endif
+    for (; i < sample; i++) {
         uint8_t b = vb[i];
         if ((b < (uint8_t)32 && b != (uint8_t)9 && b != (uint8_t)10 && b != (uint8_t)13) ||
             b > (uint8_t)126) {
@@ -371,18 +392,30 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int lo
             return;
         }
     }
+    int has_v8 = (pos + 8u <= m->vb_size);
+    uint64_t v8 = has_v8 ? zgec_rd64(vb + pos) : 0u;
+
     /* The finder at this position has already computed both hashes; when it
      * hands the same position to insert, reuse them instead of recomputing.
      * Two parity-indexed slots keep the main probe at ip and the lazy probe
      * at ip + 1 live at once, so the speculative find does not evict the
      * hashes the insert below needs. */
-    h = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 1u)) ? m->c_hs[pos & 1u] : mf_hash_short(m, vb, pos);
+    if (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 1u)) {
+        h = m->c_hs[pos & 1u];
+    } else if (m->is_binary) {
+        h = mf_hash4_v(has_v8 ? (uint32_t)v8 : zgec_rd32(vb + pos));
+    } else {
+        h = has_v8 ? mf_hash5_v(v8) : mf_hash5(vb, pos);
+    }
+
     bucket = h & (m->nbuckets - 1u);
     tag = (h >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
     mf_insert_short(m, bucket, mf_pack((uint32_t)pos, tag));
 
-    if (long_ok && pos + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
-        uint32_t hl = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 2u)) ? m->c_hl[pos & 1u] : mf_hash8(vb, pos);
+    if (long_ok && has_v8) {
+        uint32_t hl = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 2u))
+                          ? m->c_hl[pos & 1u]
+                          : mf_hash8_v(v8);
         uint32_t lb = hl & (m->long_buckets - 1u);
         uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         mf_insert_long(m, lb, mf_pack((uint32_t)pos, ltag));
@@ -507,7 +540,7 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
     if (want == 1u && (((e0 >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK) == tag)) {
         return (uint32_t)1u << newest;
     }
-    if (nlanes < 8u) {
+    if (nlanes < 4u) {
         for (; lane < nlanes; lane++) {
             uint32_t e = b[lane];
             uint32_t etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
@@ -515,6 +548,18 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
         }
         return mask;
     }
+#if defined(__AVX2__) || defined(__SSE2__)
+    if (nlanes == 4u) {
+        __m128i tagv = _mm_set1_epi32((int)(tag << ZGEC_MF_TAG_SHIFT));
+        __m128i tagmask = _mm_set1_epi32((int)(ZGEC_MF_TAG_MASK << ZGEC_MF_TAG_SHIFT));
+        __m128i zero = _mm_setzero_si128();
+        __m128i v = _mm_loadu_si128((const __m128i *)(const void *)b);
+        __m128i eq = _mm_cmpeq_epi32(_mm_and_si128(v, tagmask), tagv);
+        __m128i nz = _mm_cmpeq_epi32(v, zero);
+        __m128i hit = _mm_andnot_si128(nz, eq);
+        return (uint32_t)_mm_movemask_ps(_mm_castsi128_ps(hit));
+    }
+#endif
 #if defined(__AVX2__)
     __m256i tagv = _mm256_set1_epi32((int)(tag << ZGEC_MF_TAG_SHIFT));
     __m256i tagmask = _mm256_set1_epi32((int)(ZGEC_MF_TAG_MASK << ZGEC_MF_TAG_SHIFT));
