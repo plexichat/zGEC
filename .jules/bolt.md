@@ -66,6 +66,14 @@ When probing multi-table hash indices or checking match lengths, consolidate inp
 **Action:**
 In LZ match parsers and match finders, compare 64-bit candidate loads with `ctzll` to determine match lengths branchlessly and filter candidates against `ip + best_len` before invoking match extension routines.
 
+## 2026-10-12 - Lock-Free Task Dispatching and Two-Tier Block/Segment Multithreading Scaling
+
+**Learning:**
+1. Task index increments in `zgec_enc_work_run` and `zgec_dec_blocks_run` previously used mutex locks (`zgec_mu_lock`), causing mutex lock contention across worker threads. Replacing mutex locks with atomic fetch-and-add (`zgec_atomic_fetch_add_size`) enables lock-free work unit claims across worker pools.
+2. For small inputs or inputs with fewer blocks than thread count (`n_blocks < n_threads`), block-level parallelism alone previously clamped worker count to `n_blocks` and left all remaining threads idle. In the encoder, parallelizing per-segment preparation (`zgec_seg_prep_build`), selection (`zgec_select_coder`), and stream emission (`zgec_emit_segment`) across segments in `zgec_encode_block_full` allows all threads to remain active. In the decoder, computing `inner = (n_threads / n_blocks)` when `n_blocks < n_threads` allows inner segment-level parallelism (`decode_segments_parallel`) in Phase A to utilize all remaining CPU cores, achieving near-linear scaling without thread oversubscription.
+
+**Action:**
+When designing multi-threaded compressors or decoders, use atomic fetch-add for work unit distribution and combine block-level and segment-level parallelism to prevent core idling on low-block-count inputs while preserving byte-for-byte output determinism.
 ## 2026-10-13 - AVX2 Match Length Extension, 4-Lane Bucket SIMD Masking, and Single-Load Position Insertion
 
 **Learning:**
