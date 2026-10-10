@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_encode.h"
 #include "zgec_block.h"
 #include "zgec_bitstream.h"
@@ -375,25 +378,29 @@ static size_t zgec_enc_seq_desc_size(const uint32_t *hist)
 
 static int zgec_enc_all_same_byte(const uint8_t *src, size_t n)
 {
-    uint64_t w;
-    size_t i;
-    size_t head;
+    size_t i = 0;
     if (n == 0) return 0;
-    if (n < 8) {
-        for (i = 1; i < n; i++) {
-            if (src[i] != src[0]) return 0;
+#if defined(__AVX2__)
+    if (n >= 32) {
+        __m256i target = _mm256_set1_epi8((char)src[0]);
+        while (i + 32 <= n) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target));
+            if (m != 0xFFFFFFFFu) return 0;
+            i += 32;
         }
-        return 1;
     }
-    w = 0;
-    memset(&w, src[0], sizeof(w));
-    head = n & ~(size_t)7;
-    for (i = 0; i < head; i += 8) {
-        uint64_t v = 0;
-        memcpy(&v, src + i, sizeof(v));
-        if (v != w) return 0;
+#endif
+    if (n - i >= 8) {
+        uint64_t w;
+        memset(&w, src[0], sizeof(w));
+        size_t head = i + ((n - i) & ~(size_t)7);
+        for (; i < head; i += 8) {
+            uint64_t v = zgec_rd64(src + i);
+            if (v != w) return 0;
+        }
     }
-    for (i = head; i < n; i++) {
+    for (; i < n; i++) {
         if (src[i] != src[0]) return 0;
     }
     return 1;
@@ -592,7 +599,7 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
                                  _Alignof(size_t));
     if (parse->n_seq > UINT32_MAX - 1) return ZGEC_ERR_INVAL;
     lit_of_seq = (uint32_t *)zgec_alloc((parse->n_seq + 1) * sizeof(*lit_of_seq),
-                                     _Alignof(uint32_t));
+                                       _Alignof(uint32_t));
     if (!grans || !gstart || !lit_of_seq) {
         zgec_free(grans);
         zgec_free(gstart);
@@ -600,16 +607,6 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
         return ZGEC_ERR_NOMEM;
     }
     memset(grans, 0, n_gran * sizeof(*grans));
-
-    /* Sequence -> literal-start map from LL prefix sums. */
-    lit_pos = 0;
-    for (i = 0; i < parse->n_seq; i++) {
-        if (lit_pos > UINT32_MAX) return ZGEC_ERR_INTERNAL;
-        lit_of_seq[i] = (uint32_t)lit_pos;
-        lit_pos += (size_t)parse->seq[i].ll;
-    }
-    if (lit_pos > UINT32_MAX) { zgec_free(grans); zgec_free(gstart); zgec_free(lit_of_seq); return ZGEC_ERR_INTERNAL; }
-    lit_of_seq[parse->n_seq] = (uint32_t)lit_pos;
 
     {
         size_t per = (parse->n_seq + n_gran - 1) / n_gran;
@@ -620,6 +617,22 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
         }
         gstart[n_gran] = parse->n_seq;
     }
+
+    /* Sequence -> literal-start map from LL prefix sums. */
+    lit_pos = 0;
+    for (i = 0; i < parse->n_seq; i++) {
+        if (lit_pos > UINT32_MAX) {
+            zgec_free(grans); zgec_free(gstart); zgec_free(lit_of_seq);
+            return ZGEC_ERR_INTERNAL;
+        }
+        lit_of_seq[i] = (uint32_t)lit_pos;
+        lit_pos += (size_t)parse->seq[i].ll;
+    }
+    if (lit_pos > UINT32_MAX) {
+        zgec_free(grans); zgec_free(gstart); zgec_free(lit_of_seq);
+        return ZGEC_ERR_INTERNAL;
+    }
+    lit_of_seq[parse->n_seq] = (uint32_t)lit_pos;
 
     for (gi = 0; gi < n_gran; gi++) {
         zgec_granule *g = &grans[gi];
@@ -640,12 +653,16 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
             g->of[c]++;
             g->extra_bits += (uint64_t)nb;
             g->n_seq++;
+            /* Greedy litpos (PR #3): the literal start of every sequence is a
+             * prefix sum of LL, so it is computed once in a pre-pass instead of
+             * being re-derived per granule with a clamp on each iteration. */
             for (t = lit_of_seq[i]; t < lit_of_seq[i + 1]; t++) {
                 if (t < parse->n_lit) {
                     g->lit[parse->lit[t]]++;
                     g->lit_total++;
                 }
             }
+            lit_pos = lit_of_seq[i + 1];
         }
     }
     /* Tail literals belong to the last granule. */
@@ -1102,6 +1119,22 @@ typedef struct {
     double score;   /* bits + lambda * cycles */
 } zgec_coder_choice;
 
+/* Exact serialised size in bytes of one literal-table description
+ * (AL=11, 256 symbols). Single-table candidates use this; multi-table
+ * aggregates keep the flat constant. */
+static size_t zgec_enc_lit_desc_size(const uint32_t *hist)
+{
+    int16_t counts[ZGEC_NSYM_LIT];
+    uint8_t tmp[2048];
+    zgec_err err = zgec_rans_normalise(counts, hist);
+    if (err != ZGEC_OK) return ZGEC_ENC_RANS_TABLE_BYTES;
+    {
+        size_t n = zgec_fse_write_counts(tmp, sizeof(tmp), counts,
+                                         ZGEC_NSYM_LIT, ZGEC_LIT_AL);
+        return (n > 0) ? n : (size_t)ZGEC_ENC_RANS_TABLE_BYTES;
+    }
+}
+
 /* Estimate one literal-coding candidate for a byte buffer Z. */
 static double zgec_score_lit_cand(const uint32_t *hist, size_t n_syms,
                                   int n_tables, double lambda,
@@ -1112,7 +1145,10 @@ static double zgec_score_lit_cand(const uint32_t *hist, size_t n_syms,
     /* P4: the caller passes n_syms, the histogram's known total. */
     body = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n_syms);
     if (n_tables <= 1) {
-        hdr = (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 + 32.0 * 8.0;
+        /* Exact single-table header: the flat constant misprices rANS on
+         * small segments (a few hundred literals), where a ~150-byte
+         * overestimate exceeds the whole body gap and forces raw. */
+        hdr = (double)zgec_enc_lit_desc_size(hist) * 8.0 + 32.0 * 8.0;
     } else {
         hdr = (double)(unsigned)n_tables *
                   (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 +
@@ -2467,7 +2503,17 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
     size_t runs = 0;
     memset(hist, 0, sizeof(hist));
     for (i = 0; i < n; i++) hist[p[i]]++;
-    for (i = 1; i < n; i++) {
+    i = 1;
+#if defined(__AVX2__)
+    while (i + 32 <= n) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(p + i - 1));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(p + i));
+        unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v0, v1));
+        runs += (size_t)__builtin_popcount(m);
+        i += 32;
+    }
+#endif
+    for (; i < n; i++) {
         if (p[i] == p[i - 1]) runs++;
     }
     *h0_out = zgec_enc_entropy_bits_u32(hist, ZGEC_NSYM_LIT, (uint64_t)n);

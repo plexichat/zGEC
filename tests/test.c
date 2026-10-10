@@ -351,17 +351,28 @@ static void zgec_count_coders(const uint8_t *frame, size_t n,
                     uint32_t clen = t_rd32(frame + base + (size_t)i * 8u);
                     zgec_seg_header sh;
                     int lit_form;
+                    int lit_coder;
                     int k;
                     if (clen == 0u || soff + clen > off + 24u + psz) break;
-                    lit_form = (int)(frame[soff] & 1u);
-                    k = (int)(lit_form ? bp.sub.ctx_count
-                                       : bp.plain.ctx_count);
+                    lit_form = (int)(frame[soff] & 0x01u);
+                    lit_coder = (int)((frame[soff] >> 1) & 0x03u);
+                    /* A segment carries k literal tables only when it codes
+                     * its literals; a raw segment carries exactly one table
+                     * regardless of the block's context count (encode.c
+                     * zgec_emit_segment: lit_k = coder ? ctx_count : 1).
+                     * Feeding parse_ex the block's ctx_count for a raw
+                     * segment makes it expect k + 1 descriptors, the header
+                     * runs past comp_len, and the segment is skipped. */
+                    k = (int)(lit_coder != 0
+                                  ? (lit_form ? bp.sub.ctx_count
+                                              : bp.plain.ctx_count)
+                                  : 1u);
                     memset(&sh, 0, sizeof(sh));
                     if (zgec_seg_header_parse_ex(&sh, frame + soff, clen,
                                                  NULL, 0, NULL, k) != 0) {
-                        if ((sh.segment_flags >> 1) & 1u) (*rans)++;
-                        if (sh.segment_flags & 1u) (*sub)++;
-                        if (sh.segment_flags & 0x08u) (*cond)++;
+                        if (sh.segment_flags & ZGEC_SEG_LIT_CODER_RANS) (*rans)++;
+                        if (sh.segment_flags & ZGEC_SEG_LIT_FORM) (*sub)++;
+                        if (sh.segment_flags & ZGEC_SEG_SEQ_CTX_OF) (*cond)++;
                     }
                     soff += clen;
                 }

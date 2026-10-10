@@ -2,6 +2,7 @@
 build/
 build_check/
 build-*/
+build_*/
 cmake-build-*/
 out/
 CMakeFiles/
@@ -27,6 +28,9 @@ Makefile
 
 # Test / debug run artifacts
 *.zgec
+gmon.out
+silesia/
+silesia.zip
 test_input.txt
 rt.bin
 rt.out
