@@ -537,11 +537,20 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
 
 /* Record a candidate if it beats the current best:
  * longer, or equal length with a smaller offset. */
-static void mf_candidate(uint32_t d, uint32_t len, zgec_match *best)
+static inline void mf_update_best(uint32_t d, uint32_t len, zgec_match *best,
+                                  uint32_t rep0, uint32_t rep1, uint32_t rep2)
 {
-    if (len > best->length || (len == best->length && d < best->offset)) {
+    if (len > best->length) {
         best->offset = d;
         best->length = len;
+    } else if (len == best->length && len > 0u) {
+        int best_is_rep = (best->length > 0u && (best->offset == rep0 || best->offset == rep1 || best->offset == rep2));
+        int d_is_rep = (d == rep0 || d == rep1 || d == rep2);
+        if (d_is_rep && !best_is_rep) {
+            best->offset = d;
+        } else if (!best_is_rep && !d_is_rep && d < best->offset) {
+            best->offset = d;
+        }
     }
 }
 
@@ -867,7 +876,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             len = mf_match_len(vb, ip, d, cap);
         }
         if (len >= min_match) {
-            mf_candidate(d, len, &best);
+            mf_update_best(d, len, &best, rep0, rep1, rep2);
         }
     }
 
@@ -916,7 +925,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             len = mf_match_len(vb, ip, d, cap);
         }
                         if (len >= hash_min) {
-                            mf_candidate(d, len, &best);
+                            mf_update_best(d, len, &best, rep0, rep1, rep2);
                         }
                     }
                 }
@@ -1026,7 +1035,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
             len = mf_match_len(vb, ip, d, cap);
         }
                     if (len >= hash_min) {
-                        mf_candidate(d, len, &best);
+                        mf_update_best(d, len, &best, rep0, rep1, rep2);
                     }
                 }
             }
