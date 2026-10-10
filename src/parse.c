@@ -907,7 +907,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                         if (rlen >= 4u) {
                             uint32_t roffbase = parse_offbase(roff, &reps);
                             double rscore = parse_score(rlen, ll, roffbase,
-                                                        ll_hist, ml_hist, of_hist, l2tot,
+                                                        ll_cost, ml_cost, of_cost,
                                                         lbar, lscale);
                             if (rscore > cur_score) {
                                 cur_score = rscore;
