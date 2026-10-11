@@ -59,6 +59,22 @@ zgec_match zgec_matcher_find(zgec_matcher *m,
                                          uint32_t min_len, uint32_t max_len);
 
 /* Insert the position ip into the hash tables. */
+
+/* Same find, additionally reporting the length of each repeat-offset
+ * candidate it probed, in rep_len[0..2]. The parser prices those reps
+ * itself (section 11.4 gives a repeat zero extra offset bits, which
+ * find's length-only selection does not model), and the length scan is by
+ * far the more expensive half of scoring one, so find hands it over
+ * instead of the parser repeating it. rep_len may be NULL, which makes
+ * this exactly zgec_matcher_find. A slot is 0 when the rep was not
+ * probeable at ip -- zero offset, beyond ip, or (without an 8-byte window)
+ * a first-4-byte mismatch -- and every slot is written before find can
+ * return, so a caller never reads a stale length. */
+zgec_match zgec_matcher_find_lens(zgec_matcher *m,
+                                              const uint8_t *vb, size_t ip,
+                                              uint32_t rep0, uint32_t rep1, uint32_t rep2,
+                                              uint32_t min_len, uint32_t max_len,
+                                              uint32_t *rep_len);
 void zgec_matcher_insert(zgec_matcher *m,
                                      const uint8_t *vb, size_t ip);
 
