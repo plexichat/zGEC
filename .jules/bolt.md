@@ -96,6 +96,14 @@ Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-l
 
 **Action:**
 Vectorize sequence array transformations and 256-element histogram summations with AVX2 SIMD, and use parallel accumulation arrays to eliminate loop-carried dependencies in symbol counting loops.
+## 2026-10-13 - FSE Bitreader Refill Guarding and Phase B Direct 64-bit Match Copying
+
+**Learning:**
+1. In FSE stream decoding (`zgec_fse_decode` in `src/fse.c` and `seq_decode_cond` in `src/decode.c`), the inner loop calculates `nb = (63u - nacc) >> 3`. When `nacc >= 56u`, `nb` evaluates to 0. Guarding the 64-bit unaligned load and bit shifts with `if (nacc < 56u)` avoids redundant memory reads, shifts, and register pointer increments on iterations where `acc` already holds sufficient bits (56..63).
+2. In Phase B LZ77 match copying (`exec_block` in `src/decode.c`), matches with `moff >= 8` and short lengths (`mlen <= 8`, such as common 3..8 byte matches) previously fell through a multi-branch cascade and scalar copy loop. Handing `moff >= 8 && mlen <= 8` with a direct 64-bit load/store `zgec_wr64(d, zgec_rd64(msrc))` completes short non-overlapping match copies in a single 64-bit operation.
+
+**Action:**
+In FSE bitstream readers, guard 64-bit byte refills with `if (nacc < 56u)` to bypass zero-byte refills, and perform direct 64-bit unaligned word copies for `moff >= 8` short match lengths in LZ77 decoders.
 ## 2026-10-14 - High-Tier Probe Depth Expansion and High Compression Preset Ladder
 
 **Learning:**
