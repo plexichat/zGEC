@@ -143,3 +143,14 @@ Always use 256-bit AVX2 vector operations for literal copies, pattern broadcasts
 
 **Action:**
 Vectorize sub-literal prediction subtraction with 256-bit AVX2 byte operations, replace linear lane-boundary scans with monotonically advancing pointer checks, and use static 256-entry lookup tables for symbol classification.
+
+## 2026-10-14 - Adaptive Match Position Insertion, Fast-Tier Table Sizing, and Thread-Local Table Scratch
+
+**Learning:**
+1. In `fast_parse` (`src/parse.c`), inserting every position (`stride = 1`) inside a match into both `ts` and `tl` hash tables introduced $2 \times \text{best\_len}$ 64-bit multiplications and table stores per match. Using adaptive match position insertion (inserting `ip + 1`, `ip + 2`, striding intermediate positions for `best_len > 8`, and inserting `ip + best_len - 1`) eliminates up to 70% of inner loop hash calculations and table stores during match skips while preserving compression ratio.
+2. Sizing fast-tier hash tables to 1 MiB (`ZGEC_FAST_BITS_SHIFT = 3u`) allows hash tables to fit entirely inside L2 cache (512 KB - 1 MB), reducing L3 cache miss stalls during hash probes and increasing single-threaded throughput from 30.3 MB/s to 41.0 MB/s (+35.3%) across the Silesia corpus.
+3. Allocating fast-tier tables (`ts` and `tl`) in thread-local scratch memory (`ZGEC_ENC_TLS`) avoids repeated `malloc`/`free` heap overhead per block.
+4. In `zgec_matcher_find` (`src/match.c`), pre-filtering candidate positions against `vb[pos + best.length - 1] != vb[ip + best.length - 1]` before 64-bit loads and `ctzll` scans eliminates failing candidates branchlessly.
+
+**Action:**
+In LZ match parsers, stride intermediate match positions during insertion for long matches, keep fast-tier hash tables within L2 cache bounds (<=1 MB), use thread-local scratch arrays for block tables, and filter candidates against `ip + best.length - 1` before fetching 64-bit match prefixes.

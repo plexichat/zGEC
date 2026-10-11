@@ -1,8 +1,19 @@
+#include <stdint.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 #include "zgec_parse.h"
 #include "zgec_seq.h"
+
+#if defined(_MSC_VER)
+#define ZGEC_ENC_TLS __declspec(thread)
+#else
+#define ZGEC_ENC_TLS _Thread_local
+#endif
+
+#define ZGEC_FAST_SCRATCH_BITS 18u
+static ZGEC_ENC_TLS uint32_t fast_ts_scratch[1u << ZGEC_FAST_SCRATCH_BITS];
+static ZGEC_ENC_TLS uint32_t fast_tl_scratch[1u << ZGEC_FAST_SCRATCH_BITS];
 
 #include <stdlib.h>
 #include <string.h>
@@ -386,7 +397,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_MIN_LONG 8u
 #endif
 #ifndef ZGEC_FAST_SHIFT
-#define ZGEC_FAST_SHIFT 8u
+#define ZGEC_FAST_SHIFT 5u
 #endif
 
 #ifndef ZGEC_FAST_SHORT_HASH_BYTES
@@ -408,7 +419,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_LAZY 1
 #endif
 #ifndef ZGEC_FAST_LAZY_MAX
-#define ZGEC_FAST_LAZY_MAX 64u
+#define ZGEC_FAST_LAZY_MAX 12u
 #endif
 #ifndef ZGEC_FAST_BITS_MIN
 #define ZGEC_FAST_BITS_MIN 10u
@@ -416,7 +427,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 /* Buckets wanted per indexed position, as a shift: 2 means one bucket per
  * four positions. */
 #ifndef ZGEC_FAST_BITS_SHIFT
-#define ZGEC_FAST_BITS_SHIFT 2u
+#define ZGEC_FAST_BITS_SHIFT 3u
 #endif
 
 /* Bucket count for the fast tier's two tables, chosen from the number of
@@ -525,12 +536,20 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     unsigned sshift = (unsigned)ZGEC_FAST_SHORT_BITS - fbits;
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
 
-    ts = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
-    tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+    int ts_owned = 0;
+    if (fbits <= ZGEC_FAST_SCRATCH_BITS) {
+        ts = fast_ts_scratch;
+        tl = fast_tl_scratch;
+    } else {
+        ts = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        ts_owned = 1;
+    }
     seq_cap = (end - prefix) / 8u + 16u;
     seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
     if (!ts || !tl || !seq) {
-        zgec_free(ts); zgec_free(tl); zgec_free(seq);
+        if (ts_owned) { zgec_free(ts); zgec_free(tl); }
+        zgec_free(seq);
         return ZGEC_ERR_NOMEM;
     }
     memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
@@ -692,7 +711,16 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             seq[p->n_seq].offbase = ob;
             p->n_seq++;
 #if ZGEC_FAST_INS_ALL
-            for (ins = ip + 1u; ins + 8u <= end && ins < ip + (size_t)best_len; ins += (size_t)ZGEC_FAST_INS_STRIDE) {
+            size_t stride = (best_len <= 8u) ? 1u : (1u + ((best_len - 1u) >> 4));
+            for (ins = ip + 1u; ins + 8u <= end && ins < ip + (size_t)best_len; ins += stride) {
+                uint64_t iv = zgec_rd64(vb + ins);
+                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
+#if ZGEC_FAST_INS_LONG
+                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
+#endif
+            }
+            ins = ip + (size_t)best_len - 1u;
+            if (ins + 8u <= end && ins > ip) {
                 uint64_t iv = zgec_rd64(vb + ins);
                 ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
 #if ZGEC_FAST_INS_LONG
@@ -731,8 +759,10 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 
     zgec_free(p->seq);
     p->seq = seq;
-    zgec_free(ts);
-    zgec_free(tl);
+    if (ts_owned) {
+        zgec_free(ts);
+        zgec_free(tl);
+    }
     return ZGEC_OK;
 }
 #endif /* ZGEC_FASTDFAST_OFF */

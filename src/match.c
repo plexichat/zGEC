@@ -1062,6 +1062,12 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                      * candidates before any length work. The pos + 4 guard
                      * keeps the read in bounds locally. */
                     if ((size_t)pos + 8u <= m->vb_size && has_v8) {
+                        if (best.length != 0u && best.length <= cap &&
+                            (size_t)pos + (size_t)best.length <= m->vb_size &&
+                            vb[(size_t)pos + (size_t)best.length - 1u] !=
+                            vb[ip + (size_t)best.length - 1u]) {
+                            continue;
+                        }
                         uint64_t diff = zgec_rd64(vb + (size_t)pos) ^ v8;
                         if (diff != 0u) {
                             len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
