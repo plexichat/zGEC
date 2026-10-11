@@ -2565,6 +2565,390 @@ efail:
     return e;
 }
 
+/* ---- literal-export cache (6.3, frame-wide) ----
+ *
+ * Every block that names lit_ref_depth > 0 rebuilds the exported
+ * literals of its D predecessors (4.6 step 4). The sequential scan gets
+ * those bytes out of the history it already keeps, so it pays for each
+ * export once. A block-parallel worker has no such history: it re-derives
+ * the region from the predecessor records, so at D = 3 a frame's
+ * predecessors are exported roughly three times over -- on top of the
+ * decode itself -- and every worker repeats what the others just did.
+ *
+ * This cache exports each block at most once per frame and hands the
+ * bytes to every worker that asks for them. A block owns one slot: the
+ * first worker to need it exports it while holding that slot, so no
+ * other worker can see a half-filled one, and the rest block on the
+ * same lock and read the finished result. Nothing is exported twice and
+ * nobody spins. The frame, the footer and the source bytes stay
+ * read-only for the whole phase, so a published slot needs no further
+ * synchronisation: the reference count (taken before the workers start)
+ * keeps the bytes alive until the last consumer has copied them, and
+ * that consumer releases them, which bounds the cache by the exports
+ * still in flight rather than by the whole frame.
+ */
+
+typedef struct {
+    zgec_mu  mu;      /* held while this slot is being exported */
+    uint8_t *lit;     /* exported literals; NULL when empty or released */
+    size_t   len;
+    size_t   refs;    /* consumers that still have to copy the bytes */
+    zgec_err err;     /* export error, valid once ready */
+    unsigned ready;   /* 1 once lit/len/err are settled */
+    unsigned alias;   /* 1 when lit points into the frame, not owned */
+} zgec_export_slot;
+
+typedef struct {
+    zgec_export_slot *slot;   /* one per block; NULL disables the cache */
+    size_t nblk;
+    const zgec_frame_header *fh;
+    const zgec_footer *f;
+    const uint8_t *src;
+    size_t src_size;
+} zgec_export_cache;
+
+/* Export one predecessor record's literals. RAW and RLE yield the block
+ * bytes themselves, a COMPRESSED payload goes through the export
+ * procedure of 6.3. Shared by the cache, which keeps the bytes, and by
+ * the local path, which owns them. */
+static zgec_err dec_predecessor_export(const uint8_t *ppay,
+                                       const zgec_record_header *pr,
+                                       uint8_t **out, size_t *out_len)
+{
+    uint8_t *lb = NULL;
+    size_t ls = 0;
+    if (pr->record_type == ZGEC_REC_RAW) {
+        if (pr->payload_size != pr->raw_size) return ZGEC_ERR_RECORD_SIZE;
+        ls = (size_t)pr->raw_size;
+        if (ls > 0) {
+            lb = (uint8_t *)zgec_alloc(ls, 64);
+            if (lb == NULL) return ZGEC_ERR_NOMEM;
+            memcpy(lb, ppay, ls);
+        }
+    } else if (pr->record_type == ZGEC_REC_RLE) {
+        if (pr->payload_size != 1u) return ZGEC_ERR_RECORD_SIZE;
+        ls = (size_t)pr->raw_size;
+        if (ls > 0) {
+            lb = (uint8_t *)zgec_alloc(ls, 64);
+            if (lb == NULL) return ZGEC_ERR_NOMEM;
+            memset(lb, ppay[0], ls);
+        }
+    } else if (pr->record_type == ZGEC_REC_COMPRESSED) {
+        zgec_err e = export_block_literals(ppay, (size_t)pr->payload_size,
+                                           pr->segment_count, &lb, &ls);
+        if (e != ZGEC_OK) return e;
+        if (ls == 0) {
+            zgec_free(lb);
+            lb = NULL;
+        }
+    } else {
+        return ZGEC_ERR_RECORD_TYPE;
+    }
+    *out = lb;
+    *out_len = ls;
+    return ZGEC_OK;
+}
+
+static void zgec_export_cache_free(zgec_export_cache *c)
+{
+    size_t i;
+    if (c == NULL) return;
+    if (c->slot != NULL) {
+        for (i = 0; i < c->nblk; i++) {
+            zgec_mu_destroy(&c->slot[i].mu);
+            /* An alias points into the frame: releasing it would free a
+             * pointer that was never allocated. */
+            if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
+        }
+    }
+    zgec_free(c->slot);
+    memset(c, 0, sizeof(*c));
+}
+
+/* Count the consumers up front: block i reads the D predecessors it
+ * names, so slot j holds its bytes until the last of them copied them.
+ * A block whose depth it cannot possibly satisfy (it fails on its own)
+ * never reads a slot, so it leaves no reference behind.
+ *
+ * A frame that references no predecessor at all keeps the cache
+ * disabled: there is nothing to share, so it pays neither the index nor
+ * a lock per block. */
+static void zgec_export_cache_init(zgec_export_cache *c,
+                                   const zgec_frame_header *fh,
+                                   const zgec_footer *f, const uint8_t *src,
+                                   size_t src_size)
+{
+    size_t i;
+    int used = 0;
+    memset(c, 0, sizeof(*c));
+    if (f->block_count == 0u) return; /* nothing to share */
+    for (i = 0; i < (size_t)f->block_count; i++) {
+        if (f->blocks[i].lit_ref_depth != 0u) {
+            used = 1;
+            break;
+        }
+    }
+    if (used == 0) return;
+    c->fh = fh;
+    c->f = f;
+    c->src = src;
+    c->src_size = src_size;
+    c->nblk = (size_t)f->block_count;
+    if (c->nblk > SIZE_MAX / sizeof(*c->slot)) return; /* stays disabled */
+    c->slot = (zgec_export_slot *)zgec_alloc(c->nblk * sizeof(*c->slot),
+                                            _Alignof(zgec_export_slot));
+    if (c->slot == NULL) {
+        c->nblk = 0u;
+        return;
+    }
+    memset(c->slot, 0, c->nblk * sizeof(*c->slot));
+    for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
+    for (i = 0; i < c->nblk; i++) {
+        if (c->slot[i].mu.ok == 0) {
+            /* Without the slot locks the exporters could not agree on a
+             * result, so the frame has to go without the cache rather
+             * than risk a duplicated export. */
+            zgec_export_cache_free(c);
+            return;
+        }
+    }
+    for (i = 0; i < c->nblk; i++) {
+        const zgec_footer_block_entry *be = &f->blocks[i];
+        uint8_t D = be->lit_ref_depth;
+        uint8_t k;
+        if (D == 0u || (size_t)D > i) continue;
+        for (k = 0; k < D; k++)
+            c->slot[i - (size_t)D + (size_t)k].refs++;
+    }
+}
+
+/* Drop one consumer. The last one out releases the bytes, so the cache
+ * never keeps a block alive past the blocks that read it. */
+static void zgec_export_release(zgec_export_slot *s)
+{
+    if (s == NULL) return;
+    if (zgec_atomic_fetch_add_size(&s->refs, (size_t)-1) != (size_t)1) return;
+    /* Nobody else can reach this slot now: every consumer that held a
+     * reference has already copied the bytes it needed. */
+    if (s->alias == 0u) zgec_free(s->lit);
+    s->lit = NULL;
+    s->len = 0u;
+}
+
+/* Export block idx into its slot. Called with the slot held; the work
+ * itself is the expensive part, so the lock is only held for the block
+ * that is being produced, never across another lookup. */
+static zgec_err zgec_export_block(zgec_export_cache *c, uint32_t idx,
+                                  zgec_export_slot *s)
+{
+    const zgec_footer_block_entry *pe = &c->f->blocks[idx];
+    const uint8_t *prh;
+    const uint8_t *ppay;
+    const uint8_t *elb = NULL;
+    uint8_t *owned = NULL;
+    size_t elsz = 0;
+    zgec_record_header pr;
+    zgec_err e;
+
+    s->lit = NULL;
+    s->len = 0u;
+    s->err = ZGEC_OK;
+    if (pe->offset + 24u > (uint64_t)c->src_size) {
+        s->err = ZGEC_ERR_TRUNCATED;
+        return s->err;
+    }
+    prh = c->src + (size_t)pe->offset;
+    e = zgec_record_header_parse(&pr, prh, c->fh);
+    if (e != ZGEC_OK) {
+        s->err = e;
+        return e;
+    }
+    if (pe->offset + 24u + (uint64_t)pr.payload_size > (uint64_t)c->src_size) {
+        s->err = ZGEC_ERR_TRUNCATED;
+        return s->err;
+    }
+    if ((pr.rflags & ZGEC_RFLAG_FILTERED) != 0) {
+        /* V11: a FILTERED block is not a literal-reference predecessor. */
+        s->err = ZGEC_ERR_LITREF_EXPORT;
+        return s->err;
+    }
+    if ((pr.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0) {
+        s->err = ZGEC_ERR_LITREF_EXPORT; /* V9 */
+        return s->err;
+    }
+    ppay = prh + 24;
+    if (pr.record_type == ZGEC_REC_RAW) {
+        if (pr.payload_size != pr.raw_size) {
+            s->err = ZGEC_ERR_RECORD_SIZE;
+            return s->err;
+        }
+        elsz = (size_t)pr.raw_size;
+        if (elsz > 0) {
+            /* The frame outlives every slot, so a RAW predecessor's
+             * literals are borrowed rather than copied a second time. */
+            s->alias = 1u;
+            elb = ppay;
+        }
+    } else {
+        e = dec_predecessor_export(ppay, &pr, &owned, &elsz);
+        if (e != ZGEC_OK) {
+            s->err = e;
+            return e;
+        }
+    }
+    s->lit = (owned != NULL) ? owned : (uint8_t *)elb;
+    s->len = elsz;
+    s->err = ZGEC_OK;
+    return ZGEC_OK;
+}
+
+/* Take block idx's exported literals: export them here if nobody else
+ * has, otherwise wait for the worker that is exporting them right now.
+ * Returns the bytes and their length, or the export error. */
+static zgec_err zgec_export_slot_acquire(zgec_export_cache *c, uint32_t idx,
+                                         const uint8_t **lit, size_t *len)
+{
+    zgec_export_slot *s;
+    zgec_err e;
+
+    *lit = NULL;
+    *len = 0u;
+    if (c == NULL || idx >= c->nblk) return ZGEC_ERR_INTERNAL;
+    s = &c->slot[idx];
+    zgec_mu_lock(&s->mu);
+    if (s->ready != 0u) {
+        *lit = s->lit;
+        *len = s->len;
+        e = s->err;
+        zgec_mu_unlock(&s->mu);
+        return e;
+    }
+    /* Claimed by this worker, and still locked: publish the export
+     * before anybody else can look at it. */
+    e = zgec_export_block(c, idx, s);
+    s->ready = 1u;
+    zgec_mu_unlock(&s->mu);
+    if (e != ZGEC_OK) return e;
+    *lit = s->lit;
+    *len = s->len;
+    return ZGEC_OK;
+}
+
+/* Local LITREF predecessor: parse and export one predecessor record,
+ * the way the random-access path has always done it. */
+static zgec_err dec_predecessor_local(const uint8_t *src, size_t src_size,
+                                      const zgec_frame_header *fh,
+                                      const zgec_footer *f, uint32_t pb,
+                                      uint8_t **lit, size_t *len)
+{
+    const zgec_footer_block_entry *pe = &f->blocks[pb];
+    const uint8_t *prh;
+    zgec_record_header pr;
+    zgec_err e;
+
+    *lit = NULL;
+    *len = 0u;
+    if (pe->offset + 24u > (uint64_t)src_size) return ZGEC_ERR_TRUNCATED;
+    prh = src + (size_t)pe->offset;
+    e = zgec_record_header_parse(&pr, prh, fh);
+    if (e != ZGEC_OK) return e;
+    if (pe->offset + 24u + (uint64_t)pr.payload_size > (uint64_t)src_size)
+        return ZGEC_ERR_TRUNCATED;
+    if ((pr.rflags & ZGEC_RFLAG_FILTERED) != 0) {
+        /* V11: a FILTERED block is not a literal-reference predecessor. */
+        return ZGEC_ERR_LITREF_EXPORT;
+    }
+    if ((pr.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0)
+        return ZGEC_ERR_LITREF_EXPORT; /* V9 */
+    return dec_predecessor_export(prh + 24, &pr, lit, len);
+}
+
+/* Build the LITREF region of block blk: the exported literals of its D
+ * predecessors, oldest first (4.6 step 4, 6.3). With a cache the bytes
+ * are taken from the shared slots and copied once, into the region;
+ * without one each predecessor is exported here instead. Both paths
+ * build the same region and report the same errors. */
+static zgec_err dec_litref_gather(zgec_decoder *d, const uint8_t *src,
+                                  size_t src_size, const zgec_frame_header *fh,
+                                  const zgec_footer *f, uint32_t blk,
+                                  uint8_t depth, zgec_export_cache *xc,
+                                  uint8_t **litref, size_t *litref_len)
+{
+    const uint8_t *parts[ZGEC_MAX_LITREF_DEPTH];
+    size_t part_sz[ZGEC_MAX_LITREF_DEPTH];
+    size_t total = 0;
+    size_t wpos = 0;
+    size_t ngot = 0;
+    uint8_t *buf = NULL;
+    uint8_t k8;
+    uint32_t base = blk - (uint32_t)depth;
+    int shared = (xc != NULL && xc->slot != NULL);
+    zgec_err e = ZGEC_OK;
+
+    *litref = NULL;
+    *litref_len = 0u;
+    if (depth == 0u) return ZGEC_OK;
+    if (d->level == ZGEC_LEVEL_CORE) return ZGEC_ERR_LITREF_EXPORT; /* V9 */
+    if (depth > ZGEC_MAX_LITREF_DEPTH) return ZGEC_ERR_LITREF_DEPTH;
+    if ((size_t)depth > (size_t)blk) return ZGEC_ERR_LITREF_DEPTH;
+
+    for (k8 = 0; k8 < depth; k8++) {
+        parts[k8] = NULL;
+        part_sz[k8] = 0u;
+        if (shared) {
+            e = zgec_export_slot_acquire(xc, base + (uint32_t)k8,
+                                         &parts[k8], &part_sz[k8]);
+        } else {
+            uint8_t *lb = NULL;
+            size_t ls = 0u;
+            e = dec_predecessor_local(src, src_size, fh, f,
+                                      base + (uint32_t)k8, &lb, &ls);
+            parts[k8] = lb;
+            part_sz[k8] = ls;
+        }
+        if (e != ZGEC_OK) return e; /* that predecessor holds nothing */
+        ngot = (size_t)k8 + 1u;
+        if (total + part_sz[k8] < total) {
+            e = ZGEC_ERR_OUTPUT_SIZE;
+            goto fail;
+        }
+        total += part_sz[k8];
+    }
+
+    if (total > 0) {
+        buf = (uint8_t *)zgec_alloc(total, 64);
+        if (buf == NULL) {
+            e = ZGEC_ERR_NOMEM;
+            goto fail;
+        }
+        for (k8 = 0; k8 < depth; k8++) {
+            if (part_sz[k8] > 0) {
+                memcpy(buf + wpos, parts[k8], part_sz[k8]);
+                wpos += part_sz[k8];
+            }
+        }
+    }
+    /* The region is a private copy from here, so the cache slots are
+     * done with and can hand their bytes to whoever asks next, and the
+     * locally exported parts are only ever copied into the region. */
+    while (ngot > 0) {
+        ngot--;
+        if (shared) zgec_export_release(&xc->slot[base + (uint32_t)ngot]);
+        else zgec_free((void *)parts[ngot]);
+    }
+    *litref = buf;
+    *litref_len = total;
+    return ZGEC_OK;
+
+fail:
+    while (ngot > 0) {
+        ngot--;
+        if (shared) zgec_export_release(&xc->slot[base + (uint32_t)ngot]);
+        else zgec_free((void *)parts[ngot]);
+    }
+    return e;
+}
+
 /* ---- dictionary fetch (sections 4.6, 5.8, 5.9, V9) ---- */
 
 static const zgec_footer_dict_entry *find_dict_entry(const zgec_footer *f,
@@ -2767,13 +3151,15 @@ static void hist_push(zgec_decoder *d, const uint8_t *lit, size_t n, int ok)
 
 /* Defined below (random access, 4.6); the block-parallel path reuses it so
  * a block decodes identically whether it is read alone or as part of a
- * frame. */
+ * frame. blk is the block's index in the footer, and xc the frame-wide
+ * literal-export cache the parallel path shares (NULL for a lone read). */
 static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
                                      size_t src_size,
                                      const zgec_frame_header *fh,
                                      const zgec_footer *f,
-                                     const zgec_footer_block_entry *be,
+                                     uint32_t blk,
                                      uint8_t *ovr, size_t ovr_cap,
+                                     zgec_export_cache *xc,
                                      const uint8_t **rdst, size_t *rsz);
 
 /* ---- block-parallel frame decode (10.6, G4) ----
@@ -2800,24 +3186,62 @@ typedef struct {
     const size_t *sz;
     uint8_t *out;
     uint32_t nblk;
+    zgec_export_cache *xc;  /* frame-wide literal exports (6.3) */
+    size_t blk_stride;      /* block hand-out order, see dec_block_stride */
     zgec_mu *mu;        /* guards err/err_idx */
     volatile size_t *next;
     zgec_err *err;
     uint32_t *err_idx;
 } zgec_dec_block_job;
 
+/* The order in which the workers take the frame's blocks. A worker that
+ * is handed the blocks in ascending order ends up next to its siblings,
+ * all of them inside the same few blocks, and every block's literal
+ * references are the predecessors those siblings are still exporting
+ * (6.3): the first worker claims them, the rest queue up behind it, and
+ * only one of them makes progress at a time. Spreading the blocks out
+ * gives neighbouring workers disjoint predecessor windows, which is
+ * what keeps the exports from turning into a hand-off chain.
+ *
+ * The spread is a modular stride, and it must be coprime with the block
+ * count or the walk would step over blocks and never hand them out at
+ * all. An odd stride always exists (nblk-1 when nblk is even, nblk-2
+ * when it is odd), so scan upward from 3 and take the first coprime
+ * one; a frame with one or two blocks falls back to plain ascending
+ * order, where there is nothing to spread. */
+static size_t dec_block_stride(uint32_t nblk)
+{
+    size_t s = 3;
+    if (nblk <= 3u) return 1u;
+    while (s < (size_t)nblk) {
+        size_t a = s;
+        size_t b = (size_t)nblk;
+        while (b != 0u) {
+            size_t t = a % b;
+            a = b;
+            b = t;
+        }
+        if (a == 1u) return s;
+        s += 2u;
+    }
+    return 1u;
+}
+
 static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
 {
     if (jb == NULL) return;
     for (;;) {
-        uint32_t i = (uint32_t)zgec_atomic_fetch_add_size(jb->next, 1);
-        if (i >= jb->nblk) return;
+        uint32_t k = (uint32_t)zgec_atomic_fetch_add_size(jb->next, 1);
+        uint32_t i;
+        if (k >= jb->nblk) return;
+        i = (uint32_t)(((uint64_t)k * (uint64_t)jb->blk_stride) %
+                       (uint64_t)jb->nblk);
         const uint8_t *p = NULL;
         size_t got = 0;
         zgec_err e;
         e = decode_block_record(jb->w, jb->src, jb->src_size, jb->fh, jb->f,
-                                &jb->f->blocks[i],
-                                jb->out + jb->off[i], jb->sz[i], &p, &got);
+                                i, jb->out + jb->off[i], jb->sz[i], jb->xc,
+                                &p, &got);
         if (e == ZGEC_OK && (got != jb->sz[i] || p != jb->out + jb->off[i])) {
             e = ZGEC_ERR_INTERNAL;
         }
@@ -2940,8 +3364,10 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     uint8_t *out = NULL;
     zgec_decoder **ws = NULL;
     zgec_dec_block_job *jobs = NULL;
+    zgec_export_cache xc;
     zgec_mu mu;
     volatile size_t next = 0;
+    size_t blk_stride = 1;
     uint32_t err_idx = nblk;
     zgec_err werr = ZGEC_OK;
     zgec_err err = ZGEC_OK;
@@ -2953,6 +3379,7 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     int mu_ok = 0;
 
     *took = 0;
+    memset(&xc, 0, sizeof(xc));
     if ((uint64_t)nblk * (uint64_t)sizeof(*off) > (uint64_t)SIZE_MAX) { err = ZGEC_ERR_NOMEM; goto done; }
     off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
     sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
@@ -3129,6 +3556,12 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
         goto done;
     }
     mu_ok = 1;
+    /* The literal exports are built once and shared: before the first
+     * worker can touch them, so nothing has to be read while it is
+     * being written. A failure leaves the cache disabled and each block
+     * exports its own predecessors, exactly as it did before. */
+    zgec_export_cache_init(&xc, fh, f, src, src_size);
+    blk_stride = dec_block_stride(nblk);
     for (t = 0; t < n_workers; t++) {
         jobs[t].w = ws[t];
         jobs[t].src = src;
@@ -3139,6 +3572,8 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
         jobs[t].sz = sz;
         jobs[t].out = out;
         jobs[t].nblk = nblk;
+        jobs[t].xc = &xc;
+        jobs[t].blk_stride = blk_stride;
         jobs[t].mu = &mu;
         jobs[t].next = &next;
         jobs[t].err = &werr;
@@ -3156,6 +3591,7 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
 
 done:
     if (mu_ok != 0) zgec_mu_destroy(&mu);
+    zgec_export_cache_free(&xc);
     if (ws != NULL) {
         for (t = 0; t < n_workers && ws != NULL; t++) {
             if (ws[t] != NULL) zgec_decoder_destroy(ws[t]);
@@ -3675,10 +4111,12 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
                                      size_t src_size,
                                      const zgec_frame_header *fh,
                                      const zgec_footer *f,
-                                     const zgec_footer_block_entry *be,
+                                     uint32_t blk,
                                      uint8_t *ovr, size_t ovr_cap,
+                                     zgec_export_cache *xc,
                                      const uint8_t **rdst, size_t *rsz)
 {
+    const zgec_footer_block_entry *be;
     const uint8_t *rh;
     zgec_record_header rec;
     const uint8_t *payload;
@@ -3691,6 +4129,7 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
     int filter_mode = 0;
     int filter_param = 0;
 
+    be = &f->blocks[blk];
     if (be->offset + 24u > (uint64_t)src_size) return ZGEC_ERR_TRUNCATED;
     rh = src + (size_t)be->offset;
     e = zgec_record_header_parse(&rec, rh, fh);
@@ -3756,132 +4195,14 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
     if (e != ZGEC_OK) return e; /* V9 */
 
     /* Literal references: export blocks b-D..b-1 (4.6 step 4, 6.3).
-     * Each predecessor is exported once into a side buffer; the sizes
-     * are pre-summed so the result needs a single allocation and one
-     * copy pass (no per-predecessor realloc + re-copy). */
-    if (rec.lit_ref_depth > 0) {
-        uint32_t b;
-        uint8_t k8;
-        uint8_t depth = rec.lit_ref_depth;
-        uint8_t *parts[ZGEC_MAX_LITREF_DEPTH];
-        size_t part_sz[ZGEC_MAX_LITREF_DEPTH];
-        size_t total = 0;
-        size_t wpos = 0;
-        if (d->level == ZGEC_LEVEL_CORE) return ZGEC_ERR_LITREF_EXPORT; /* V9 */
-        if (depth > ZGEC_MAX_LITREF_DEPTH) return ZGEC_ERR_LITREF_DEPTH;
-        /* Find this block's index: caller passes it via be lookup. */
-        b = 0;
-        for (b = 0; b < f->block_count; b++) {
-            if (f->blocks[b].offset == be->offset) break;
-        }
-        if (b >= f->block_count) return ZGEC_ERR_INTERNAL;
-        if ((uint32_t)depth > b) return ZGEC_ERR_LITREF_DEPTH;
-        for (k8 = 0; k8 < depth; k8++) {
-            parts[k8] = NULL;
-            part_sz[k8] = 0;
-        }
-        for (k8 = 0; k8 < depth; k8++) {
-            uint32_t pb = b - (uint32_t)depth + (uint32_t)k8;
-            const zgec_footer_block_entry *pe = &f->blocks[pb];
-            const uint8_t *prh;
-            zgec_record_header pr;
-            const uint8_t *ppay;
-            uint8_t *elb = NULL;
-            size_t elsz = 0;
-            uint8_t j8;
-            if (pe->offset + 24u > (uint64_t)src_size) {
-                e = ZGEC_ERR_TRUNCATED;
-                goto litref_fail;
-            }
-            prh = src + (size_t)pe->offset;
-            e = zgec_record_header_parse(&pr, prh, fh);
-            if (e != ZGEC_OK) goto litref_fail;
-            if (pe->offset + 24u + (uint64_t)pr.payload_size >
-                (uint64_t)src_size) {
-                e = ZGEC_ERR_TRUNCATED;
-                goto litref_fail;
-            }
-            if ((pr.rflags & ZGEC_RFLAG_FILTERED) != 0) {
-                /* V11: a FILTERED block is not a literal-reference
-                 * predecessor. */
-                e = ZGEC_ERR_LITREF_EXPORT;
-                goto litref_fail;
-            }
-            if ((pr.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) == 0) {
-                e = ZGEC_ERR_LITREF_EXPORT; /* V9 */
-                goto litref_fail;
-            }
-            ppay = prh + 24;
-            if (pr.record_type == ZGEC_REC_RAW) {
-                if (pr.payload_size != pr.raw_size) {
-                    e = ZGEC_ERR_RECORD_SIZE;
-                    goto litref_fail;
-                }
-                elsz = (size_t)pr.raw_size;
-                if (elsz > 0) {
-                    elb = (uint8_t *)zgec_alloc(elsz, 64);
-                    if (!elb) {
-                        e = ZGEC_ERR_NOMEM;
-                        goto litref_fail;
-                    }
-                    memcpy(elb, ppay, elsz);
-                }
-            } else if (pr.record_type == ZGEC_REC_RLE) {
-                if (pr.payload_size != 1u) {
-                    e = ZGEC_ERR_RECORD_SIZE;
-                    goto litref_fail;
-                }
-                elsz = (size_t)pr.raw_size;
-                if (elsz > 0) {
-                    elb = (uint8_t *)zgec_alloc(elsz, 64);
-                    if (!elb) {
-                        e = ZGEC_ERR_NOMEM;
-                        goto litref_fail;
-                    }
-                    memset(elb, ppay[0], elsz);
-                }
-            } else if (pr.record_type == ZGEC_REC_COMPRESSED) {
-                e = export_block_literals(ppay, (size_t)pr.payload_size,
-                                          pr.segment_count, &elb, &elsz);
-                if (e != ZGEC_OK) goto litref_fail;
-                if (elsz == 0) {
-                    zgec_free(elb);
-                    elb = NULL;
-                }
-            } else {
-                e = ZGEC_ERR_RECORD_TYPE;
-                goto litref_fail;
-            }
-            if (total + elsz < total) {
-                zgec_free(elb);
-                e = ZGEC_ERR_OUTPUT_SIZE;
-                goto litref_fail;
-            }
-            parts[k8] = elb;
-            part_sz[k8] = elsz;
-            total += elsz;
-            continue;
-litref_fail:
-            zgec_free(elb);
-            for (j8 = 0; j8 < k8; j8++) zgec_free(parts[j8]);
-            return e;
-        }
-        if (total > 0) {
-            litref = (uint8_t *)zgec_alloc(total, 64);
-            if (!litref) {
-                for (k8 = 0; k8 < depth; k8++) zgec_free(parts[k8]);
-                return ZGEC_ERR_NOMEM;
-            }
-            for (k8 = 0; k8 < depth; k8++) {
-                if (part_sz[k8] > 0) {
-                    memcpy(litref + wpos, parts[k8], part_sz[k8]);
-                    wpos += part_sz[k8];
-                }
-                zgec_free(parts[k8]);
-            }
-        }
-        litref_len = total;
-    }
+     * The gather takes the bytes from the frame-wide export cache when
+     * the block-parallel path supplies one -- that is what keeps a
+     * multi-threaded decode from re-exporting each predecessor once per
+     * worker -- and exports them locally otherwise, as a lone
+     * random-access read does. */
+    e = dec_litref_gather(d, src, src_size, fh, f, blk, rec.lit_ref_depth, xc,
+                          &litref, &litref_len);
+    if (e != ZGEC_OK) return e;
 
     {
         /* Spec 4.3: when FILTERED is set the payload starts with the
@@ -3999,8 +4320,8 @@ zgec_err zgec_decode_block_index(zgec_decoder *d,
         zgec_footer_free(&f);
         return ZGEC_ERR_BLOCK_SIZE;
     }
-    e = decode_block_record(d, src, src_size, &fh, &f,
-                            &f.blocks[block_index], NULL, 0, dst, dst_size);
+    e = decode_block_record(d, src, src_size, &fh, &f, block_index,
+                            NULL, 0, NULL, dst, dst_size);
     zgec_footer_free(&f);
     return e;
 }
