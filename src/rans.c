@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_rans.h"
 
 #include "zgec_lit.h"
@@ -508,6 +511,11 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
 
 /* ---- histograms (section 9.3) ---- */
 
+/* Clear and fill n_tables literal histograms of 256 counts each from Z
+ * (section 9.3). A single table counts all literals; with multiple tables,
+ * lane starts and runstart bits select the last table, and other literals
+ * use the preceding byte's context class mapped through class_map.
+ * Multi-table input requires a valid ctx_mode, class_map and runstart. */
 void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
                           const uint8_t *Z, size_t n_lit,
                           int ctx_mode, const uint8_t *class_map,
@@ -523,55 +531,43 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     if (n_tables > 1) {
         /* Prevalidate the whole map before a single count is written, so
          * an invalid map cannot leave a partly populated histogram set
-         * that looks like a finished model. The loop below keeps its own
-         * checks as a second line of defence, though this pass does not
-         * make all of them unreachable: `cls` there comes from
-         * zgec_classify(), not from class_map, so its `cls >= 64u` exit
-         * still guards whatever classify() returns. */
+         * that looks like a finished model. */
         for (unsigned cls = 0; cls < 64u; cls++) {
-            /* The bound is k, not n_tables, because index k is reserved for
-             * the run-start table. include/zgec_rans.h:95 fixes the
-             * relationship -- "n_tables is 1 (k == 1) or k + 1 (k > 1, last
-             * table is run-start)" -- and src/encode.c:1496 is the only
-             * assignment, `n_tables = (k <= 1) ? 1 : (k + 1)`, so with
-             * n_tables > 1 established just above, k == n_tables - 1 here.
-             * Both consumers of a class map refuse class_map[cls] >= k --
-             * zgec_rans_decode() and zgec_rans_encode(), both above -- so
-             * an entry of exactly k has to be refused here too: it would
-             * otherwise be counted into the run-start table and only
-             * rejected later by zgec_rans_encode(), leaving exactly the
-             * half-built histogram set this guard exists to prevent. */
             if ((int)class_map[cls] >= n_tables - 1) return;
         }
     }
 
     if (n_tables == 1) {
-        /* Single table: a plain linear histogram, 16 counts per step.
-         * The lane geometry below only exists to interleave the table
-         * streams; with one table it is pure overhead. Counts match the
-         * lane loop byte for byte. */
+        /* Single table: multi-accumulator histogram unrolled 4-wide to break
+         * store-forwarding dependencies on consecutive repeating bytes. */
         size_t i = 0;
-        for (; i + 16 <= n_lit; i += 16) {
-            tables_counts[Z[i]]++;
-            tables_counts[Z[i + 1]]++;
-            tables_counts[Z[i + 2]]++;
-            tables_counts[Z[i + 3]]++;
-            tables_counts[Z[i + 4]]++;
-            tables_counts[Z[i + 5]]++;
-            tables_counts[Z[i + 6]]++;
-            tables_counts[Z[i + 7]]++;
-            tables_counts[Z[i + 8]]++;
-            tables_counts[Z[i + 9]]++;
-            tables_counts[Z[i + 10]]++;
-            tables_counts[Z[i + 11]]++;
-            tables_counts[Z[i + 12]]++;
-            tables_counts[Z[i + 13]]++;
-            tables_counts[Z[i + 14]]++;
-            tables_counts[Z[i + 15]]++;
+        uint32_t c0[ZGEC_NSYM_LIT] = {0};
+        uint32_t c1[ZGEC_NSYM_LIT] = {0};
+        uint32_t c2[ZGEC_NSYM_LIT] = {0};
+        uint32_t c3[ZGEC_NSYM_LIT] = {0};
+        for (; i + 4 <= n_lit; i += 4) {
+            c0[Z[i]]++;
+            c1[Z[i + 1]]++;
+            c2[Z[i + 2]]++;
+            c3[Z[i + 3]]++;
         }
         for (; i < n_lit; i++) {
-            tables_counts[Z[i]]++;
+            c0[Z[i]]++;
         }
+#if defined(__AVX2__)
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+            __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+            __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+            _mm256_storeu_si256((__m256i *)(tables_counts + s), sum);
+        }
+#else
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
+            tables_counts[s] = c0[s] + c1[s] + c2[s] + c3[s];
+        }
+#endif
         return;
     }
 
@@ -580,38 +576,42 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     uint8_t idx_lut[256];
     zgec_lit_lane_geom(start, len, n_lit);
     zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
+
     int rs_empty = zgec_rs_is_empty(runstart, n_lit);
 
     if (rs_empty) {
+        /* When runstart has no bits set, skip testing zgec_rs_get() per literal. */
         for (unsigned lane = 0; lane < 8; lane++) {
-            size_t st = start[lane];
-            size_t ln = len[lane];
-            if (ln == 0) continue;
-            tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[st]]++;
-            for (size_t t = 1; t < ln; t++) {
-                size_t j = st + t;
-                uint8_t pidx = idx_lut[Z[j - 1]];
-                if (pidx == 0xFFu) return;
-                tables_counts[(size_t)pidx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+            size_t lane_len = len[lane];
+            size_t lane_start = start[lane];
+            if (lane_len > 0) {
+                tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
+                for (size_t t = 1; t < lane_len; t++) {
+                    size_t j = lane_start + t;
+                    uint8_t pidx = idx_lut[Z[j - 1]];
+                    if (pidx == 0xFFu) return;
+                    tables_counts[(size_t)pidx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+                }
             }
         }
     } else {
         for (unsigned lane = 0; lane < 8; lane++) {
-            size_t st = start[lane];
-            size_t ln = len[lane];
-            for (size_t t = 0; t < ln; t++) {
-                size_t j = st + t;
-                int table_idx;
-                if (j >= n_lit) return;
-                if (t == 0 || zgec_rs_get(runstart, j)) {
-                    table_idx = n_tables - 1;
-                } else {
-                    uint8_t pidx = idx_lut[Z[j - 1]];
-                    if (pidx == 0xFFu) return;
-                    table_idx = (int)pidx;
+            size_t lane_len = len[lane];
+            size_t lane_start = start[lane];
+            if (lane_len > 0) {
+                tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
+                for (size_t t = 1; t < lane_len; t++) {
+                    size_t j = lane_start + t;
+                    int table_idx;
+                    if (zgec_rs_get(runstart, j)) {
+                        table_idx = n_tables - 1;
+                    } else {
+                        uint8_t pidx = idx_lut[Z[j - 1]];
+                        if (pidx == 0xFFu) return;
+                        table_idx = (int)pidx;
+                    }
+                    tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
                 }
-                if (table_idx < 0 || table_idx >= n_tables) return;
-                tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
             }
         }
     }

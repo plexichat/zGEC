@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
@@ -159,6 +162,11 @@ zgec_err zgec_filter_validate(unsigned mode, unsigned param)
     return ZGEC_ERR_RESERVED;
 }
 
+/* Apply the DELTA or SHUFFLE pre-filter (section 7.5) from src to dst,
+ * preserving n bytes. For nonempty input, buffers must be non-null and
+ * must not overlap. Returns ZGEC_ERR_RESERVED for an invalid descriptor,
+ * ZGEC_ERR_INVAL for invalid buffers, or ZGEC_OK on success; n == 0 is a
+ * no-op after descriptor validation. */
 zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
                            unsigned mode, unsigned param)
 {
@@ -180,9 +188,18 @@ zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
         if (d - s < n || s - d < n) return ZGEC_ERR_INVAL;
     }
     if (mode == ZGEC_FILTER_DELTA) {
-        size_t i;
+        size_t i = 1;
         dst[0] = src[0];
-        for (i = 1; i < n; i++) {
+#if defined(__AVX2__)
+        while (i + 32u <= n) {
+            __m256i vcurr = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            __m256i vprev = _mm256_loadu_si256((const __m256i *)(const void *)(src + i - 1));
+            __m256i vdelta = _mm256_sub_epi8(vcurr, vprev);
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), vdelta);
+            i += 32u;
+        }
+#endif
+        for (; i < n; i++) {
             dst[i] = (uint8_t)((unsigned)src[i] - (unsigned)src[i - 1]);
         }
     } else {
