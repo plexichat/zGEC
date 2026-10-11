@@ -95,3 +95,23 @@ Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-l
 
 **Action:**
 When configuring top-tier compression levels, probe all bucket lanes in `ZGEC_TIER_HIGH`, rely on price-gate cost modeling for candidate minimum lengths, and leverage larger block windows up to the P24 position limit (16 MiB).
+## 2026-10-13 - Comprehensive AVX2 SIMD Vectorization in Decompression Hot Paths
+
+**Learning:**
+1. In Phase B decompression (`exec_copy_literals` and `exec_match_wide`), replacing byte/word loops with 256-bit AVX2 vector loads and stores (`_mm256_loadu_si256`/`_mm256_storeu_si256`) accelerates literal copying and match reconstruction across 32-byte blocks.
+2. For small match offsets (`moff = 2, 4, 8, 16`), broadcasting pattern registers into 256-bit AVX2 vectors (`_mm256_set1_epi16`, `_mm256_set1_epi32`, `_mm256_set1_epi64x`, `_mm256_broadcastsi128_si256`) enables writing 32 repeated bytes per store without scalar byte iterations.
+3. In sub-literal prediction decoding (`exec_literals_sub`), when `rep0 >= 32`, vectorizing residual addition with 256-bit `_mm256_add_epi8` computes 32 decoded sub-literals per SIMD instruction.
+4. In 8-lane rANS decoding (`zgec_rans_decode`), gathering packed slots across 8 lanes simultaneously with `_mm256_i32gather_epi32` and computing state transitions with `_mm256_mullo_epi32` accelerates rANS symbol decoding during full rounds when no lane requires state renormalization.
+5. In inverse pre-filtering (`zgec_filter_inverse` DELTA mode), 128-bit vector shifts (`_mm_slli_si128`) and byte additions (`_mm_add_epi8`) compute 16-byte prefix sums in parallel.
+
+**Action:**
+Always use 256-bit AVX2 vector operations for literal copies, pattern broadcasts, sub-literal residual additions, rANS 8-lane state gathers, and delta filter inverse prefix sums in decompression hot paths.
+## 2026-10-13 - AVX2 Sub-Literal Residual Subtraction, Hoisted Lane Boundary Checks, and Static Context LUTs
+
+**Learning:**
+1. In `zgec_enc_build_resid` (`src/encode.c`), sub-literal residual prediction subtraction operated scalar byte-by-byte. Vectorizing 32 bytes at a time with AVX2 (`_mm256_sub_epi8` on `lit` and `vb + p - r0`) drastically accelerates residual generation.
+2. In `zgec_ctx_body_bits` (`src/encode.c`), scanning an $O(N \times \text{n\_lane})$ loop over 8 lane start positions per byte added millions of redundant array comparisons. Advancing a single lane pointer index (`next_lane_idx`) when $j$ reaches the next lane boundary reduces comparison overhead to $O(N)$.
+3. In `zgec_classify` (`src/lit.c`) and `zgec_select_contexts` (`src/encode.c`), replacing arithmetic signed mode classification with a static 256-entry lookup table (`signed_table`) eliminates branchy arithmetic in context model ranking.
+
+**Action:**
+Vectorize sub-literal prediction subtraction with 256-bit AVX2 byte operations, replace linear lane-boundary scans with monotonically advancing pointer checks, and use static 256-entry lookup tables for symbol classification.
