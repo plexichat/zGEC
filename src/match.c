@@ -155,7 +155,7 @@
 #define ZGEC_MF_PROBE_DEPTH 8u
 #endif
 #ifndef ZGEC_MF_PROBE_DEPTH_HIGH
-#define ZGEC_MF_PROBE_DEPTH_HIGH 8u
+#define ZGEC_MF_PROBE_DEPTH_HIGH 16u
 #endif
 
 /* Positions sampled inside a match for the fast and main tiers.
