@@ -450,6 +450,11 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
 
 /* ---- histograms (section 9.3) ---- */
 
+/* Clear and fill n_tables literal histograms of 256 counts each from Z
+ * (section 9.3). A single table counts all literals; with multiple tables,
+ * lane starts and runstart bits select the last table, and other literals
+ * use the preceding byte's context class mapped through class_map.
+ * Multi-table input requires a valid ctx_mode, class_map and runstart. */
 void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
                           const uint8_t *Z, size_t n_lit,
                           int ctx_mode, const uint8_t *class_map,

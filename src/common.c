@@ -158,6 +158,11 @@ zgec_err zgec_filter_validate(unsigned mode, unsigned param)
     return ZGEC_ERR_RESERVED;
 }
 
+/* Apply the DELTA or SHUFFLE pre-filter (section 7.5) from src to dst,
+ * preserving n bytes. For nonempty input, buffers must be non-null and
+ * must not overlap. Returns ZGEC_ERR_RESERVED for an invalid descriptor,
+ * ZGEC_ERR_INVAL for invalid buffers, or ZGEC_OK on success; n == 0 is a
+ * no-op after descriptor validation. */
 zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
                            unsigned mode, unsigned param)
 {
