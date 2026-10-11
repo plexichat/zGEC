@@ -681,12 +681,14 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             if (xb > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
 
             /* refill to 56..63 bits */
-            nb = (63u - nacc) >> 3;
-            w = zgec_rd64(ptr - 7);
-            acc |= w >> nacc;
-            nacc += 8u * nb;
-            ptr -= nb;
-            left -= nb;
+            if (nacc < 56u) {
+                nb = (63u - nacc) >> 3;
+                w = zgec_rd64(ptr - 7);
+                acc |= w >> nacc;
+                nacc += 8u * nb;
+                ptr -= nb;
+                left -= nb;
+            }
 
             extra = (uint32_t)((acc >> 1) >> (63u - xb));
             acc <<= xb;
@@ -721,12 +723,14 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             if (xb > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
 
             /* refill to 56..63 bits */
-            nb = (63u - nacc) >> 3;
-            w = zgec_rd64(ptr - 7);
-            acc |= w >> nacc;
-            nacc += 8u * nb;
-            ptr -= nb;
-            left -= nb;
+            if (nacc < 56u) {
+                nb = (63u - nacc) >> 3;
+                w = zgec_rd64(ptr - 7);
+                acc |= w >> nacc;
+                nacc += 8u * nb;
+                ptr -= nb;
+                left -= nb;
+            }
             if (syms) syms[i] = (uint8_t)sym;
             extra = (uint32_t)((acc >> 1) >> (63u - xb));
             acc <<= xb;

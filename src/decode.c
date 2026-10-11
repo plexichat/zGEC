@@ -1046,12 +1046,14 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         sym = (unsigned)en->symbol;
         xb = (unsigned)zgec_seq_nbits[sym];
         if (xb > 32u) goto bad_symbol;
-        nb = (63u - nacc) >> 3;
-        w = zgec_rd64(ptr - 7);
-        acc |= w >> nacc;
-        nacc += 8u * nb;
-        ptr -= nb;
-        left -= nb;
+        if (nacc < 56u) {
+            nb = (63u - nacc) >> 3;
+            w = zgec_rd64(ptr - 7);
+            acc |= w >> nacc;
+            nacc += 8u * nb;
+            ptr -= nb;
+            left -= nb;
+        }
         /* (acc >> 1) >> (63 - k) is acc >> (64 - k) for k >= 1 and 0
          * for k == 0, without a branch. */
         extra = (uint32_t)((acc >> 1) >> (63u - xb));
@@ -1708,13 +1710,15 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * before the match, so the byte-at-a-time order is
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
-                } else if (moff >= 32 && mlen >= 32) {
-                    exec_match_wide(d, msrc, mlen, 32);
-                } else if (moff >= 16 && mlen >= 16) {
-                    exec_match_wide(d, msrc, mlen, 16);
-                } else if (moff >= 8 && mlen >= 8) {
-                    exec_match_wide(d, msrc, mlen, 8);
-                } else if (moff >= 8 && mlen >= 4) {
+                } else if (moff >= 8) {
+                    if (mlen <= 8) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                    } else if (moff >= 16 && mlen >= 16) {
+                        exec_match_wide(d, msrc, mlen, 16);
+                    } else {
+                        exec_match_wide(d, msrc, mlen, 8);
+                    }
+                } else if (moff >= 4 && mlen <= 8) {
                     memcpy(d, msrc, 4);
                     memcpy(d + mlen - 4, msrc + mlen - 4, 4);
                 } else {
