@@ -1,4 +1,4 @@
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_encode.h"
@@ -484,6 +484,13 @@ static uint32_t zgec_enc_rep0_after(const zgec_sequence *seq, size_t n)
  * ML-3 value (section 8.1), so the real match length is ml_coded[s] + 3.
  * vb_start is the virtual-buffer position of the slice's first output
  * byte. */
+/* Build the sub-literal residual buffer Z (section 9.6) exactly as the
+ * decoder reconstructs it: each literal is predicted from the byte rep0
+ * back in the virtual buffer, the match bytes are skipped, and tail
+ * literals use rep0 after the last sequence. ml_coded[s] holds the coded
+ * ML-3 value (section 8.1), so the real match length is ml_coded[s] + 3.
+ * vb_start is the virtual-buffer position of the slice's first output
+ * byte. */
 static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
                                  size_t n_lit, const uint32_t *ll,
                                  const uint32_t *ml_coded, size_t n_seq,
@@ -501,47 +508,52 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
         uint32_t u = 0;
 #if defined(__AVX2__)
         if (r0 != 0u) {
-            size_t r0_sz = (size_t)r0;
-            while (llen >= 32u && li + 32u <= n_lit && p >= r0_sz) {
-                __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li));
-                __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p - r0_sz));
-                __m256i vres = _mm256_sub_epi8(vlit, vpred);
-                _mm256_storeu_si256((__m256i *)(void *)(z + li), vres);
-                u += 32u;
-                li += 32u;
-                p += 32u;
-                llen -= 32u;
+            while (u + 32u <= llen && li + u + 32u <= n_lit) {
+                if ((size_t)r0 <= p + u) {
+                    __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                    __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)r0));
+                    __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                    _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
+                    u += 32u;
+                } else {
+                    break;
+                }
             }
         }
 #endif
-        for (; u < llen && li < n_lit; u++) {
+        for (; u < llen && li + u < n_lit; u++) {
             uint8_t pred = 0;
-            if (r0 != 0u && (size_t)r0 <= p) pred = vb[p - (size_t)r0];
-            z[li] = (uint8_t)((unsigned)lit[li] - (unsigned)pred);
-            li++;
-            p++;
+            if (r0 != 0u && (size_t)r0 <= p + u) pred = vb[p + u - (size_t)r0];
+            z[li + u] = (uint8_t)((unsigned)lit[li + u] - (unsigned)pred);
         }
-        p += (size_t)mlen;
+        li += (size_t)u;
+        p += (size_t)u + (size_t)mlen;
     }
+    {
+        uint32_t u = 0;
 #if defined(__AVX2__)
-    if (rep0_tail != 0u) {
-        size_t r0_sz = (size_t)rep0_tail;
-        while (li + 32u <= n_lit && p >= r0_sz) {
-            __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li));
-            __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p - r0_sz));
-            __m256i vres = _mm256_sub_epi8(vlit, vpred);
-            _mm256_storeu_si256((__m256i *)(void *)(z + li), vres);
-            li += 32u;
-            p += 32u;
+        if (rep0_tail != 0u) {
+            while (li + u + 32u <= n_lit) {
+                if ((size_t)rep0_tail <= p + u) {
+                    __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                    __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)rep0_tail));
+                    __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                    _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
+                    u += 32u;
+                } else {
+                    break;
+                }
+            }
         }
-    }
 #endif
-    for (; li < n_lit; li++) {
-        uint8_t pred = 0;
-        if (rep0_tail != 0u && (size_t)rep0_tail <= p)
-            pred = vb[p - (size_t)rep0_tail];
-        z[li] = (uint8_t)((unsigned)lit[li] - (unsigned)pred);
-        p++;
+        for (; li + u < n_lit; u++) {
+            uint8_t pred = 0;
+            if (rep0_tail != 0u && (size_t)rep0_tail <= p + u)
+                pred = vb[p + u - (size_t)rep0_tail];
+            z[li + u] = (uint8_t)((unsigned)lit[li + u] - (unsigned)pred);
+        }
+        li += u;
+        p += u;
     }
 }
 
@@ -1240,6 +1252,10 @@ static double zgec_cond_net_gain(const uint32_t *cls_hist /*[3][66]*/,
  * (mode, class map, k). Mirrors emission (zgec_rans_histograms): lane
  * starts and run starts use the run-start table, every other byte the
  * context table its class maps to (D5). cls_hist is 64x256 scratch. */
+/* Partitioned rANS body estimate for a byte buffer under an explicit
+ * (mode, class map, k). Mirrors emission (zgec_rans_histograms): lane
+ * starts and run starts use the run-start table, every other byte the
+ * context table its class maps to (D5). cls_hist is 64x256 scratch. */
 static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                                  const uint8_t *runstart,
                                  int ctx_mode, const uint8_t *cmap, int k,
@@ -1281,12 +1297,12 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                 rs_total++;
                 continue;
             }
-        {
-            unsigned grp = (unsigned)grp_lut[z[j - 1]];
-            cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-            grp_total[grp]++;
+            {
+                unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                grp_total[grp]++;
+            }
         }
-    }
     }
     for (g = 0; g < k; g++) {
         body += zgec_enc_entropy_bits_u32(cls_hist + (size_t)g * 256u,

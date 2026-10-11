@@ -155,7 +155,7 @@
 #define ZGEC_MF_PROBE_DEPTH 8u
 #endif
 #ifndef ZGEC_MF_PROBE_DEPTH_HIGH
-#define ZGEC_MF_PROBE_DEPTH_HIGH 8u
+#define ZGEC_MF_PROBE_DEPTH_HIGH 16u
 #endif
 
 /* Positions sampled inside a match for the fast and main tiers.
@@ -906,6 +906,12 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         if (d == 0u || (size_t)d > ip) {
             continue;
         }
+        if (i == 1u && d == rep0) {
+            continue;
+        }
+        if (i == 2u && (d == rep0 || d == rep1)) {
+            continue;
+        }
         /* Assert-style: d <= ip < vb_size <= vb_capacity (hoisted check). */
         assert((size_t)d <= m->vb_capacity);
         /* min_match >= 4, so a repeat whose first four bytes differ cannot
@@ -936,8 +942,7 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     if (has_v8) {
         uint32_t hl = mf_hash8_v(v8);
         uint32_t lb = hl & (m->long_buckets - 1u);
-        const uint32_t *le = &m->long_tab[(size_t)lb];
-        uint32_t e = *le;
+        uint32_t e = m->long_tab[(size_t)lb];
         uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         uint32_t etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         uint32_t pos;
@@ -945,10 +950,6 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         uint32_t len;
         m->c_hl[ip & 1u] = hl;
         m->c_flags[ip & 1u] |= 2u;
-        mf_prefetch_bucket((const void *)le);
-        e = *le;
-        ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
-        etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         if (e != 0u && etag == ltag) {
             pos = mf_pos(e);
             if ((size_t)pos < ip) {
@@ -1060,27 +1061,37 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                      * 4-byte screen the rep path uses skips hopeless hash
                      * candidates before any length work. The pos + 4 guard
                      * keeps the read in bounds locally. */
-                    if ((size_t)pos + (size_t)4 <= m->vb_size &&
-                        zgec_rd32(vb + (size_t)pos) != cur4s) {
-                        continue;
-                    }
-                    /* A candidate can only beat `best` if it matches at
-                     * best.length - 1 as well; one byte compare there skips
-                     * the length scan for the candidates that cannot. */
-                    if (best.length != 0u && best.length <= cap &&
-                        vb[ip - (size_t)d + (size_t)best.length - 1u] !=
-                        vb[ip + (size_t)best.length - 1u]) {
-                        continue;
-                    }
-                    if (has_v8) {
-            uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-            len = (diff == 0u) ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
-                               : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-        } else {
-            len = mf_match_len(vb, ip, d, cap);
-        }
-                    if (len >= hash_min) {
-                        mf_update_best(d, len, &best, rep0, rep1, rep2);
+                    if ((size_t)pos + 8u <= m->vb_size && has_v8) {
+                        uint64_t diff = zgec_rd64(vb + (size_t)pos) ^ v8;
+                        if (diff != 0u) {
+                            len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                            if (len >= hash_min) {
+                                mf_update_best(d, len, &best, rep0, rep1, rep2);
+                            }
+                        } else {
+                            if (best.length <= 8u || best.length > cap ||
+                                vb[(size_t)pos + (size_t)best.length - 1u] ==
+                                vb[ip + (size_t)best.length - 1u]) {
+                                len = mf_match_len_slow(vb + (size_t)pos, vb + ip, cap);
+                                if (len >= hash_min) {
+                                    mf_update_best(d, len, &best, rep0, rep1, rep2);
+                                }
+                            }
+                        }
+                    } else {
+                        if ((size_t)pos + (size_t)4 <= m->vb_size &&
+                            zgec_rd32(vb + (size_t)pos) != cur4s) {
+                            continue;
+                        }
+                        if (best.length != 0u && best.length <= cap &&
+                            vb[ip - (size_t)d + (size_t)best.length - 1u] !=
+                            vb[ip + (size_t)best.length - 1u]) {
+                            continue;
+                        }
+                        len = mf_match_len(vb, ip, d, cap);
+                        if (len >= hash_min) {
+                            mf_update_best(d, len, &best, rep0, rep1, rep2);
+                        }
                     }
                 }
             }

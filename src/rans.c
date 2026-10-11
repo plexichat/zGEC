@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 /* ---- context mode validation (Annex C) ----
  *
  * Section 9.3 lets a stream name one of five classification functions.
@@ -190,7 +194,50 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     zgec_err err = ZGEC_OK;
     if (k == 1) {
         /* k == 1 fast path: single table, no context/run-start logic. */
-        for (size_t round = 0; round < max_rounds && err == ZGEC_OK; round++) {
+        size_t round = 0;
+#if defined(__AVX2__)
+        const int *tab_packed = (const int *)tables[0].packed;
+        __m256i v_mask_m = _mm256_set1_epi32((int)(ZGEC_RANS_M - 1));
+        __m256i v_mask_fff = _mm256_set1_epi32(0xFFF);
+        __m256i v_min_state = _mm256_set1_epi32((int)ZGEC_RANS_STATE_MIN);
+
+        for (; round < full && err == ZGEC_OK; round++) {
+            __m256i v_x = _mm256_loadu_si256((const __m256i *)state);
+            __m256i v_slot = _mm256_and_si256(v_x, v_mask_m);
+            __m256i v_e = _mm256_i32gather_epi32(tab_packed, v_slot, 4);
+            __m256i v_f = _mm256_and_si256(_mm256_srli_epi32(v_e, 8), v_mask_fff);
+            __m256i v_zero_f = _mm256_cmpeq_epi32(v_f, _mm256_setzero_si256());
+            if (!_mm256_testz_si256(v_zero_f, v_zero_f)) { err = ZGEC_ERR_RANS_STATE; break; }
+
+            Z[start[0] + round] = (uint8_t)_mm256_extract_epi32(v_e, 0);
+            Z[start[1] + round] = (uint8_t)_mm256_extract_epi32(v_e, 1);
+            Z[start[2] + round] = (uint8_t)_mm256_extract_epi32(v_e, 2);
+            Z[start[3] + round] = (uint8_t)_mm256_extract_epi32(v_e, 3);
+            Z[start[4] + round] = (uint8_t)_mm256_extract_epi32(v_e, 4);
+            Z[start[5] + round] = (uint8_t)_mm256_extract_epi32(v_e, 5);
+            Z[start[6] + round] = (uint8_t)_mm256_extract_epi32(v_e, 6);
+            Z[start[7] + round] = (uint8_t)_mm256_extract_epi32(v_e, 7);
+
+            __m256i v_x_hi = _mm256_srli_epi32(v_x, ZGEC_RANS_L);
+            __m256i v_bias = _mm256_srli_epi32(v_e, 20);
+            __m256i v_next = _mm256_add_epi32(_mm256_mullo_epi32(v_f, v_x_hi), v_bias);
+
+            __m256i v_needs_renorm = _mm256_cmpgt_epi32(v_min_state, v_next);
+            _mm256_storeu_si256((__m256i *)state, v_next);
+
+            if (!_mm256_testz_si256(v_needs_renorm, v_needs_renorm)) {
+                for (unsigned lane = 0; lane < 8; lane++) {
+                    if (state[lane] < ZGEC_RANS_STATE_MIN) {
+                        if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
+                        state[lane] = (state[lane] << 16) | zgec_rd16(cursor);
+                        cursor += 2;
+                        remaining -= 2;
+                    }
+                }
+            }
+        }
+#endif
+        for (; round < max_rounds && err == ZGEC_OK; round++) {
             unsigned m = (round < full) ? 8u : rem;
             for (unsigned lane = 0; lane < m; lane++) {
                 size_t j = start[lane] + round;
@@ -383,13 +430,24 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;
             if (round < full) {
-                for (int lane = 7; lane >= 0; lane--) {
-                    size_t j = start[lane] + round;
-                    uint8_t s = Z[j];
-                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                        zgec_free(words);
-                        return 0;
-                    }
+                size_t j7 = start[7] + round;
+                size_t j6 = start[6] + round;
+                size_t j5 = start[5] + round;
+                size_t j4 = start[4] + round;
+                size_t j3 = start[3] + round;
+                size_t j2 = start[2] + round;
+                size_t j1 = start[1] + round;
+                size_t j0 = start[0] + round;
+                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
+                    zgec_free(words);
+                    return 0;
                 }
             } else {
                 for (int lane = 7; lane >= 0; lane--) {
