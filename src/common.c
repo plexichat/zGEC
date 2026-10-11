@@ -6,6 +6,10 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #define ZGEC_VER_STR2(x) #x
 #define ZGEC_VER_STR(x) ZGEC_VER_STR2(x)
 
@@ -222,8 +226,24 @@ zgec_err zgec_filter_inverse(uint8_t *buf, size_t n,
     if (n == 0) return ZGEC_OK;
     if (buf == NULL) return ZGEC_ERR_INVAL;
     if (mode == ZGEC_FILTER_DELTA) {
-        size_t i;
-        for (i = 1; i < n; i++) {
+        size_t i = 1;
+#if defined(__x86_64__) || defined(_M_X64) || defined(__AVX2__)
+        if (n >= 17) {
+            uint8_t last = buf[0];
+            while (i + 16 <= n) {
+                __m128i vec = _mm_loadu_si128((const __m128i *)(buf + i));
+                vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 1));
+                vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 2));
+                vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 4));
+                vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 8));
+                vec = _mm_add_epi8(vec, _mm_set1_epi8((char)last));
+                _mm_storeu_si128((__m128i *)(buf + i), vec);
+                last = buf[i + 15];
+                i += 16;
+            }
+        }
+#endif
+        for (; i < n; i++) {
             buf[i] = (uint8_t)((unsigned)buf[i] + (unsigned)buf[i - 1]);
         }
     } else {

@@ -37,26 +37,28 @@ zgec: level 6, 12582912 -> 4210812 bytes (2.9884x)  210.5 ms  57.0 MiB/s
 A level is a preset; any explicit flag overrides its column. Every preset
 uses `--block-log2 21` (2 MiB blocks) and `lambda 0`.
 
-Slots 1-3 and 11 and 13-25 are reserved and rejected with
-`level N is not implemented`; the implemented ladder is 4-10 and 12.
-Level 4 is the old level 1, level 12 is the old level 9, and the old
-levels 7 and 8 (byte-identical output on the reference corpus) are the
-single level 10.
+Slots 1-3 and 11 are reserved and rejected with `level N is not implemented`; the implemented ladder is 4-10 and 12-25.
+Levels 13-14 add epoch dictionaries and pre-filtering; levels 15-25 progressively increase block window sizes up to 16 MiB (`block-log2` 24) for maximum compression ratio.
 
-| level | tier | contexts | sub-lit | conditioning | litref | dicts | filter | checksums |
-|------:|------|----------|---------|--------------|--------|-------|--------|-----------|
-| 4 | fast | - | - | - | - | - | - | - |
-| 5 | fast | x | - | - | - | - | - | - |
-| 6 | main | - | - | - | - | - | - | - |
-| 7 | main | x | - | - | - | - | - | - |
-| 8 | main | x | - | - | x | - | - | - |
-| 9 | main | x | - | x | x | - | - | - |
-| 10 | high | x | x | x | x | - | - | - |
-| 12 | high | x | x | x | x | - | - | x |
+| level | tier | contexts | sub-lit | conditioning | litref | dicts | filter | checksums | block_log2 |
+|------:|------|----------|---------|--------------|--------|-------|--------|-----------|------------|
+| 4 | fast | - | - | - | - | - | - | - | 21 (2 MiB) |
+| 5 | fast | x | - | - | - | - | - | - | 21 (2 MiB) |
+| 6 | main | - | - | - | - | - | - | - | 21 (2 MiB) |
+| 7 | main | x | - | - | - | - | - | - | 21 (2 MiB) |
+| 8 | main | x | - | - | x | - | - | - | 21 (2 MiB) |
+| 9 | main | x | - | x | x | - | - | - | 21 (2 MiB) |
+| 10 | high | x | x | x | x | - | - | - | 21 (2 MiB) |
+| 12 | high | x | x | x | x | - | - | x | 21 (2 MiB) |
+| 13 | high | x | x | x | x | x | - | x | 21 (2 MiB) |
+| 14 | high | x | x | x | x | x | x | x | 21 (2 MiB) |
+| 15..16 | high | x | x | x | x | x | x | x | 22 (4 MiB) |
+| 17..18 | high | x | x | x | x | x | x | x | 23 (8 MiB) |
+| 19..25 | high | x | x | x | x | x | x | x | 24 (16 MiB) |
 
 ```sh
 zgec c -l 4 big.log big.zgec      # fastest implemented
-zgec c -l 12 src.tar src.tar.zgec # best ratio in the preset ladder
+zgec c -l 25 src.tar src.tar.zgec # maximum ratio level
 ```
 
 ## Threads (`-T N`, default 0)

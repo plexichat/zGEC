@@ -1,4 +1,4 @@
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_encode.h"
@@ -498,22 +498,55 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
         uint32_t r0 = rep0_before ? rep0_before[s] : 1u;
         uint32_t llen = ll ? ll[s] : 0u;
         uint32_t mlen = ml_coded ? (ml_coded[s] + 3u) : 0u;
-        uint32_t u;
-        for (u = 0; u < llen && li < n_lit; u++) {
-            uint8_t pred = 0;
-            if (r0 != 0u && (size_t)r0 <= p) pred = vb[p - (size_t)r0];
-            z[li] = (uint8_t)((unsigned)lit[li] - (unsigned)pred);
-            li++;
-            p++;
+        uint32_t u = 0;
+#if defined(__AVX2__)
+        if (r0 != 0u) {
+            while (u + 32u <= llen && li + u + 32u <= n_lit) {
+                if ((size_t)r0 <= p + u) {
+                    __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                    __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)r0));
+                    __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                    _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
+                    u += 32u;
+                } else {
+                    break;
+                }
+            }
         }
-        p += (size_t)mlen;
+#endif
+        for (; u < llen && li + u < n_lit; u++) {
+            uint8_t pred = 0;
+            if (r0 != 0u && (size_t)r0 <= p + u) pred = vb[p + u - (size_t)r0];
+            z[li + u] = (uint8_t)((unsigned)lit[li + u] - (unsigned)pred);
+        }
+        li += (size_t)u;
+        p += (size_t)u + (size_t)mlen;
     }
-    for (; li < n_lit; li++) {
-        uint8_t pred = 0;
-        if (rep0_tail != 0u && (size_t)rep0_tail <= p)
-            pred = vb[p - (size_t)rep0_tail];
-        z[li] = (uint8_t)((unsigned)lit[li] - (unsigned)pred);
-        p++;
+    {
+        uint32_t u = 0;
+#if defined(__AVX2__)
+        if (rep0_tail != 0u) {
+            while (li + u + 32u <= n_lit) {
+                if ((size_t)rep0_tail <= p + u) {
+                    __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                    __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)rep0_tail));
+                    __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                    _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
+                    u += 32u;
+                } else {
+                    break;
+                }
+            }
+        }
+#endif
+        for (; li + u < n_lit; u++) {
+            uint8_t pred = 0;
+            if (rep0_tail != 0u && (size_t)rep0_tail <= p + u)
+                pred = vb[p + u - (size_t)rep0_tail];
+            z[li + u] = (uint8_t)((unsigned)lit[li + u] - (unsigned)pred);
+        }
+        li += u;
+        p += u;
     }
 }
 
@@ -1250,34 +1283,32 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
+        size_t next_lane_idx = 0;
         for (j = 0; j < n_z; j++) {
             int is_lane_start = 0;
-            size_t li;
+            if (next_lane_idx < n_lane && j == lane_pos[next_lane_idx]) {
+                is_lane_start = 1;
+                while (next_lane_idx < n_lane && j == lane_pos[next_lane_idx]) {
+                    next_lane_idx++;
+                }
+            }
             if (runstart && zgec_rs_get(runstart, j)) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
             }
-            for (li = 0; li < n_lane; li++) {
-                if (lane_pos[li] == j) { is_lane_start = 1; break; }
+            if (is_lane_start || j == 0) {
+                rs_hist[z[j]]++;
+                rs_total++;
+                continue;
             }
-            (void)lane_mark;
-        if (is_lane_start) {
-            rs_hist[z[j]]++;
-            rs_total++;
-            continue;
+            {
+                unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                grp_total[grp]++;
+            }
         }
-        if (j == 0) {
-            rs_hist[z[j]]++;
-            rs_total++;
-            continue;
-        }
-        {
-            unsigned grp = (unsigned)grp_lut[z[j - 1]];
-            cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-            grp_total[grp]++;
-        }
-    }
+    (void)lane_mark;
     }
     for (g = 0; g < k; g++) {
         body += zgec_enc_entropy_bits_u32(cls_hist + (size_t)g * 256u,
