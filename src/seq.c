@@ -309,6 +309,9 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
     return (size_t)(bw->ptr - bw->start);
 }
 
+/* Return the shared sequence code when all n values map to the same
+ * symbol, even if their extra bits differ. Return -1 for empty or null
+ * input, or when any value maps to a different code. */
 int zgec_seq_rle_symbol(const uint32_t *values, size_t n)
 {
     if (n == 0 || values == NULL) return -1;

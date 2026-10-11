@@ -511,6 +511,11 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
 
 /* ---- histograms (section 9.3) ---- */
 
+/* Clear and fill n_tables literal histograms of 256 counts each from Z
+ * (section 9.3). A single table counts all literals; with multiple tables,
+ * lane starts and runstart bits select the last table, and other literals
+ * use the preceding byte's context class mapped through class_map.
+ * Multi-table input requires a valid ctx_mode, class_map and runstart. */
 void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
                           const uint8_t *Z, size_t n_lit,
                           int ctx_mode, const uint8_t *class_map,
@@ -549,10 +554,7 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     }
 
     if (n_tables == 1) {
-        /* Single table: a plain linear histogram, four counts per step.
-         * The lane geometry below only exists to interleave the table
-         * streams; with one table it is pure overhead. Counts match the
-         * lane loop byte for byte. */
+        /* Single table: a plain linear histogram unrolled 8-wide. */
         size_t i = 0;
         uint32_t c0[ZGEC_NSYM_LIT] = {0};
         uint32_t c1[ZGEC_NSYM_LIT] = {0};
@@ -588,25 +590,27 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     size_t len[8];
     uint8_t idx_lut[256];
     zgec_lit_lane_geom(start, len, n_lit);
-    if (n_tables > 1)
-        zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
+    zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
 
     for (unsigned lane = 0; lane < 8; lane++) {
-        for (size_t t = 0; t < len[lane]; t++) {
-            size_t j = start[lane] + t;
-            int table_idx = 0;
-            if (n_tables > 1) {
-                if (j >= n_lit) return;
-                if (j == start[lane] || zgec_rs_get(runstart, j)) {
+        size_t lane_len = len[lane];
+        size_t lane_start = start[lane];
+        if (lane_len > 0) {
+            size_t j0 = lane_start;
+            int table_idx0 = n_tables - 1;
+            tables_counts[(size_t)table_idx0 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j0]]++;
+            for (size_t t = 1; t < lane_len; t++) {
+                size_t j = lane_start + t;
+                int table_idx;
+                if (zgec_rs_get(runstart, j)) {
                     table_idx = n_tables - 1;
                 } else {
                     uint8_t pidx = idx_lut[Z[j - 1]];
                     if (pidx == 0xFFu) return;
                     table_idx = (int)pidx;
                 }
-                if (table_idx < 0 || table_idx >= n_tables) return;
+                tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
             }
-            tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
         }
     }
 }
