@@ -69,6 +69,21 @@ static inline int zgec_rs_get(const uint8_t *map, size_t j)
     return (int)(((unsigned)map[j >> 3] >> (j & 7u)) & 1u);
 }
 
+static inline int zgec_rs_is_empty(const uint8_t *map, size_t n_lit)
+{
+    if (map == NULL || n_lit == 0) return 1;
+    size_t bytes = zgec_rs_bytes(n_lit);
+    size_t i = 0;
+    while (i + 8 <= bytes) {
+        if (zgec_rd64(map + i) != 0) return 0;
+        i += 8;
+    }
+    for (; i < bytes; i++) {
+        if (map[i] != 0) return 0;
+    }
+    return 1;
+}
+
 /* Compute the run-start bitmap from the LL values: bit j set if literal j
  * is the first literal of a literal run (section 9.3). n_lit is the total
  * literal count; ll[0..n_seq-1] are the literal lengths; the tail literal

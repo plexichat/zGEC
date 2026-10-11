@@ -244,20 +244,27 @@ static uint32_t parse_offbase(uint32_t off, const zgec_reps *reps)
  *       = log2(total + 66) - log2(count + 1),
  *
  * and the three totals are carried incrementally by the parser, so only
- * the three tiny per-symbol terms remain. l2tot[] holds log2(total+66)
- * for LL/ML/OF, refreshed when a sequence is accepted. */
+ * the three tiny per-symbol terms remain. The per-symbol term comes from
+ * the `*_base[]` tables, which hold log2(count + 1) per code, and
+ * `l2tot[]` holds log2(total + 66) for LL/ML/OF: a cost is one
+ * subtraction and one float narrowing, which is the same value the
+ * earlier materialised `*_cost[]` tables held. Materialising all 66
+ * entries of a cost table on every accepted sequence cost three
+ * 66-iteration log loops to move two numbers -- one histogram bin and
+ * one total -- so the tables are updated at those two points instead. */
 static double parse_seq_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
-                             const float *ll_cost,
-                             const float *ml_cost,
-                             const float *of_cost)
+                              const double *l2tot,
+                              const double *ll_base,
+                              const double *ml_base,
+                              const double *of_base)
 {
     uint8_t nb_ll = 0, nb_ml = 0, nb_of = 0;
     uint8_t c_ll = zgec_seq_code_of(ll, &nb_ll);
     uint8_t c_ml = zgec_seq_code_of(ml >= 3 ? ml - 3 : 0, &nb_ml);
     uint8_t c_of = zgec_seq_code_of(offbase >= 1 ? offbase - 1 : 0, &nb_of);
-    double cost = (double)ll_cost[c_ll] + (double)nb_ll;
-    cost += (double)ml_cost[c_ml] + (double)nb_ml;
-    cost += (double)of_cost[c_of] + (double)nb_of;
+    double cost = (double)(float)(l2tot[0] - ll_base[c_ll]) + (double)nb_ll;
+    cost += (double)(float)(l2tot[1] - ml_base[c_ml]) + (double)nb_ml;
+    cost += (double)(float)(l2tot[2] - of_base[c_of]) + (double)nb_of;
     return cost;
 }
 
@@ -266,11 +273,13 @@ static double parse_seq_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
  * Positive means the match saves bits over coding its len bytes as
  * literals. */
 static double parse_score(uint32_t len, uint32_t ll, uint32_t offbase,
-                          const float *ll_cost, const float *ml_cost,
-                          const float *of_cost,
+                          const double *l2tot,
+                          const double *ll_base, const double *ml_base,
+                          const double *of_base,
                           double lbar, double lscale)
 {
-    double cost = parse_seq_cost(ll, len, offbase, ll_cost, ml_cost, of_cost);
+    double cost = parse_seq_cost(ll, len, offbase, l2tot, ll_base, ml_base,
+                                 of_base);
     return (double)len * lbar - cost * lscale;
 }
 
@@ -732,35 +741,6 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 #endif /* ZGEC_FASTDFAST_OFF */
 
 
-static inline uint32_t parse_match_len(const uint8_t *vb, size_t ip, size_t d, size_t cap)
-{
-    const uint8_t *a = vb + ip - d;
-    const uint8_t *b = vb + ip;
-    size_t len = 0;
-#if defined(__AVX2__)
-    while (len + 32u <= cap) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(a + len));
-        __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(b + len));
-        unsigned m32 = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb256));
-        if (m32 != 0xFFFFFFFFu) {
-            return (uint32_t)(len + (unsigned)__builtin_ctz(~m32));
-        }
-        len += 32u;
-    }
-#endif
-    while (len + 8u <= cap) {
-        uint64_t x = zgec_rd64(a + len) ^ zgec_rd64(b + len);
-        if (x != 0u) {
-            return (uint32_t)(len + ((unsigned)__builtin_ctzll(x) >> 3));
-        }
-        len += 8u;
-    }
-    while (len < cap && a[len] == b[len]) {
-        len++;
-    }
-    return (uint32_t)len;
-}
-
 zgec_err zgec_parse_block_ex(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
                           const uint8_t *dict, size_t dict_size,
@@ -909,12 +889,16 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     uint32_t ml_hist[ZGEC_NSYM_SEQ];
     uint32_t of_hist[ZGEC_NSYM_SEQ];
     uint32_t lit_hist[ZGEC_NSYM_LIT];
-    double ll_log_hist[ZGEC_NSYM_SEQ];
-    double ml_log_hist[ZGEC_NSYM_SEQ];
-    double of_log_hist[ZGEC_NSYM_SEQ];
-    float ll_cost[ZGEC_NSYM_SEQ];
-    float ml_cost[ZGEC_NSYM_SEQ];
-    float of_cost[ZGEC_NSYM_SEQ];
+    /* Per-code log2(count + 1): the per-symbol half of a sequence cost.
+     * A histogram bin moves by one per accepted sequence, so only that
+     * bin changes here; see parse_seq_cost. This subsumes the throttled
+     * cost-table refresh main used for the same reason: with no
+     * materialised table there is nothing to throttle, and a cost is
+     * derived from the live total and bin at query time, which is the
+     * value the un-throttled table held. */
+    double ll_base[ZGEC_NSYM_SEQ];
+    double ml_base[ZGEC_NSYM_SEQ];
+    double of_base[ZGEC_NSYM_SEQ];
     uint32_t ll_tot = 0, ml_tot = 0, of_tot = 0;   /* running code totals */
     double l2tot[3];           /* log2(total + 66) for LL/ML/OF */
     size_t lit_total = 0;      /* literals tallied into lit_hist */
@@ -922,22 +906,18 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     size_t lit_step = 256u;    /* literals before the next estimate */
     double lbar = 6.0;
     unsigned shift = parse_skip_shift(tier);
-    int s_i;
     memset(ll_hist, 0, sizeof(ll_hist));
     memset(ml_hist, 0, sizeof(ml_hist));
     memset(of_hist, 0, sizeof(of_hist));
     memset(lit_hist, 0, sizeof(lit_hist));
+    /* Every bin starts at count 0, so log2(count + 1) is log2(1) = 0 for
+     * all 66 codes, which is what the old initial cost table held. */
+    memset(ll_base, 0, sizeof(ll_base));
+    memset(ml_base, 0, sizeof(ml_base));
+    memset(of_base, 0, sizeof(of_base));
     l2tot[0] = zgec_fast_log2_u32(ZGEC_NSYM_SEQ);
     l2tot[1] = l2tot[0];
     l2tot[2] = l2tot[0];
-    for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
-        ll_log_hist[s_i] = zgec_fast_log2_u32(1u);
-        ml_log_hist[s_i] = zgec_fast_log2_u32(1u);
-        of_log_hist[s_i] = zgec_fast_log2_u32(1u);
-        ll_cost[s_i] = (float)(l2tot[0] - ll_log_hist[s_i]);
-        ml_cost[s_i] = (float)(l2tot[1] - ml_log_hist[s_i]);
-        of_cost[s_i] = (float)(l2tot[2] - of_log_hist[s_i]);
-    }
 
     size_t ip = prefix;
     size_t end = prefix + raw_size;
@@ -978,8 +958,10 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             if (nstep != (size_t)1) zgec_matcher_prefetch(m, vb, ip + (size_t)1);
         }
 #endif
-        match = zgec_matcher_find(m, vb, ip, reps.rep[0], reps.rep[1], reps.rep[2], 4u,
-                                  (uint32_t)(end - ip));
+        uint32_t rep_len[3];
+        match = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1],
+                                      reps.rep[2], 4u, (uint32_t)(end - ip),
+                                      rep_len);
         ll = (uint32_t)(ip - anchor);
         if (match.length >= 4u) {
             is_rep = (match.offset == reps.rep[0] || match.offset == reps.rep[1] ||
@@ -988,7 +970,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             if (match.length >= need) {
                 offbase = parse_offbase(match.offset, &reps);
                 cur_score = parse_score(match.length, ll, offbase,
-                                        ll_cost, ml_cost, of_cost,
+                                        l2tot, ll_base, ml_base, of_base,
                                         lbar, lscale);
                 if (cur_score > 0.0) {
                     cur_len = match.length;
@@ -1001,20 +983,33 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
          * discarding repeat offsets when a non-repeat match is 1 byte longer.
          * However, repeat offsets carry 0 extra bits for offset coding, so
          * a repeat match can yield a significantly higher parse_score (net bit
-         * savings) than a longer non-repeat match with a large offset. */
+         * savings) than a longer non-repeat match with a large offset.
+         *
+         * The lengths are the ones find's rep scan already computed and
+         * returned in rep_len[], probed with the same reps and the same
+         * cap at this exact ip, so re-scanning them here would repeat the
+         * most expensive half of that work: a slot is 0 when the rep was
+         * not probeable there or the first four bytes differed, both of
+         * which cannot clear the rlen >= 4 gate below. */
         {
             size_t cap = end - ip;
             unsigned nreps = (tier == ZGEC_TIER_FAST) ? 1u : 3u;
             for (unsigned ri = 0u; ri < nreps; ri++) {
                 uint32_t roff = reps.rep[ri];
                 if (roff != 0u && (size_t)roff <= ip && (size_t)roff <= (1u << 24)) {
-                    if (cap >= 4u && zgec_rd32(vb + ip - roff) == zgec_rd32(vb + ip)) {
-                        uint32_t rlen = parse_match_len(vb, ip, roff, cap);
-                        if (rlen >= 4u) {
+                    if (cap >= 4u && rep_len[ri] >= 4u) {
+                        /* A repeat's score is rlen * lbar minus a
+                         * non-negative sequence cost, so it can never
+                         * exceed rlen * lbar: when that does not clear
+                         * cur_score the rep cannot win and the score is
+                         * skipped rather than computed and discarded.
+                         * The test is exact, so the choice is unchanged. */
+                        if ((double)rep_len[ri] * lbar > cur_score) {
+                            uint32_t rlen = rep_len[ri];
                             uint32_t roffbase = parse_offbase(roff, &reps);
                             double rscore = parse_score(rlen, ll, roffbase,
-                                                        ll_cost, ml_cost, of_cost,
-                                                        lbar, lscale);
+                                                        l2tot, ll_base, ml_base,
+                                                        of_base, lbar, lscale);
                             if (rscore > cur_score) {
                                 cur_score = rscore;
                                 cur_len = rlen;
@@ -1043,10 +1038,17 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             double base = cur_score;
             double nscore = -1.0;
             uint32_t defer;
-            if (nm.length >= nneed) {
+            /* The lazy probe has to beat `base` to be worth deferring to,
+             * and a candidate's score never exceeds its length priced as
+             * literals, so a length that does not clear base ends the
+             * comparison before any score is computed. Exact either way:
+             * the branch below only runs when cur_len > 0, and only then
+             * is base > 0, so the -1.0 sentinel loses the same comparison
+             * the real score would. */
+            if (nm.length >= nneed && (double)nm.length * lbar > base) {
                 uint32_t noffbase = parse_offbase(nm.offset, &reps);
                 nscore = parse_score(nm.length, nll, noffbase,
-                                     ll_cost, ml_cost, of_cost,
+                                     l2tot, ll_base, ml_base, of_base,
                                      lbar, lscale);
             }
             /* cmov-style: the score comparison feeds a
@@ -1116,7 +1118,11 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             p->n_seq++;
 
             /* Fold the accepted triple into the
-             * running statistics for the price gate. */
+             * running statistics for the price gate.
+             * Two numbers move per accepted sequence -- one histogram bin
+             * in each of the three tables and the three totals -- so that
+             * is all this updates; parse_seq_cost derives every cost from
+             * these. */
             {
                 uint8_t c_ll_acc = zgec_seq_code_of(ll, &nb);
                 uint8_t c_ml_acc = zgec_seq_code_of(ml >= 3u ? ml - 3u : 0u, &nb);
@@ -1130,23 +1136,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                 l2tot[0] = zgec_fast_log2_u32(ll_tot + (uint32_t)ZGEC_NSYM_SEQ);
                 l2tot[1] = zgec_fast_log2_u32(ml_tot + (uint32_t)ZGEC_NSYM_SEQ);
                 l2tot[2] = zgec_fast_log2_u32(of_tot + (uint32_t)ZGEC_NSYM_SEQ);
-                ll_log_hist[c_ll_acc] = zgec_fast_log2_u32(ll_hist[c_ll_acc] + 1u);
-                ml_log_hist[c_ml_acc] = zgec_fast_log2_u32(ml_hist[c_ml_acc] + 1u);
-                of_log_hist[c_of_acc] = zgec_fast_log2_u32(of_hist[c_of_acc] + 1u);
-                /* Batch/throttle table updates: update the full 66-element cost tables
-                 * every 16 sequence acceptances or when totals are small (<256).
-                 * For intermediate sequences, update only the modified symbol's cost entry. */
-                if (ll_tot < 256 || (ll_tot & 15u) == 0u) {
-                    for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
-                        ll_cost[s_i] = (float)(l2tot[0] - ll_log_hist[s_i]);
-                        ml_cost[s_i] = (float)(l2tot[1] - ml_log_hist[s_i]);
-                        of_cost[s_i] = (float)(l2tot[2] - of_log_hist[s_i]);
-                    }
-                } else {
-                    ll_cost[c_ll_acc] = (float)(l2tot[0] - ll_log_hist[c_ll_acc]);
-                    ml_cost[c_ml_acc] = (float)(l2tot[1] - ml_log_hist[c_ml_acc]);
-                    of_cost[c_of_acc] = (float)(l2tot[2] - of_log_hist[c_of_acc]);
-                }
+                ll_base[c_ll_acc] = zgec_fast_log2_u32(ll_hist[c_ll_acc] + 1u);
+                ml_base[c_ml_acc] = zgec_fast_log2_u32(ml_hist[c_ml_acc] + 1u);
+                of_base[c_of_acc] = zgec_fast_log2_u32(of_hist[c_of_acc] + 1u);
             }
             /* Re-estimate Lbar when the literal count has grown by a
              * growing margin. parse_lbar walks all 256 symbols and takes
