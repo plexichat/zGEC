@@ -319,19 +319,17 @@ int zgec_seq_rle_symbol(const uint32_t *values, size_t n)
     uint8_t code0 = zgec_seq_code_of(values[0], &dummy);
     size_t i = 1;
 #if defined(__AVX2__)
-    if (n >= 8) {
-        __m256i val0 = _mm256_set1_epi32((int)values[0]);
-        while (i + 8 <= n) {
-            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
-            unsigned m = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, val0)));
-            if (m != 0xFFu) {
-                for (size_t k = 0; k < 8; k++) {
-                    uint8_t c = zgec_seq_code_of(values[i + k], &dummy);
-                    if (c != code0) return -1;
-                }
+    __m256i v0 = _mm256_set1_epi32((int)values[0]);
+    while (i + 8 <= n) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
+        unsigned mask = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpeq_epi32(v, v0)));
+        if (mask != 0xFFu) {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t c = zgec_seq_code_of(values[i + k], &dummy);
+                if (c != code0) return -1;
             }
-            i += 8;
         }
+        i += 8;
     }
 #endif
     for (; i < n; i++) {
