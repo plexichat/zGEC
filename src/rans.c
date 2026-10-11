@@ -106,6 +106,7 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts)
             if (eff > (uint32_t)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
             t->f[s] = (uint16_t)eff;
             t->c[s] = (uint16_t)sum;
+            t->xmax[s] = eff << 21;
             sum += eff;
             /* Precompute a biased reciprocal for the encode loop's
              * division by f[s]. floor(2^32 / f) + 1 is the bias that
@@ -354,31 +355,30 @@ static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_
                                           uint32_t *state_ptr, uint16_t *words,
                                           size_t *nwords_ptr, size_t words_cap)
 {
-    uint64_t f = tab->f[s];
-    if (f == 0) return -1;
-    uint64_t xmax = f << 21;
+    uint32_t f = tab->f[s];
+    if (f == 0u) return -1;
     uint32_t x = *state_ptr;
-    if ((uint64_t)x >= xmax) {
+    if (x >= tab->xmax[s]) {
         if (*nwords_ptr >= words_cap) return -1;
         words[(*nwords_ptr)++] = (uint16_t)(x & 0xFFFFu);
         x >>= 16;
     }
     uint32_t recip = tab->f_recip[s];
     uint32_t quo;
-    int64_t rems;
+    uint32_t rems;
     if (f == 1u) {
         quo = x;
-        rems = 0;
+        rems = 0u;
     } else {
         uint64_t prod = (uint64_t)x * (uint64_t)recip;
         quo = (uint32_t)(prod >> 32);
-        rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-        if (rems < 0) {
+        rems = x - quo * f;
+        if (rems >= f) {
             quo--;
-            rems += (int64_t)f;
+            rems += f;
         }
     }
-    *state_ptr = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+    *state_ptr = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
     return 0;
 }
 
@@ -531,30 +531,15 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     if (n_tables > 1) {
         /* Prevalidate the whole map before a single count is written, so
          * an invalid map cannot leave a partly populated histogram set
-         * that looks like a finished model. The loop below keeps its own
-         * checks as a second line of defence, though this pass does not
-         * make all of them unreachable: `cls` there comes from
-         * zgec_classify(), not from class_map, so its `cls >= 64u` exit
-         * still guards whatever classify() returns. */
+         * that looks like a finished model. */
         for (unsigned cls = 0; cls < 64u; cls++) {
-            /* The bound is k, not n_tables, because index k is reserved for
-             * the run-start table. include/zgec_rans.h:95 fixes the
-             * relationship -- "n_tables is 1 (k == 1) or k + 1 (k > 1, last
-             * table is run-start)" -- and src/encode.c:1496 is the only
-             * assignment, `n_tables = (k <= 1) ? 1 : (k + 1)`, so with
-             * n_tables > 1 established just above, k == n_tables - 1 here.
-             * Both consumers of a class map refuse class_map[cls] >= k --
-             * zgec_rans_decode() and zgec_rans_encode(), both above -- so
-             * an entry of exactly k has to be refused here too: it would
-             * otherwise be counted into the run-start table and only
-             * rejected later by zgec_rans_encode(), leaving exactly the
-             * half-built histogram set this guard exists to prevent. */
             if ((int)class_map[cls] >= n_tables - 1) return;
         }
     }
 
     if (n_tables == 1) {
-        /* Single table: a plain linear histogram unrolled 8-wide. */
+        /* Single table: multi-accumulator histogram unrolled 4-wide to break
+         * store-forwarding dependencies on consecutive repeating bytes. */
         size_t i = 0;
         uint32_t c0[ZGEC_NSYM_LIT] = {0};
         uint32_t c1[ZGEC_NSYM_LIT] = {0};
@@ -592,24 +577,41 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     zgec_lit_lane_geom(start, len, n_lit);
     zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
 
-    for (unsigned lane = 0; lane < 8; lane++) {
-        size_t lane_len = len[lane];
-        size_t lane_start = start[lane];
-        if (lane_len > 0) {
-            size_t j0 = lane_start;
-            int table_idx0 = n_tables - 1;
-            tables_counts[(size_t)table_idx0 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j0]]++;
-            for (size_t t = 1; t < lane_len; t++) {
-                size_t j = lane_start + t;
-                int table_idx;
-                if (zgec_rs_get(runstart, j)) {
-                    table_idx = n_tables - 1;
-                } else {
+    int rs_empty = zgec_rs_is_empty(runstart, n_lit);
+
+    if (rs_empty) {
+        /* When runstart has no bits set, skip testing zgec_rs_get() per literal. */
+        for (unsigned lane = 0; lane < 8; lane++) {
+            size_t lane_len = len[lane];
+            size_t lane_start = start[lane];
+            if (lane_len > 0) {
+                tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
+                for (size_t t = 1; t < lane_len; t++) {
+                    size_t j = lane_start + t;
                     uint8_t pidx = idx_lut[Z[j - 1]];
                     if (pidx == 0xFFu) return;
-                    table_idx = (int)pidx;
+                    tables_counts[(size_t)pidx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
                 }
-                tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+            }
+        }
+    } else {
+        for (unsigned lane = 0; lane < 8; lane++) {
+            size_t lane_len = len[lane];
+            size_t lane_start = start[lane];
+            if (lane_len > 0) {
+                tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
+                for (size_t t = 1; t < lane_len; t++) {
+                    size_t j = lane_start + t;
+                    int table_idx;
+                    if (zgec_rs_get(runstart, j)) {
+                        table_idx = n_tables - 1;
+                    } else {
+                        uint8_t pidx = idx_lut[Z[j - 1]];
+                        if (pidx == 0xFFu) return;
+                        table_idx = (int)pidx;
+                    }
+                    tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+                }
             }
         }
     }

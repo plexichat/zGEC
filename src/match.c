@@ -581,19 +581,28 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
 }
 
 /* Record a candidate if it beats the current best:
- * longer, or equal length with a smaller offset. */
+ * longer, or equal length with a smaller offset.
+ *
+ * Whether the current best is a repeat offset is carried in
+ * *best_is_rep rather than re-derived from best->offset on every call:
+ * the predicate is exactly "best->offset is one of the reps", and
+ * best->offset only changes on an assignment, so updating the flag
+ * there yields the same value re-deriving it would while making each
+ * candidate three compares cheaper. */
 static inline void mf_update_best(uint32_t d, uint32_t len, zgec_match *best,
-                                  uint32_t rep0, uint32_t rep1, uint32_t rep2)
+                                  uint32_t rep0, uint32_t rep1, uint32_t rep2,
+                                  int *best_is_rep)
 {
     if (len > best->length) {
         best->offset = d;
         best->length = len;
+        *best_is_rep = (d == rep0 || d == rep1 || d == rep2);
     } else if (len == best->length && len > 0u) {
-        int best_is_rep = (best->length > 0u && (best->offset == rep0 || best->offset == rep1 || best->offset == rep2));
         int d_is_rep = (d == rep0 || d == rep1 || d == rep2);
-        if (d_is_rep && !best_is_rep) {
+        if (d_is_rep && !*best_is_rep) {
             best->offset = d;
-        } else if (!best_is_rep && !d_is_rep && d < best->offset) {
+            *best_is_rep = 1;
+        } else if (!d_is_rep && !*best_is_rep && d < best->offset) {
             best->offset = d;
         }
     }
@@ -840,6 +849,15 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                              uint32_t rep0, uint32_t rep1, uint32_t rep2,
                              uint32_t min_len, uint32_t max_len)
 {
+    return zgec_matcher_find_lens(m, vb, ip, rep0, rep1, rep2, min_len,
+                                  max_len, NULL);
+}
+
+zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
+                                  uint32_t rep0, uint32_t rep1, uint32_t rep2,
+                                  uint32_t min_len, uint32_t max_len,
+                                  uint32_t *rep_len)
+{
     zgec_match best;
     uint32_t min_match;
     uint32_t hash_min;
@@ -900,6 +918,54 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
     int has_v8 = (ip + 8u <= m->vb_size);
     uint64_t v8 = has_v8 ? zgec_rd64(vb + ip) : 0u;
     cur4 = has_v8 ? (uint32_t)v8 : zgec_rd32(vb + ip);   /* cap >= min_match >= 4 here */
+
+    /* Hash and bucket selection for the two table probes, hoisted above
+     * the rep scan. Both bucket lines are already determinable from v8
+     * and cur4, so the prefetches go out first and each miss overlaps
+     * the rep length work below instead of stalling at the end of find,
+     * where nothing else is in flight. The short hash is computed even
+     * if the short probe is later skipped by the long-match early-out:
+     * it is the same value the caller's insert of this position will
+     * need, so it is not wasted. */
+    uint32_t hshort = 0u;
+    uint32_t sbucket = 0u;
+    const uint32_t *b = NULL;
+    uint32_t hl = 0u;
+    uint32_t lb = 0u;
+    uint32_t ltag = 0u;
+    const uint32_t *le = NULL;
+    int want_short = 0;
+    int best_is_rep = 0;
+    if (has_v8) {
+        hl = mf_hash8_v(v8);
+        lb = hl & (m->long_buckets - 1u);
+        ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
+        le = &m->long_tab[(size_t)lb];
+        mf_prefetch_bucket((const void *)le);
+    }
+    {
+        size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
+                                   : (size_t)ZGEC_MF_HASH_BYTES;
+        if (ip + need <= m->vb_size && hash_min <= cap) {
+            hshort = m->is_binary ? mf_hash4_v((uint32_t)cur4)
+                                  : (has_v8 ? mf_hash5_v(v8) : mf_hash_short(m, vb, ip));
+            sbucket = hshort & (m->nbuckets - 1u);
+            b = &m->short_tab[(size_t)sbucket * (size_t)m->nlanes];
+            want_short = 1;
+            mf_prefetch_bucket((const void *)b);
+            mf_prefetch_bucket((const void *)&m->short_head[sbucket]);
+        }
+    }
+
+    /* Publish the rep lengths this scan computes: the caller scores the
+     * same three reps, and the length scan is the expensive half. Every
+     * slot is written before any early return can happen, so a slot a
+     * caller reads after a rejected find is 0 rather than stale. */
+    if (rep_len) {
+        rep_len[0] = 0u;
+        rep_len[1] = 0u;
+        rep_len[2] = 0u;
+    }
     for (i = 0; i < nreps; i++) {
         uint32_t d = reps[i];
         uint32_t len;
@@ -914,20 +980,26 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
         }
         /* Assert-style: d <= ip < vb_size <= vb_capacity (hoisted check). */
         assert((size_t)d <= m->vb_capacity);
-        /* min_match >= 4, so a repeat whose first four bytes differ cannot
-         * qualify; one 4-byte compare replaces the length scan. */
-        if (zgec_rd32(vb + ip - (size_t)d) != cur4) {
-            continue;
-        }
         if (has_v8) {
+            /* No separate 4-byte screen: the 8-byte compare below covers
+             * it, because a first-four mismatch sets some of the low four
+             * diff bits, so ctz(diff) >> 3 < 4 and the min_match gate
+             * rejects it. The screen loaded the same cache line the
+             * compare needs, so it only ever paid a second visit to it. */
             uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
             len = (diff == 0u) ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
                                : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
         } else {
+            if (zgec_rd32(vb + ip - (size_t)d) != cur4) {
+                continue;
+            }
             len = mf_match_len(vb, ip, d, cap);
         }
+        if (rep_len) {
+            rep_len[i] = len;
+        }
         if (len >= min_match) {
-            mf_update_best(d, len, &best, rep0, rep1, rep2);
+            mf_update_best(d, len, &best, rep0, rep1, rep2, &best_is_rep);
         }
     }
 
@@ -937,19 +1009,20 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * leaves this position's hashes intact for the main probe's insert. */
     m->c_ip[ip & 1u] = ip;
     m->c_flags[ip & 1u] = 0u;
-    /* 2. Long table: 8-byte hash, one entry per
-     * bucket, tag-checked before any length work. */
+    /* 2. Long table: 8-byte hash, one entry per bucket,
+     * tag-checked before any length work. hl/lb/ltag/le were computed (and
+     * the line prefetched) above, ahead of the rep scan, so what remains
+     * here is the tag check and nothing else. */
     if (has_v8) {
-        uint32_t hl = mf_hash8_v(v8);
-        uint32_t lb = hl & (m->long_buckets - 1u);
-        uint32_t e = m->long_tab[(size_t)lb];
-        uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
-        uint32_t etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
+        uint32_t e;
+        uint32_t etag;
         uint32_t pos;
         uint32_t d;
         uint32_t len;
         m->c_hl[ip & 1u] = hl;
         m->c_flags[ip & 1u] |= 2u;
+        e = *le;
+        etag = (e >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         if (e != 0u && etag == ltag) {
             pos = mf_pos(e);
             if ((size_t)pos < ip) {
@@ -963,15 +1036,13 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     if (best.length == 0u || best.length > cap ||
                         vb[ip - (size_t)d + (size_t)best.length - 1u] ==
                         vb[ip + (size_t)best.length - 1u]) {
-                        if (has_v8) {
-            uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-            len = (diff == 0u) ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
-                               : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-        } else {
-            len = mf_match_len(vb, ip, d, cap);
-        }
+                        uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+                        len = (diff == 0u)
+                                  ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                                  : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
                         if (len >= hash_min) {
-                            mf_update_best(d, len, &best, rep0, rep1, rep2);
+                            mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                           &best_is_rep);
                         }
                     }
                 }
@@ -989,120 +1060,103 @@ zgec_match zgec_matcher_find(zgec_matcher *m, const uint8_t *vb, size_t ip,
      *
      * A rep or long-table match of 32 bytes or more already captures the
      * bulk of the available gain; scoring the short bucket then rarely
-     * changes the parse, so it is skipped. */
-    if (best.length < 32u) {
-    {
-        size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
-                                   : (size_t)ZGEC_MF_HASH_BYTES;
-        if (ip + need <= m->vb_size && hash_min <= cap) {
-            uint32_t h = m->is_binary ? mf_hash4_v((uint32_t)cur4)
-                                      : (has_v8 ? mf_hash5_v(v8) : mf_hash_short(m, vb, ip));
-            uint32_t bucket = h & (m->nbuckets - 1u);
-            const uint32_t *b = &m->short_tab[(size_t)bucket * (size_t)m->nlanes];
-            uint32_t tag = (h >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
-            uint32_t mask;
-            uint32_t head;
-            uint32_t nmatch;
-            uint32_t want;
-            uint32_t nhit;
-            uint32_t cur4s;
-            m->c_hs[ip & 1u] = h;
-            m->c_flags[ip & 1u] |= 1u;
-            mf_prefetch_bucket((const void *)b);
-            want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
-                 : (m->tier == ZGEC_TIER_FAST) ? ZGEC_MF_PROBE_DEPTH_FAST
-                                               : ZGEC_MF_PROBE_DEPTH;
-            head = (uint32_t)m->short_head[bucket];
-            mask = mf_bucket_hits(b, tag, m->nlanes, want,
-                                  (head - 1u) & (m->nlanes - 1u));
-            nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
-            nhit = (nmatch < want) ? nmatch : want;
-            cur4s = zgec_rd32(vb + ip); /* need >= 4 above, so ip + 4 <= vb_size */
-            /* The live entries walk backwards from the newest lane: the
-             * ring head points one past the most recent write.
-             *
-             * Visit only the lanes that hit, newest first. Rotating the hit
-             * mask so that lane head-1 lands in the top bit lets a
-             * count-leading-zeros walk yield lanes in newest-first order
-             * while skipping the empty ones: the loop runs once per hit
-             * instead of once per lane. `s == 0` (head == 0) is the
-             * unrotated mask, which also keeps each shift below in range,
-             * and the mask is truncated to nlanes bits for nlanes < 32. */
-            {
-                uint32_t n = m->nlanes;
-                uint32_t s = (n - head) & (n - 1u);
-                uint32_t rm;
-                if (s == 0u) {
-                    rm = mask;
+     * changes the parse, so it is skipped. `want_short` is the hoisted
+     * prelude -- the position is hashable and hash candidates can still
+     * qualify -- decided before the rep scan so that the bucket line
+     * could be prefetched early; `b`, `sbucket` and `hshort` come from
+     * the same prelude. */
+    if (want_short && best.length < 32u) {
+        uint32_t tag = (hshort >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
+        uint32_t mask;
+        uint32_t head;
+        uint32_t nmatch;
+        uint32_t want;
+        uint32_t nhit;
+        m->c_hs[ip & 1u] = hshort;
+        m->c_flags[ip & 1u] |= 1u;
+        want = (m->tier == ZGEC_TIER_HIGH) ? ZGEC_MF_PROBE_DEPTH_HIGH
+              : (m->tier == ZGEC_TIER_FAST) ? ZGEC_MF_PROBE_DEPTH_FAST
+                                            : ZGEC_MF_PROBE_DEPTH;
+        head = (uint32_t)m->short_head[sbucket];
+        mask = mf_bucket_hits(b, tag, m->nlanes, want,
+                              (head - 1u) & (m->nlanes - 1u));
+        nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
+        nhit = (nmatch < want) ? nmatch : want;
+        /* The live entries walk backwards from the newest lane: the
+         * ring head points one past the most recent write.
+         *
+         * Visit only the lanes that hit, newest first. Rotating the hit
+         * mask so that lane head-1 lands in the top bit lets a
+         * count-leading-zeros walk yield lanes in newest-first order
+         * while skipping the empty ones: the loop runs once per hit
+         * instead of once per lane. `s == 0` (head == 0) is the
+         * unrotated mask, which also keeps each shift below in range,
+         * and the mask is truncated to nlanes bits for nlanes < 32. */
+        {
+            uint32_t n = m->nlanes;
+            uint32_t s = (n - head) & (n - 1u);
+            uint32_t rm;
+            if (s == 0u) {
+                rm = mask;
+            } else {
+                rm = (mask << s) | (mask >> (n - s));
+            }
+            if (n < 32u) {
+                rm &= (uint32_t)(((uint64_t)1u << n) - 1u);
+            }
+            while (rm != 0u && nhit > 0) {
+                uint32_t bpos = 31u - (uint32_t)__builtin_clz(rm);
+                uint32_t lane = (head + bpos) & (n - 1u);
+                uint32_t entry;
+                uint32_t pos;
+                uint32_t d;
+                uint32_t len;
+                rm &= ~(1u << bpos);
+                nhit--;
+                entry = b[lane];
+                pos = mf_pos(entry);
+                if ((size_t)pos >= ip) {
+                    continue;
+                }
+                d = (uint32_t)(ip - (size_t)pos);
+                /* Assert-style: d <= ip < vb_size <= vb_capacity. */
+                assert((size_t)d <= m->vb_capacity);
+                /* No first-4-byte screen here: it would re-read the very
+                 * line the length compare below loads (a first-4 mismatch
+                 * sets some of the low four diff bits, so the length comes
+                 * out under 4 and the hash_min gate rejects it), and
+                 * pos < ip keeps the 8-byte read inside the buffer, so
+                 * dropping the screen removes a load without adding a
+                 * candidate. */
+                /* A candidate can only beat `best` if it matches at
+                 * best.length - 1 as well; one byte compare there skips
+                 * the length scan for the candidates that cannot. */
+                if (best.length != 0u && best.length <= cap &&
+                    vb[ip - (size_t)d + (size_t)best.length - 1u] !=
+                    vb[ip + (size_t)best.length - 1u]) {
+                    continue;
+                }
+                if (has_v8) {
+                    uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+                    len = (diff == 0u)
+                              ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                              : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
                 } else {
-                    rm = (mask << s) | (mask >> (n - s));
-                }
-                if (n < 32u) {
-                    rm &= (uint32_t)(((uint64_t)1u << n) - 1u);
-                }
-                while (rm != 0u && nhit > 0) {
-                    uint32_t bpos = 31u - (uint32_t)__builtin_clz(rm);
-                    uint32_t lane = (head + bpos) & (n - 1u);
-                    uint32_t entry;
-                    uint32_t pos;
-                    uint32_t d;
-                    uint32_t len;
-                    rm &= ~(1u << bpos);
-                    nhit--;
-                    entry = b[lane];
-                    pos = mf_pos(entry);
-                    if ((size_t)pos >= ip) {
+                    /* No 8-byte window here -- v8 is the zero
+                     * placeholder, not eight readable bytes -- so the
+                     * length comes from the byte-wise matcher and is
+                     * kept behind the first-4-byte screen that case
+                     * needs. */
+                    if (zgec_rd32(vb + (size_t)pos) != cur4) {
                         continue;
                     }
-                    d = (uint32_t)(ip - (size_t)pos);
-                    /* Assert-style: d <= ip < vb_size <= vb_capacity. */
-                    assert((size_t)d <= m->vb_capacity);
-                    /* A len >= 5 match implies a first-4-byte match, so the
-                     * 4-byte screen the rep path uses skips hopeless hash
-                     * candidates before any length work. The pos + 4 guard
-                     * keeps the read in bounds locally. */
-                    if ((size_t)pos + 8u <= m->vb_size && has_v8) {
-                        if (best.length != 0u && best.length <= cap &&
-                            (size_t)pos + (size_t)best.length <= m->vb_size &&
-                            vb[(size_t)pos + (size_t)best.length - 1u] !=
-                            vb[ip + (size_t)best.length - 1u]) {
-                            continue;
-                        }
-                        uint64_t diff = zgec_rd64(vb + (size_t)pos) ^ v8;
-                        if (diff != 0u) {
-                            len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                            if (len >= hash_min) {
-                                mf_update_best(d, len, &best, rep0, rep1, rep2);
-                            }
-                        } else {
-                            if (best.length <= 8u || best.length > cap ||
-                                vb[(size_t)pos + (size_t)best.length - 1u] ==
-                                vb[ip + (size_t)best.length - 1u]) {
-                                len = mf_match_len_slow(vb + (size_t)pos, vb + ip, cap);
-                                if (len >= hash_min) {
-                                    mf_update_best(d, len, &best, rep0, rep1, rep2);
-                                }
-                            }
-                        }
-                    } else {
-                        if ((size_t)pos + (size_t)4 <= m->vb_size &&
-                            zgec_rd32(vb + (size_t)pos) != cur4s) {
-                            continue;
-                        }
-                        if (best.length != 0u && best.length <= cap &&
-                            vb[ip - (size_t)d + (size_t)best.length - 1u] !=
-                            vb[ip + (size_t)best.length - 1u]) {
-                            continue;
-                        }
-                        len = mf_match_len(vb, ip, d, cap);
-                        if (len >= hash_min) {
-                            mf_update_best(d, len, &best, rep0, rep1, rep2);
-                        }
-                    }
+                    len = mf_match_len(vb, ip, d, cap);
+                }
+                if (len >= hash_min) {
+                    mf_update_best(d, len, &best, rep0, rep1, rep2, &best_is_rep);
                 }
             }
         }
-    }
     }
     return best;
 }
@@ -1158,12 +1212,25 @@ void zgec_matcher_prefetch_match(zgec_matcher *m, const uint8_t *vb, size_t star
         size_t t;
         if (nsamp > len) nsamp = len;
         if (nsamp < 1u) nsamp = 1u;
-        for (t = 0; t < nsamp; t++) {
-            uint64_t off = (nsamp > 1u)
-                               ? ((uint64_t)(len - 1u) * (uint64_t)t /
-                                  (uint64_t)(nsamp - 1u))
-                               : 0u;
-            zgec_matcher_prefetch(m, vb, start + (size_t)off);
+        /* Same sample grid as insert_match, same quotient/remainder walk:
+         * one division up front instead of one per sample. */
+        {
+            size_t num = (len > 1u) ? (len - 1u) : 0u;
+            size_t den = (nsamp > 1u) ? (nsamp - 1u) : 1u;
+            size_t q = num / den;
+            size_t r = num - q * den;   /* r < den */
+            size_t rem = 0u;
+            size_t pos = start;
+            for (t = 0; t < nsamp; t++) {
+                zgec_matcher_prefetch(m, vb, pos);
+                rem += r;
+                if (rem >= den) {
+                    rem -= den;
+                    pos += q + 1u;
+                } else {
+                    pos += q;
+                }
+            }
         }
     }
 }
@@ -1221,10 +1288,6 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
             mf_insert_pos(m, vb, pos, 1);
         }
     } else {
-        /* Sampled: evenly spaced, distinct positions across the match
-         * (never more than the match length, so no duplicate inserts),
-         * all within the virtual buffer. uint64_t math: no 32-bit wrap,
-         * no division per sample. */
         size_t nsamp = (m->tier == ZGEC_TIER_FAST)
                            ? (size_t)ZGEC_MF_MATCH_SAMPLES_FAST
                            : (size_t)ZGEC_MF_MATCH_SAMPLES;
@@ -1241,15 +1304,31 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
         }
         if (nsamp > len) nsamp = len;
         if (nsamp < 1u) nsamp = 1u;
-        for (t = 0; t < nsamp; t++) {
-            uint64_t off = (nsamp > 1u)
-                               ? ((uint64_t)(len - 1u) * (uint64_t)t /
-                                  (uint64_t)(nsamp - 1u))
-                               : 0u;
-            size_t pos = start + (size_t)off;
-            if (pos < m->vb_size && need <= m->vb_size - pos) {
+        /* Sample offsets are floor((len-1) * t / (nsamp-1)), the same grid
+         * the old per-sample 64-bit division produced. The stride is
+         * carried as a quotient and a remainder (the classic exact
+         * rational walk) so the loop contains no division at all:
+         * nsamp-1 > 0 whenever nsamp > 1, and when nsamp == 1 the single
+         * sample is at offset 0 either way. */
+        {
+            size_t num = (len > 1u) ? (len - 1u) : 0u;
+            size_t den = (nsamp > 1u) ? (nsamp - 1u) : 1u;
+            size_t q = num / den;
+            size_t r = num - q * den;   /* r < den */
+            size_t rem = 0u;
+            size_t pos = start;
+            for (t = 0; t < nsamp; t++) {
                 int long_ok = (t == 0u || t + 1u == nsamp) ? 1 : 0;
-                mf_insert_pos(m, vb, pos, long_ok);
+                if (pos < m->vb_size && need <= m->vb_size - pos) {
+                    mf_insert_pos(m, vb, pos, long_ok);
+                }
+                rem += r;
+                if (rem >= den) {
+                    rem -= den;
+                    pos += q + 1u;
+                } else {
+                    pos += q;
+                }
             }
         }
     }
