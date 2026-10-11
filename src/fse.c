@@ -156,7 +156,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
     int nsym = dec->nsym;
     int S = 1 << al;
 
-    struct zgec_fse_occ *occ;
+    struct zgec_fse_occ occ[1u << ZGEC_MAX_AL];
     int counts[256];
     int off[256];
     int run;
@@ -178,10 +178,6 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
         off[s] = run;
         run += counts[s];
     }
-
-    occ = (struct zgec_fse_occ *)zgec_alloc(
-        (size_t)S * sizeof(*occ), _Alignof(struct zgec_fse_occ));
-    if (!occ) return ZGEC_ERR_NOMEM;
 
     /* Each symbol owns its own 2^al block at (s * S) in the encoder
      * table, so the occurrence index j is 0-based within that block.
@@ -206,7 +202,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
 
     full_size = (size_t)nsym * (size_t)S * sizeof(zgec_fse_enc_entry);
     full = (zgec_fse_enc_table *)zgec_alloc(sizeof(zgec_fse_enc_table) + full_size, _Alignof(zgec_fse_enc_table));
-    if (!full) { zgec_free(occ); return ZGEC_ERR_NOMEM; }
+    if (!full) return ZGEC_ERR_NOMEM;
     /* Zero-fill is load-bearing, not just hygiene: a symbol with zero
      * occurrences owns a block of S cells that no occurrence writes, and the
      * encoder relies on those reading as (nb_bits = 0, new_state = 0) rather
@@ -265,7 +261,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                  * finding 4). It is kept so a future builder cannot widen a
                  * cell past its row unnoticed. */
                 if ((unsigned)nb > (unsigned)al) {
-                    zgec_free(occ); zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                    zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
                 }
                 range = 1u << nb;
                 lo = (int)bl;                        /* decoder next-state range is
@@ -278,7 +274,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                     byte = (size_t)stprev >> 3;
                     bit = (uint8_t)(1u << ((unsigned)stprev & 7u));
                     if (covered[byte] & bit) {       /* two occurrences, one cell */
-                        zgec_free(occ); zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                        zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
                     }
                     covered[byte] = (uint8_t)(covered[byte] | bit);
                     covered_cells++;
@@ -294,12 +290,11 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
              * with counts[s] == 0 runs this loop zero times and covers nothing,
              * which is not a gap -- its block is the zero-fill above. */
             if (counts[s] > 0 && covered_cells != S) {   /* a cell nobody wrote */
-                zgec_free(occ); zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
             }
         }
     }
 
-    zgec_free(occ);
     *out = full;
     return ZGEC_OK;
 }

@@ -141,15 +141,23 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
     }
 
     if (!t || !values) return 0;
-    uint8_t *syms = (uint8_t *)zgec_alloc(n, 1);
-    if (!syms) return 0;
+    uint8_t stack_syms[2048];
+    uint8_t *syms = NULL;
+    int syms_allocated = 0;
+    if (n <= sizeof(stack_syms)) {
+        syms = stack_syms;
+    } else {
+        syms = (uint8_t *)zgec_alloc(n, 1);
+        if (!syms) return 0;
+        syms_allocated = 1;
+    }
     for (size_t i = 0; i < n; i++) {
         uint8_t nb_dummy;
         syms[i] = zgec_seq_code_of(values[i], &nb_dummy);
     }
 
     zgec_err err = zgec_fse_encode(t, bw, values, syms, n, base, nbits);
-    zgec_free(syms);
+    if (syms_allocated) zgec_free(syms);
     if (err != ZGEC_OK) return 0;
     /* Flush the accumulator and append the sentinel byte (section 8.4),
      * exactly as the RLE path above does; the reader needs it (V5). */
@@ -203,13 +211,21 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
        write loop below reuses it instead of deriving it a second time.
        Validation still runs to completion before the first write, so a
        failed encode leaves the bitstream untouched. */
-    uint8_t *syms = (uint8_t *)zgec_alloc(n, 1);
-    if (!syms) return 0;
+    uint8_t stack_syms[2048];
+    uint8_t *syms = NULL;
+    int syms_allocated = 0;
+    if (n <= sizeof(stack_syms)) {
+        syms = stack_syms;
+    } else {
+        syms = (uint8_t *)zgec_alloc(n, 1);
+        if (!syms) return 0;
+        syms_allocated = 1;
+    }
     for (i = 0; i < n; i++) {
         uint8_t nb;
         uint8_t code = zgec_seq_code_of(values[i], &nb);
         uint32_t extra;
-        if ((int)code >= nsym) { zgec_free(syms); return 0; }
+        if ((int)code >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
         /* Bound the value against its symbol's range here too, not only in
            the write loop below: the range test can reject for a custom
            base/nbits pair, and doing it here is what keeps the promise that
@@ -217,7 +233,7 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
            accepted set is identical to the loop's, so this rejects nothing
            the loop would have accepted. */
         if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra)) {
-            zgec_free(syms);
+            if (syms_allocated) zgec_free(syms);
             return 0;
         }
         syms[i] = code;
@@ -228,18 +244,18 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
                         : zgec_mlclass(ml[n - 1]);
     /* zgec_mlclass() is total on 0..2, but the index must not depend on
        that staying true (entry 3). */
-    if (last_cls >= 3u) { zgec_free(syms); return 0; }
+    if (last_cls >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
     first_entry = enc[last_cls]->e[(size_t)last_s * (size_t)S];
     state = first_entry.new_state;
-    if (state >= S) { zgec_free(syms); return 0; }
+    if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
     if (nbits[last_s] > 0) {
         uint32_t extra;
         if (!zgec_seq_get_extra(values[n - 1], last_s, base, nbits, &extra)) {
-            zgec_free(syms);
+            if (syms_allocated) zgec_free(syms);
             return 0;
         }
         zgec_bw_write(bw, extra, (unsigned)nbits[last_s]);
-        if (bw->overflow) { zgec_free(syms); return 0; }
+        if (bw->overflow) { if (syms_allocated) zgec_free(syms); return 0; }
     }
 
     for (i = n - 1; i > 0; i--) {
@@ -250,8 +266,8 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         s = syms[i - 1];
         c = use_prev ? ((i >= 2) ? zgec_mlclass(ml[i - 2]) : 0u)
                      : zgec_mlclass(ml[i - 1]);
-        if (c >= 3u) { zgec_free(syms); return 0; }
-        if ((int)s >= enc[c]->nsym) { zgec_free(syms); return 0; }
+        if (c >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
+        if ((int)s >= enc[c]->nsym) { if (syms_allocated) zgec_free(syms); return 0; }
         entry = enc[c]->e[(size_t)s * (size_t)S + (size_t)state];
         bits = (state >= (uint32_t)entry.baseline)
                    ? (uint32_t)(state - (uint32_t)entry.baseline)
@@ -266,24 +282,24 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
            (finding 1). nb_bits < 32 so the shift below is defined. */
         if ((unsigned)entry.nb_bits < 32u &&
             bits >= (UINT32_C(1) << (unsigned)entry.nb_bits)) {
-            zgec_free(syms);
+            if (syms_allocated) zgec_free(syms);
             return 0;
         }
         zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
         if (nbits[s] > 0) {
             uint32_t extra;
             if (!zgec_seq_get_extra(values[i - 1], s, base, nbits, &extra)) {
-                zgec_free(syms);
+                if (syms_allocated) zgec_free(syms);
                 return 0;
             }
             zgec_bw_write(bw, extra, (unsigned)nbits[s]);
         }
-        if (bw->overflow) { zgec_free(syms); return 0; }
+        if (bw->overflow) { if (syms_allocated) zgec_free(syms); return 0; }
         state = entry.new_state;
-        if (state >= S) { zgec_free(syms); return 0; }
+        if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
     }
 
-    zgec_free(syms);
+    if (syms_allocated) zgec_free(syms);
     zgec_bw_write(bw, state, (unsigned)al);
     if (bw->overflow) return 0;
     if (zgec_bw_finish(bw) == 0) return 0;

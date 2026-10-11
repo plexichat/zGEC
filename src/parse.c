@@ -570,8 +570,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 if (r == 0u || (size_t)r > ip) continue;
                 if (zgec_rd32(vb + ip - r) != cur4) continue;
                 len = fast_match_len(vb, ip, r, cap);
-                if (len >= 4u && (len > best_len ||
-                                  (len == best_len && r < best_off))) {
+                if (len >= 4u && len > best_len) {
                     best_len = len;
                     best_off = r;
                 }
