@@ -123,3 +123,23 @@ Always use 256-bit AVX2 vector operations for literal copies, pattern broadcasts
 
 **Action:**
 Vectorize sub-literal prediction subtraction with 256-bit AVX2 byte operations, replace linear lane-boundary scans with monotonically advancing pointer checks, and use static 256-entry lookup tables for symbol classification.
+
+## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
+
+**Learning:**
+1. In rANS encoding ( in ), precomputing  in  eliminates repeated 64-bit shifts () per symbol. Replacing 64-bit signed division () with 32-bit unsigned wraparound math () removes 64-bit integer conversion overhead in the inner encoding loop.
+2. In  () and  (), checking  before iterating over literals bypasses bitwise  queries whenever no run-starts exist.
+3. In  for single-context streams (), unrolling the 4-way loop to 16-way increases instruction-level parallelism and L1 cache throughput.
+
+**Action:**
+Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
+
+**Learning:**
+1. In rANS encoding (`zgec_rans_encode_symbol` in `src/rans.c`), precomputing `xmax[s] = (uint32_t)eff << 21` in `zgec_rans_build_enc` eliminates repeated 64-bit shifts (`f << 21`) per symbol. Replacing 64-bit signed division (`int64_t rems = (int64_t)x - (int64_t)quo * (int64_t)f`) with 32-bit unsigned wraparound math (`uint32_t rems = x - quo * f; if (rems >= f) { quo--; rems += f; }`) removes 64-bit integer conversion overhead in the inner encoding loop.
+2. In `zgec_select_contexts` (`src/encode.c`) and `zgec_rans_histograms` (`src/rans.c`), checking `zgec_rs_is_empty(runstart, n_lit)` before iterating over literals bypasses bitwise `zgec_rs_get` queries whenever no run-starts exist.
+3. In `zgec_rans_histograms` for single-context streams (`n_tables == 1`), unrolling the 4-way loop to 16-way increases instruction-level parallelism and L1 cache throughput.
+
+**Action:**
+Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.

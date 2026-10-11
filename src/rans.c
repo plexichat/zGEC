@@ -103,6 +103,7 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts)
             if (eff > (uint32_t)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
             t->f[s] = (uint16_t)eff;
             t->c[s] = (uint16_t)sum;
+            t->xmax[s] = eff << 21;
             sum += eff;
             /* Precompute a biased reciprocal for the encode loop's
              * division by f[s]. floor(2^32 / f) + 1 is the bias that
@@ -351,31 +352,30 @@ static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_
                                           uint32_t *state_ptr, uint16_t *words,
                                           size_t *nwords_ptr, size_t words_cap)
 {
-    uint64_t f = tab->f[s];
-    if (f == 0) return -1;
-    uint64_t xmax = f << 21;
+    uint32_t f = tab->f[s];
+    if (f == 0u) return -1;
     uint32_t x = *state_ptr;
-    if ((uint64_t)x >= xmax) {
+    if (x >= tab->xmax[s]) {
         if (*nwords_ptr >= words_cap) return -1;
         words[(*nwords_ptr)++] = (uint16_t)(x & 0xFFFFu);
         x >>= 16;
     }
     uint32_t recip = tab->f_recip[s];
     uint32_t quo;
-    int64_t rems;
+    uint32_t rems;
     if (f == 1u) {
         quo = x;
-        rems = 0;
+        rems = 0u;
     } else {
         uint64_t prod = (uint64_t)x * (uint64_t)recip;
         quo = (uint32_t)(prod >> 32);
-        rems = (int64_t)x - (int64_t)quo * (int64_t)f;
-        if (rems < 0) {
+        rems = x - quo * f;
+        if (rems >= f) {
             quo--;
-            rems += (int64_t)f;
+            rems += f;
         }
     }
-    *state_ptr = (uint32_t)(((uint64_t)quo << ZGEC_RANS_L) + (uint64_t)rems + (uint64_t)tab->c[s]);
+    *state_ptr = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
     return 0;
 }
 
@@ -546,16 +546,28 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     }
 
     if (n_tables == 1) {
-        /* Single table: a plain linear histogram, four counts per step.
+        /* Single table: a plain linear histogram, 16 counts per step.
          * The lane geometry below only exists to interleave the table
          * streams; with one table it is pure overhead. Counts match the
          * lane loop byte for byte. */
         size_t i = 0;
-        for (; i + 4 <= n_lit; i += 4) {
+        for (; i + 16 <= n_lit; i += 16) {
             tables_counts[Z[i]]++;
             tables_counts[Z[i + 1]]++;
             tables_counts[Z[i + 2]]++;
             tables_counts[Z[i + 3]]++;
+            tables_counts[Z[i + 4]]++;
+            tables_counts[Z[i + 5]]++;
+            tables_counts[Z[i + 6]]++;
+            tables_counts[Z[i + 7]]++;
+            tables_counts[Z[i + 8]]++;
+            tables_counts[Z[i + 9]]++;
+            tables_counts[Z[i + 10]]++;
+            tables_counts[Z[i + 11]]++;
+            tables_counts[Z[i + 12]]++;
+            tables_counts[Z[i + 13]]++;
+            tables_counts[Z[i + 14]]++;
+            tables_counts[Z[i + 15]]++;
         }
         for (; i < n_lit; i++) {
             tables_counts[Z[i]]++;
@@ -567,16 +579,31 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     size_t len[8];
     uint8_t idx_lut[256];
     zgec_lit_lane_geom(start, len, n_lit);
-    if (n_tables > 1)
-        zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
+    zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
+    int rs_empty = zgec_rs_is_empty(runstart, n_lit);
 
-    for (unsigned lane = 0; lane < 8; lane++) {
-        for (size_t t = 0; t < len[lane]; t++) {
-            size_t j = start[lane] + t;
-            int table_idx = 0;
-            if (n_tables > 1) {
+    if (rs_empty) {
+        for (unsigned lane = 0; lane < 8; lane++) {
+            size_t st = start[lane];
+            size_t ln = len[lane];
+            if (ln == 0) continue;
+            tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[st]]++;
+            for (size_t t = 1; t < ln; t++) {
+                size_t j = st + t;
+                uint8_t pidx = idx_lut[Z[j - 1]];
+                if (pidx == 0xFFu) return;
+                tables_counts[(size_t)pidx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+            }
+        }
+    } else {
+        for (unsigned lane = 0; lane < 8; lane++) {
+            size_t st = start[lane];
+            size_t ln = len[lane];
+            for (size_t t = 0; t < ln; t++) {
+                size_t j = st + t;
+                int table_idx;
                 if (j >= n_lit) return;
-                if (j == start[lane] || zgec_rs_get(runstart, j)) {
+                if (t == 0 || zgec_rs_get(runstart, j)) {
                     table_idx = n_tables - 1;
                 } else {
                     uint8_t pidx = idx_lut[Z[j - 1]];
@@ -584,8 +611,8 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
                     table_idx = (int)pidx;
                 }
                 if (table_idx < 0 || table_idx >= n_tables) return;
+                tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
             }
-            tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
         }
     }
 }
