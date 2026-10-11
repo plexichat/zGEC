@@ -85,3 +85,51 @@ When designing multi-threaded compressors or decoders, use atomic fetch-add for 
 
 **Action:**
 Use AVX2 32-byte SIMD equality scans for all match length matchers, evaluate 4-lane hash buckets with 128-bit SIMD masks, and consolidate multi-table hash input loads into a single 64-bit load.
+
+## 2026-10-14 - Encode Path AVX2 SIMD Vectorization across Sequence Preparation and Histograms
+
+**Learning:**
+1. In `zgec_seg_prep_build` (`src/encode.c`), extracting sequence fields (`ll`, `mlv`, `ofv`, `mls`, `ml_sum`) operated sequentially. Vectorizing 8 sequences at a time using 256-bit AVX2 SIMD intrinsics (`_mm256_sub_epi32`, `_mm256_max_epi32`, `_mm256_add_epi32`, and SIMD stores) accelerates segment preparation overhead.
+2. In `zgec_enc_entropy_bits_u32` and `zgec_select_contexts` (`src/encode.c`), 256-element histogram summation previously used scalar accumulation. Vectorizing with AVX2 (`_mm256_loadu_si256` and `_mm256_add_epi32`) reduces histogram total computation time.
+3. In `zgec_rans_histograms` (`src/rans.c`), single-table histogram generation previously suffered from loop-carried dependencies when consecutive identical symbols appeared. Using 4 parallel accumulation buffers followed by 256-bit AVX2 vector additions eliminates dependency stalls while preserving exact counts.
+4. In `zgec_seq_rle_symbol` (`src/seq.c`), evaluating sequence values for RLE candidates previously checked each value individually. Comparing 8 values per iteration with `_mm256_cmpeq_epi32` rapidly confirms uniform sequence symbols.
+
+**Action:**
+Vectorize sequence array transformations and 256-element histogram summations with AVX2 SIMD, and use parallel accumulation arrays to eliminate loop-carried dependencies in symbol counting loops.
+## 2026-10-13 - FSE Bitreader Refill Guarding and Phase B Direct 64-bit Match Copying
+
+**Learning:**
+1. In FSE stream decoding (`zgec_fse_decode` in `src/fse.c` and `seq_decode_cond` in `src/decode.c`), the inner loop calculates `nb = (63u - nacc) >> 3`. When `nacc >= 56u`, `nb` evaluates to 0. Guarding the 64-bit unaligned load and bit shifts with `if (nacc < 56u)` avoids redundant memory reads, shifts, and register pointer increments on iterations where `acc` already holds sufficient bits (56..63).
+2. In Phase B LZ77 match copying (`exec_block` in `src/decode.c`), matches with `moff >= 8` and short lengths (`mlen <= 8`, such as common 3..8 byte matches) previously fell through a multi-branch cascade and scalar copy loop. Handing `moff >= 8 && mlen <= 8` with a direct 64-bit load/store `zgec_wr64(d, zgec_rd64(msrc))` completes short non-overlapping match copies in a single 64-bit operation.
+
+**Action:**
+In FSE bitstream readers, guard 64-bit byte refills with `if (nacc < 56u)` to bypass zero-byte refills, and perform direct 64-bit unaligned word copies for `moff >= 8` short match lengths in LZ77 decoders.
+## 2026-10-14 - High-Tier Probe Depth Expansion and High Compression Preset Ladder
+
+**Learning:**
+1. In `zgec_matcher_find` (`src/match.c`), `ZGEC_MF_PROBE_DEPTH_HIGH` previously probed only 8 out of 16 bucket lanes in `ZGEC_TIER_HIGH`. Probing all 16 lanes (`ZGEC_MF_PROBE_DEPTH_HIGH = 16u`) allows high-tier match finding to discover significantly longer, higher-quality matches across large virtual buffers.
+2. In `parse_min_norep` (`src/parse.c`), forcing non-repeat matches to be >= 6 bytes beyond 256 KiB bypassed 5-byte matches that the price gate cost model confirmed were profitable. Allowing 5-byte matches in high tier when `cur_score > 0` improves overall compression ratio without sacrificing throughput.
+3. Expanding the CLI preset level ladder to levels 13-25 with epoch dictionaries (`--dicts`), sampled block pre-filtering (`--filter`), and progressive block sizes (`block_log2` up to 24 / 16 MiB window) reduces Silesia corpus payload size by ~3.9 MB (from 3.40x to 3.63x ratio) while maintaining fast decompression speed (~154 MB/s).
+
+**Action:**
+When configuring top-tier compression levels, probe all bucket lanes in `ZGEC_TIER_HIGH`, rely on price-gate cost modeling for candidate minimum lengths, and leverage larger block windows up to the P24 position limit (16 MiB).
+## 2026-10-13 - Comprehensive AVX2 SIMD Vectorization in Decompression Hot Paths
+
+**Learning:**
+1. In Phase B decompression (`exec_copy_literals` and `exec_match_wide`), replacing byte/word loops with 256-bit AVX2 vector loads and stores (`_mm256_loadu_si256`/`_mm256_storeu_si256`) accelerates literal copying and match reconstruction across 32-byte blocks.
+2. For small match offsets (`moff = 2, 4, 8, 16`), broadcasting pattern registers into 256-bit AVX2 vectors (`_mm256_set1_epi16`, `_mm256_set1_epi32`, `_mm256_set1_epi64x`, `_mm256_broadcastsi128_si256`) enables writing 32 repeated bytes per store without scalar byte iterations.
+3. In sub-literal prediction decoding (`exec_literals_sub`), when `rep0 >= 32`, vectorizing residual addition with 256-bit `_mm256_add_epi8` computes 32 decoded sub-literals per SIMD instruction.
+4. In 8-lane rANS decoding (`zgec_rans_decode`), gathering packed slots across 8 lanes simultaneously with `_mm256_i32gather_epi32` and computing state transitions with `_mm256_mullo_epi32` accelerates rANS symbol decoding during full rounds when no lane requires state renormalization.
+5. In inverse pre-filtering (`zgec_filter_inverse` DELTA mode), 128-bit vector shifts (`_mm_slli_si128`) and byte additions (`_mm_add_epi8`) compute 16-byte prefix sums in parallel.
+
+**Action:**
+Always use 256-bit AVX2 vector operations for literal copies, pattern broadcasts, sub-literal residual additions, rANS 8-lane state gathers, and delta filter inverse prefix sums in decompression hot paths.
+## 2026-10-13 - AVX2 Sub-Literal Residual Subtraction, Hoisted Lane Boundary Checks, and Static Context LUTs
+
+**Learning:**
+1. In `zgec_enc_build_resid` (`src/encode.c`), sub-literal residual prediction subtraction operated scalar byte-by-byte. Vectorizing 32 bytes at a time with AVX2 (`_mm256_sub_epi8` on `lit` and `vb + p - r0`) drastically accelerates residual generation.
+2. In `zgec_ctx_body_bits` (`src/encode.c`), scanning an $O(N \times \text{n\_lane})$ loop over 8 lane start positions per byte added millions of redundant array comparisons. Advancing a single lane pointer index (`next_lane_idx`) when $j$ reaches the next lane boundary reduces comparison overhead to $O(N)$.
+3. In `zgec_classify` (`src/lit.c`) and `zgec_select_contexts` (`src/encode.c`), replacing arithmetic signed mode classification with a static 256-entry lookup table (`signed_table`) eliminates branchy arithmetic in context model ranking.
+
+**Action:**
+Vectorize sub-literal prediction subtraction with 256-bit AVX2 byte operations, replace linear lane-boundary scans with monotonically advancing pointer checks, and use static 256-entry lookup tables for symbol classification.

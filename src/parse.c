@@ -168,7 +168,24 @@ void zgec_lit_bounds(const zgec_parse *p,
         if (end_seq > p->n_seq) end_seq = p->n_seq;
         if (end_seq < start_seq) end_seq = start_seq;
         lit_bounds[s] = lit_pos;
-        for (size_t i = start_seq; i < end_seq; i++) {
+        size_t i = start_seq;
+#if defined(__AVX2__)
+        __m256i vsum = _mm256_setzero_si256();
+        while (i + 8 <= end_seq) {
+            const zgec_sequence *q = &p->seq[i];
+            __m256i v_ll = _mm256_set_epi32((int)q[7].ll, (int)q[6].ll, (int)q[5].ll, (int)q[4].ll,
+                                            (int)q[3].ll, (int)q[2].ll, (int)q[1].ll, (int)q[0].ll);
+            vsum = _mm256_add_epi32(vsum, v_ll);
+            i += 8;
+        }
+        __m128i vlow = _mm256_castsi256_si128(vsum);
+        __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+        vlow = _mm_add_epi32(vlow, vhigh);
+        vlow = _mm_hadd_epi32(vlow, vlow);
+        vlow = _mm_hadd_epi32(vlow, vlow);
+        lit_pos += (size_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+#endif
+        for (; i < end_seq; i++) {
             lit_pos += p->seq[i].ll;
         }
     }
@@ -199,8 +216,9 @@ static unsigned parse_skip_shift(zgec_tier tier)
 /* Fixed fallback minimum non-repeat length for the
  * first implementation: 5, 6 beyond 256 KiB
  * (section 11.4). Repeat offsets keep minimum 4. */
-static uint32_t parse_min_norep(size_t ip)
+static uint32_t parse_min_norep(size_t ip, zgec_tier tier)
 {
+    if (tier >= ZGEC_TIER_HIGH) return 5u;
     return (ip >= (size_t)262144) ? 6u : 5u;
 }
 
@@ -570,8 +588,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 if (r == 0u || (size_t)r > ip) continue;
                 if (zgec_rd32(vb + ip - r) != cur4) continue;
                 len = fast_match_len(vb, ip, r, cap);
-                if (len >= 4u && (len > best_len ||
-                                  (len == best_len && r < best_off))) {
+                if (len >= 4u && len > best_len) {
                     best_len = len;
                     best_off = r;
                 }
@@ -898,6 +915,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     uint32_t ml_hist[ZGEC_NSYM_SEQ];
     uint32_t of_hist[ZGEC_NSYM_SEQ];
     uint32_t lit_hist[ZGEC_NSYM_LIT];
+    double ll_log_hist[ZGEC_NSYM_SEQ];
+    double ml_log_hist[ZGEC_NSYM_SEQ];
+    double of_log_hist[ZGEC_NSYM_SEQ];
     float ll_cost[ZGEC_NSYM_SEQ];
     float ml_cost[ZGEC_NSYM_SEQ];
     float of_cost[ZGEC_NSYM_SEQ];
@@ -917,9 +937,12 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     l2tot[1] = l2tot[0];
     l2tot[2] = l2tot[0];
     for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
-        ll_cost[s_i] = (float)(l2tot[0] - zgec_fast_log2_u32(1u));
-        ml_cost[s_i] = (float)(l2tot[1] - zgec_fast_log2_u32(1u));
-        of_cost[s_i] = (float)(l2tot[2] - zgec_fast_log2_u32(1u));
+        ll_log_hist[s_i] = zgec_fast_log2_u32(1u);
+        ml_log_hist[s_i] = zgec_fast_log2_u32(1u);
+        of_log_hist[s_i] = zgec_fast_log2_u32(1u);
+        ll_cost[s_i] = (float)(l2tot[0] - ll_log_hist[s_i]);
+        ml_cost[s_i] = (float)(l2tot[1] - ml_log_hist[s_i]);
+        of_cost[s_i] = (float)(l2tot[2] - of_log_hist[s_i]);
     }
 
     size_t ip = prefix;
@@ -967,7 +990,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (match.length >= 4u) {
             is_rep = (match.offset == reps.rep[0] || match.offset == reps.rep[1] ||
                       match.offset == reps.rep[2]) ? 1u : 0u;
-            need = (is_rep != 0u) ? 4u : parse_min_norep(ip);
+            need = (is_rep != 0u) ? 4u : parse_min_norep(ip, tier);
             if (match.length >= need) {
                 offbase = parse_offbase(match.offset, &reps);
                 cur_score = parse_score(match.length, ll, offbase,
@@ -1022,7 +1045,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             uint32_t nis_rep = (nm.length >= 4u &&
                                 (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
                                  nm.offset == reps.rep[2])) ? 1u : 0u;
-            uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1);
+            uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1, tier);
             double base = cur_score;
             double nscore = -1.0;
             uint32_t defer;
@@ -1113,10 +1136,22 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                 l2tot[0] = zgec_fast_log2_u32(ll_tot + (uint32_t)ZGEC_NSYM_SEQ);
                 l2tot[1] = zgec_fast_log2_u32(ml_tot + (uint32_t)ZGEC_NSYM_SEQ);
                 l2tot[2] = zgec_fast_log2_u32(of_tot + (uint32_t)ZGEC_NSYM_SEQ);
-                for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
-                    ll_cost[s_i] = (float)(l2tot[0] - zgec_fast_log2_u32(ll_hist[s_i] + 1u));
-                    ml_cost[s_i] = (float)(l2tot[1] - zgec_fast_log2_u32(ml_hist[s_i] + 1u));
-                    of_cost[s_i] = (float)(l2tot[2] - zgec_fast_log2_u32(of_hist[s_i] + 1u));
+                ll_log_hist[c_ll_acc] = zgec_fast_log2_u32(ll_hist[c_ll_acc] + 1u);
+                ml_log_hist[c_ml_acc] = zgec_fast_log2_u32(ml_hist[c_ml_acc] + 1u);
+                of_log_hist[c_of_acc] = zgec_fast_log2_u32(of_hist[c_of_acc] + 1u);
+                /* Batch/throttle table updates: update the full 66-element cost tables
+                 * every 16 sequence acceptances or when totals are small (<256).
+                 * For intermediate sequences, update only the modified symbol's cost entry. */
+                if (ll_tot < 256 || (ll_tot & 15u) == 0u) {
+                    for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
+                        ll_cost[s_i] = (float)(l2tot[0] - ll_log_hist[s_i]);
+                        ml_cost[s_i] = (float)(l2tot[1] - ml_log_hist[s_i]);
+                        of_cost[s_i] = (float)(l2tot[2] - of_log_hist[s_i]);
+                    }
+                } else {
+                    ll_cost[c_ll_acc] = (float)(l2tot[0] - ll_log_hist[c_ll_acc]);
+                    ml_cost[c_ml_acc] = (float)(l2tot[1] - ml_log_hist[c_ml_acc]);
+                    of_cost[c_of_acc] = (float)(l2tot[2] - of_log_hist[c_of_acc]);
                 }
             }
             /* Re-estimate Lbar when the literal count has grown by a
