@@ -898,6 +898,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     uint32_t ml_hist[ZGEC_NSYM_SEQ];
     uint32_t of_hist[ZGEC_NSYM_SEQ];
     uint32_t lit_hist[ZGEC_NSYM_LIT];
+    double ll_log_hist[ZGEC_NSYM_SEQ];
+    double ml_log_hist[ZGEC_NSYM_SEQ];
+    double of_log_hist[ZGEC_NSYM_SEQ];
     float ll_cost[ZGEC_NSYM_SEQ];
     float ml_cost[ZGEC_NSYM_SEQ];
     float of_cost[ZGEC_NSYM_SEQ];
@@ -917,9 +920,12 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     l2tot[1] = l2tot[0];
     l2tot[2] = l2tot[0];
     for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
-        ll_cost[s_i] = (float)(l2tot[0] - zgec_fast_log2_u32(1u));
-        ml_cost[s_i] = (float)(l2tot[1] - zgec_fast_log2_u32(1u));
-        of_cost[s_i] = (float)(l2tot[2] - zgec_fast_log2_u32(1u));
+        ll_log_hist[s_i] = zgec_fast_log2_u32(1u);
+        ml_log_hist[s_i] = zgec_fast_log2_u32(1u);
+        of_log_hist[s_i] = zgec_fast_log2_u32(1u);
+        ll_cost[s_i] = (float)(l2tot[0] - ll_log_hist[s_i]);
+        ml_cost[s_i] = (float)(l2tot[1] - ml_log_hist[s_i]);
+        of_cost[s_i] = (float)(l2tot[2] - of_log_hist[s_i]);
     }
 
     size_t ip = prefix;
@@ -1113,10 +1119,22 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                 l2tot[0] = zgec_fast_log2_u32(ll_tot + (uint32_t)ZGEC_NSYM_SEQ);
                 l2tot[1] = zgec_fast_log2_u32(ml_tot + (uint32_t)ZGEC_NSYM_SEQ);
                 l2tot[2] = zgec_fast_log2_u32(of_tot + (uint32_t)ZGEC_NSYM_SEQ);
-                for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
-                    ll_cost[s_i] = (float)(l2tot[0] - zgec_fast_log2_u32(ll_hist[s_i] + 1u));
-                    ml_cost[s_i] = (float)(l2tot[1] - zgec_fast_log2_u32(ml_hist[s_i] + 1u));
-                    of_cost[s_i] = (float)(l2tot[2] - zgec_fast_log2_u32(of_hist[s_i] + 1u));
+                ll_log_hist[c_ll_acc] = zgec_fast_log2_u32(ll_hist[c_ll_acc] + 1u);
+                ml_log_hist[c_ml_acc] = zgec_fast_log2_u32(ml_hist[c_ml_acc] + 1u);
+                of_log_hist[c_of_acc] = zgec_fast_log2_u32(of_hist[c_of_acc] + 1u);
+                /* Batch/throttle table updates: update the full 66-element cost tables
+                 * every 16 sequence acceptances or when totals are small (<256).
+                 * For intermediate sequences, update only the modified symbol's cost entry. */
+                if (ll_tot < 256 || (ll_tot & 15u) == 0u) {
+                    for (s_i = 0; s_i < ZGEC_NSYM_SEQ; s_i++) {
+                        ll_cost[s_i] = (float)(l2tot[0] - ll_log_hist[s_i]);
+                        ml_cost[s_i] = (float)(l2tot[1] - ml_log_hist[s_i]);
+                        of_cost[s_i] = (float)(l2tot[2] - of_log_hist[s_i]);
+                    }
+                } else {
+                    ll_cost[c_ll_acc] = (float)(l2tot[0] - ll_log_hist[c_ll_acc]);
+                    ml_cost[c_ml_acc] = (float)(l2tot[1] - ml_log_hist[c_ml_acc]);
+                    of_cost[c_of_acc] = (float)(l2tot[2] - of_log_hist[c_of_acc]);
                 }
             }
             /* Re-estimate Lbar when the literal count has grown by a
