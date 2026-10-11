@@ -1,8 +1,19 @@
+#include <stdint.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 #include "zgec_parse.h"
 #include "zgec_seq.h"
+
+#if defined(_MSC_VER)
+#define ZGEC_ENC_TLS __declspec(thread)
+#else
+#define ZGEC_ENC_TLS _Thread_local
+#endif
+
+#define ZGEC_FAST_SCRATCH_BITS 18u
+static ZGEC_ENC_TLS uint32_t fast_ts_scratch[1u << ZGEC_FAST_SCRATCH_BITS];
+static ZGEC_ENC_TLS uint32_t fast_tl_scratch[1u << ZGEC_FAST_SCRATCH_BITS];
 
 #include <stdlib.h>
 #include <string.h>
@@ -395,7 +406,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_MIN_LONG 8u
 #endif
 #ifndef ZGEC_FAST_SHIFT
-#define ZGEC_FAST_SHIFT 8u
+#define ZGEC_FAST_SHIFT 5u
 #endif
 
 #ifndef ZGEC_FAST_SHORT_HASH_BYTES
@@ -410,6 +421,23 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #ifndef ZGEC_FAST_INS_LONG
 #define ZGEC_FAST_INS_LONG 1
 #endif
+/* Cap on interior positions indexed per accepted match. The interior-insert
+ * loop below walks the whole match two positions at a time, so a long match
+ * costs O(best_len) hash-and-store pairs: on periodic data where matches run
+ * kilobytes, that write stream dominates the accept path. 0 restores the
+ * unbounded walk.
+ *
+ * Measured and left off: the cap is a large speed win where matches are long
+ * (nci +50% encode throughput at span 8, vs +13-18% on webster/samba in an
+ * earlier sweep) and the ratio proxy barely moves -- but the proxy prices
+ * sequences at a flat 3 bytes and so is blind to the offset distribution the
+ * cap changes, and end-to-end output at -l 4 grows +0.6% (dickens) to +1.7%
+ * (nci). That is past the line a speed dial may trade, so the default keeps
+ * every interior position indexed. Revisit if the fast tier ever gains a
+ * price-gated accept, which would pay the cap back in rejected candidates. */
+#ifndef ZGEC_FAST_INS_SPAN
+#define ZGEC_FAST_INS_SPAN 0u
+#endif
 #ifndef ZGEC_FAST_PREFETCH
 #define ZGEC_FAST_PREFETCH 0
 #endif
@@ -417,7 +445,23 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_LAZY 1
 #endif
 #ifndef ZGEC_FAST_LAZY_MAX
-#define ZGEC_FAST_LAZY_MAX 64u
+#define ZGEC_FAST_LAZY_MAX 12u
+#endif
+/* When the lazy lookahead runs, probe only the long (8-byte) table at ip+1,
+ * not the short (5-byte) one as well. zstd's dfast lookahead likewise tests
+ * only the long candidate it already has. The short-table probe finds matches
+ * a few bytes long that rarely beat the current best_len+1 gate, so it costs a
+ * hash and a probe per visited position for little decision change.
+ *
+ * Measured on Silesia (fast tier, 2 MiB blocks, median of 3 interleaved
+ * rounds) against the post-Bolt fast_parse: long-only gives +2-4% encode
+ * throughput (dickens +4.3%, xml +4.0%, samba +2.9%, nci +2.3%) at
+ * +0.02-0.16pp of ratio proxy cost, and +0.03-0.13% end-to-end output at
+ * -l 4. With the earlier LAZY_MAX=64 the win was larger (+4-10%), since the
+ * skipped probe ran on every short match; at 12 it runs less often but still
+ * pays for itself. */
+#ifndef ZGEC_FAST_LAZY_LONG_ONLY
+#define ZGEC_FAST_LAZY_LONG_ONLY 1
 #endif
 #ifndef ZGEC_FAST_BITS_MIN
 #define ZGEC_FAST_BITS_MIN 10u
@@ -425,7 +469,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 /* Buckets wanted per indexed position, as a shift: 2 means one bucket per
  * four positions. */
 #ifndef ZGEC_FAST_BITS_SHIFT
-#define ZGEC_FAST_BITS_SHIFT 2u
+#define ZGEC_FAST_BITS_SHIFT 3u
 #endif
 
 /* Bucket count for the fast tier's two tables, chosen from the number of
@@ -463,34 +507,7 @@ static inline uint32_t fast_hash_l_v(uint64_t v)
     return (uint32_t)((v * 0xD6E8FEB86659FD93ULL) >> (64u - ZGEC_FAST_LONG_BITS));
 }
 
-static inline uint32_t fast_match_len(const uint8_t *vb, size_t ip, size_t d, size_t cap)
-{
-    const uint8_t *a = vb + ip - d;
-    const uint8_t *b = vb + ip;
-    size_t len = 0;
-#if defined(__AVX2__)
-    while (len + 32u <= cap) {
-        __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(a + len));
-        __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(b + len));
-        unsigned m32 = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(va, vb256));
-        if (m32 != 0xFFFFFFFFu) {
-            return (uint32_t)(len + (unsigned)__builtin_ctz(~m32));
-        }
-        len += 32u;
-    }
-#endif
-    while (len + 8u <= cap) {
-        uint64_t x = zgec_rd64(a + len) ^ zgec_rd64(b + len);
-        if (x != 0u) {
-            return (uint32_t)(len + ((unsigned)__builtin_ctzll(x) >> 3));
-        }
-        len += 8u;
-    }
-    while (len < cap && a[len] == b[len]) {
-        len++;
-    }
-    return (uint32_t)len;
-}
+
 
 static inline uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
 {
@@ -534,12 +551,20 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     unsigned sshift = (unsigned)ZGEC_FAST_SHORT_BITS - fbits;
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
 
-    ts = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
-    tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+    int ts_owned = 0;
+    if (fbits <= ZGEC_FAST_SCRATCH_BITS) {
+        ts = fast_ts_scratch;
+        tl = fast_tl_scratch;
+    } else {
+        ts = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        ts_owned = 1;
+    }
     seq_cap = (end - prefix) / 8u + 16u;
     seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
     if (!ts || !tl || !seq) {
-        zgec_free(ts); zgec_free(tl); zgec_free(seq);
+        if (ts_owned) { zgec_free(ts); zgec_free(tl); }
+        zgec_free(seq);
         return ZGEC_ERR_NOMEM;
     }
     memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
@@ -562,7 +587,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         uint32_t best_len = 0u;
         uint32_t best_off = 0u;
         uint64_t cur8 = zgec_rd64(vb + ip);
-        uint32_t cur4 = (uint32_t)cur8;
+        (void)cur8;
         uint32_t hs = fast_hash_s_v(cur8) >> sshift;
         uint32_t hl = fast_hash_l_v(cur8) >> lshift;
 #if ZGEC_FAST_PREFETCH
@@ -593,10 +618,14 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             uint32_t ri;
             for (ri = 0; ri < 3u; ri++) {
                 uint32_t r = reps.rep[ri];
-                uint32_t len;
                 if (r == 0u || (size_t)r > ip) continue;
-                if (zgec_rd32(vb + ip - r) != cur4) continue;
-                len = fast_match_len(vb, ip, r, cap);
+                uint64_t diff = zgec_rd64(vb + ip - r) ^ cur8;
+                uint32_t len;
+                if (diff != 0u) {
+                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                } else {
+                    len = 8u + fast_match_len_tail(vb + ip - r + 8u, vb + ip + 8u, cap - 8u);
+                }
                 if (len >= 4u && len > best_len) {
                     best_len = len;
                     best_off = r;
@@ -657,6 +686,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     if (len1 >= ZGEC_FAST_MIN_LONG) l1 = len1;
                 }
             }
+#if !ZGEC_FAST_LAZY_LONG_ONLY
             c1 = ts[fast_hash_s_v(v1) >> sshift];
             if (c1 != 0u && (size_t)(c1 - 1u) < p1) {
                 size_t d1 = p1 - (size_t)(c1 - 1u);
@@ -669,6 +699,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     if (len1 >= ZGEC_FAST_MIN_SHORT && len1 > l1) l1 = len1;
                 }
             }
+#endif
             if (l1 > best_len + 1u) {
                 ip = p1;
                 continue;
@@ -701,14 +732,39 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             seq[p->n_seq].offbase = ob;
             p->n_seq++;
 #if ZGEC_FAST_INS_ALL
-            for (ins = ip + 1u; ins + 8u <= end && ins < ip + (size_t)best_len; ins += (size_t)ZGEC_FAST_INS_STRIDE) {
-                uint64_t iv = zgec_rd64(vb + ins);
-                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
-#if ZGEC_FAST_INS_LONG
-                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
+            {
+                size_t ins_end = ip + (size_t)best_len;
+                if (ins_end + 8u > end) ins_end = (end >= 8u) ? end - 8u : 0u;
+#if ZGEC_FAST_INS_SPAN > 0u
+                if (ins_end > ip + (size_t)ZGEC_FAST_INS_SPAN)
+                    ins_end = ip + (size_t)ZGEC_FAST_INS_SPAN;
 #endif
+                ins = ip + 1u;
+                for (; ins + 2u <= ins_end; ins += 2u) {
+                    uint64_t iv0 = zgec_rd64(vb + ins);
+                    uint64_t iv1 = zgec_rd64(vb + ins + 1u);
+                    uint32_t hs0 = fast_hash_s_v(iv0) >> sshift;
+                    uint32_t hl0 = fast_hash_l_v(iv0) >> lshift;
+                    uint32_t hs1 = fast_hash_s_v(iv1) >> sshift;
+                    uint32_t hl1 = fast_hash_l_v(iv1) >> lshift;
+                    ts[hs0] = (uint32_t)ins + 1u;
+#if ZGEC_FAST_INS_LONG
+                    tl[hl0] = (uint32_t)ins + 1u;
+#endif
+                    ts[hs1] = (uint32_t)ins + 2u;
+#if ZGEC_FAST_INS_LONG
+                    tl[hl1] = (uint32_t)ins + 2u;
+#endif
+                }
+                for (; ins < ins_end; ins++) {
+                    uint64_t iv = zgec_rd64(vb + ins);
+                    ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
+#if ZGEC_FAST_INS_LONG
+                    tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
+#endif
+                }
+                ins = ip + (size_t)best_len;
             }
-            ins = ip + (size_t)best_len;
 #else
             /* Sparse inserts inside the match: second and last position. */
             ins = ip + 1u;
@@ -740,12 +796,13 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 
     zgec_free(p->seq);
     p->seq = seq;
-    zgec_free(ts);
-    zgec_free(tl);
+    if (ts_owned) {
+        zgec_free(ts);
+        zgec_free(tl);
+    }
     return ZGEC_OK;
 }
 #endif /* ZGEC_FASTDFAST_OFF */
-
 
 zgec_err zgec_parse_block_ex(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
