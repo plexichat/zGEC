@@ -498,6 +498,13 @@ static uint32_t zgec_enc_rep0_after(const zgec_sequence *seq, size_t n)
  * ML-3 value (section 8.1), so the real match length is ml_coded[s] + 3.
  * vb_start is the virtual-buffer position of the slice's first output
  * byte. */
+/* Build the sub-literal residual buffer Z (section 9.6) exactly as the
+ * decoder reconstructs it: each literal is predicted from the byte rep0
+ * back in the virtual buffer, the match bytes are skipped, and tail
+ * literals use rep0 after the last sequence. ml_coded[s] holds the coded
+ * ML-3 value (section 8.1), so the real match length is ml_coded[s] + 3.
+ * vb_start is the virtual-buffer position of the slice's first output
+ * byte. */
 static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
                                  size_t n_lit, const uint32_t *ll,
                                  const uint32_t *ml_coded, size_t n_seq,
@@ -1273,6 +1280,10 @@ static double zgec_cond_net_gain(const uint32_t *cls_hist /*[3][66]*/,
  * (mode, class map, k). Mirrors emission (zgec_rans_histograms): lane
  * starts and run starts use the run-start table, every other byte the
  * context table its class maps to (D5). cls_hist is 64x256 scratch. */
+/* Partitioned rANS body estimate for a byte buffer under an explicit
+ * (mode, class map, k). Mirrors emission (zgec_rans_histograms): lane
+ * starts and run starts use the run-start table, every other byte the
+ * context table its class maps to (D5). cls_hist is 64x256 scratch. */
 static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                                  const uint8_t *runstart,
                                  int ctx_mode, const uint8_t *cmap, int k,
@@ -1290,19 +1301,10 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
     {
-        /* Lane starts are at most 8 positions: mark them once instead of
-         * scanning all 8 per byte. */
-        uint8_t lane_mark = 0;
-        size_t lane_pos[ZGEC_NLANES];
-        size_t n_lane = 0;
-        unsigned lane;
         /* Byte -> context group, resolved once (estimate-only: out-of-range
          * classes/groups fold to 0, as the per-byte clamps below did). */
         uint8_t grp_lut[256];
         unsigned b;
-        for (lane = 0; lane < (unsigned)ZGEC_NLANES; lane++) {
-            if (start[lane] < n_z) lane_pos[n_lane++] = start[lane];
-        }
         for (b = 0; b < 256u; b++) {
             unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
             unsigned grp;
@@ -1311,21 +1313,14 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        size_t next_lane_idx = 0;
         for (j = 0; j < n_z; j++) {
-            int is_lane_start = 0;
-            if (next_lane_idx < n_lane && j == lane_pos[next_lane_idx]) {
-                is_lane_start = 1;
-                while (next_lane_idx < n_lane && j == lane_pos[next_lane_idx]) {
-                    next_lane_idx++;
-                }
-            }
             if (runstart && zgec_rs_get(runstart, j)) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
             }
-            if (is_lane_start || j == 0) {
+            if (j == start[0] || j == start[1] || j == start[2] || j == start[3] ||
+                j == start[4] || j == start[5] || j == start[6] || j == start[7]) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
@@ -1336,7 +1331,6 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                 grp_total[grp]++;
             }
         }
-    (void)lane_mark;
     }
     for (g = 0; g < k; g++) {
         body += zgec_enc_entropy_bits_u32(cls_hist + (size_t)g * 256u,
