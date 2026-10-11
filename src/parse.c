@@ -1,8 +1,19 @@
+#include <stdint.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
 #endif
 #include "zgec_parse.h"
 #include "zgec_seq.h"
+
+#if defined(_MSC_VER)
+#define ZGEC_ENC_TLS __declspec(thread)
+#else
+#define ZGEC_ENC_TLS _Thread_local
+#endif
+
+#define ZGEC_FAST_SCRATCH_BITS 18u
+static ZGEC_ENC_TLS uint32_t fast_ts_scratch[1u << ZGEC_FAST_SCRATCH_BITS];
+static ZGEC_ENC_TLS uint32_t fast_tl_scratch[1u << ZGEC_FAST_SCRATCH_BITS];
 
 #include <stdlib.h>
 #include <string.h>
@@ -395,7 +406,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_MIN_LONG 8u
 #endif
 #ifndef ZGEC_FAST_SHIFT
-#define ZGEC_FAST_SHIFT 8u
+#define ZGEC_FAST_SHIFT 5u
 #endif
 
 #ifndef ZGEC_FAST_SHORT_HASH_BYTES
@@ -417,7 +428,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_LAZY 1
 #endif
 #ifndef ZGEC_FAST_LAZY_MAX
-#define ZGEC_FAST_LAZY_MAX 64u
+#define ZGEC_FAST_LAZY_MAX 12u
 #endif
 #ifndef ZGEC_FAST_BITS_MIN
 #define ZGEC_FAST_BITS_MIN 10u
@@ -425,7 +436,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 /* Buckets wanted per indexed position, as a shift: 2 means one bucket per
  * four positions. */
 #ifndef ZGEC_FAST_BITS_SHIFT
-#define ZGEC_FAST_BITS_SHIFT 2u
+#define ZGEC_FAST_BITS_SHIFT 3u
 #endif
 
 /* Bucket count for the fast tier's two tables, chosen from the number of
@@ -507,12 +518,20 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     unsigned sshift = (unsigned)ZGEC_FAST_SHORT_BITS - fbits;
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
 
-    ts = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
-    tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+    int ts_owned = 0;
+    if (fbits <= ZGEC_FAST_SCRATCH_BITS) {
+        ts = fast_ts_scratch;
+        tl = fast_tl_scratch;
+    } else {
+        ts = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        ts_owned = 1;
+    }
     seq_cap = (end - prefix) / 8u + 16u;
     seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
     if (!ts || !tl || !seq) {
-        zgec_free(ts); zgec_free(tl); zgec_free(seq);
+        if (ts_owned) { zgec_free(ts); zgec_free(tl); }
+        zgec_free(seq);
         return ZGEC_ERR_NOMEM;
     }
     memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
@@ -690,9 +709,13 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     uint32_t hs1 = fast_hash_s_v(iv1) >> sshift;
                     uint32_t hl1 = fast_hash_l_v(iv1) >> lshift;
                     ts[hs0] = (uint32_t)ins + 1u;
+#if ZGEC_FAST_INS_LONG
                     tl[hl0] = (uint32_t)ins + 1u;
+#endif
                     ts[hs1] = (uint32_t)ins + 2u;
+#if ZGEC_FAST_INS_LONG
                     tl[hl1] = (uint32_t)ins + 2u;
+#endif
                 }
                 for (; ins < ins_end; ins++) {
                     uint64_t iv = zgec_rd64(vb + ins);
@@ -734,451 +757,9 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 
     zgec_free(p->seq);
     p->seq = seq;
-    zgec_free(ts);
-    zgec_free(tl);
-    return ZGEC_OK;
-}
-#endif /* ZGEC_FASTDFAST_OFF */
-
-
-zgec_err zgec_parse_block_ex(zgec_parse **out,
-                          const uint8_t *src, size_t raw_size,
-                          const uint8_t *dict, size_t dict_size,
-                          const uint8_t *litref, size_t litref_size,
-                          zgec_tier tier, double lambda)
-{
-    if (!out) return ZGEC_ERR_INVAL;
-    /* Never leave a stale pointer behind on the failure paths below. */
-    *out = NULL;
-    if ((!src && raw_size > 0)) return ZGEC_ERR_INVAL;
-    /* A size without a pointer would leave the [dict) region of the
-     * virtual buffer below uninitialised and exposed to the matcher, so
-     * reject the pair instead of copying nothing into it. */
-    if (!dict && dict_size > 0) return ZGEC_ERR_INVAL;
-    if ((!litref && litref_size > 0)) return ZGEC_ERR_INVAL;
-    /* raw_size is recorded in 32 bits, so a larger input would be
-     * truncated into every allocation and bounds decision that uses it.
-     * Guarded on SIZE_MAX because on a 32-bit target size_t cannot exceed
-     * UINT32_MAX, which makes the comparison always false and trips gcc's
-     * -Wtype-limits in this -Werror build. No cast in the #if: the
-     * preprocessor evaluates type names as 0. */
-#if SIZE_MAX > UINT32_MAX
-    if (raw_size > (size_t)UINT32_MAX) return ZGEC_ERR_INVAL;
-#endif
-
-    /* Lambda is the speed/ratio dial (section 11.7):
-     * 0 maximises ratio, larger values raise the
-     * price-gate bar slightly towards fewer, longer
-     * matches (faster decode). Clamped small so the
-     * effect stays a slight threshold scale. */
-    /* A non-finite lambda survives the clamp below unchanged, because
-     * every comparison against NaN is false: lscale and every score
-     * would be NaN, the "cur_score > 0.0" gate would reject every match,
-     * and the block would come out as pure literals. Fall back to the
-     * ratio endpoint rather than silently disabling match emission. */
-    if (!isfinite(lambda)) lambda = 0.0;
-    double lam = (lambda < 0.0) ? 0.0 : ((lambda > 4.0) ? 4.0 : lambda);
-    double lscale = 1.0 + 0.25 * lam;
-
-    /* Sequence capacity from the input rather than a flat 65536 records:
-     * at 12 bytes a record that is ~768 KiB, allocated even for a 64-byte
-     * block. The shortest match is 4 bytes, so raw_size/16 is a safe
-     * under-estimate that the growth path below extends on demand. */
-    size_t seq_cap = raw_size / 16u + 16u;
-    if (seq_cap < 256u) seq_cap = 256u;
-    if (seq_cap > 65536u) seq_cap = 65536u;
-    if (parse_mul_overflows(seq_cap, sizeof(zgec_sequence)))
-        return ZGEC_ERR_NOMEM;
-
-    zgec_parse *p = (zgec_parse *)zgec_alloc(sizeof(*p), _Alignof(zgec_parse));
-    if (!p) return ZGEC_ERR_NOMEM;
-    memset(p, 0, sizeof(*p));
-
-    p->seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
-    if (!p->seq) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
-
-    /* Checked before allocating: a wrapped size allocates short, and the
-     * literal copies below then run past its end. */
-    if (zgec_add_overflows(raw_size, (size_t)ZGEC_LIT_SLACK + 64u)) {
-        zgec_parse_free(p);
-        return ZGEC_ERR_NOMEM;
+    if (ts_owned) {
+        zgec_free(ts);
+        zgec_free(tl);
     }
-    p->lit = (uint8_t *)zgec_alloc(raw_size + (size_t)ZGEC_LIT_SLACK + 64u, 64);
-    if (!p->lit) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
-    p->raw_size = (uint32_t)raw_size;
-    p->n_seq = 0;
-    p->n_lit = 0;
-
-    if (raw_size == 0) {
-        *out = p;
-        return ZGEC_OK;
-    }
-
-    /* Virtual buffer [dict][litref][src] (section 6.1). Every size here
-     * is checked before use: an unchecked sum can wrap to a small value,
-     * pass the P24 guard below, and be used as a memcpy length. */
-    if (zgec_add_overflows(dict_size, litref_size)) {
-        zgec_parse_free(p);
-        return ZGEC_ERR_INVAL;
-    }
-    size_t prefix = dict_size + litref_size;
-    if (prefix > (size_t)(1u << 24)) {
-        zgec_parse_free(p);
-        return ZGEC_ERR_INVAL;
-    }
-    if (zgec_add_overflows(prefix, raw_size)) {
-        zgec_parse_free(p);
-        return ZGEC_ERR_INVAL;
-    }
-    size_t vb_size = prefix + raw_size;
-    uint8_t *vb;
-    zgec_matcher *m;
-    if (zgec_add_overflows(vb_size, 64u)) {
-        zgec_parse_free(p);
-        return ZGEC_ERR_NOMEM;
-    }
-    vb = (uint8_t *)zgec_alloc(vb_size + 64u, 64);
-    if (!vb) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
-    if (dict && dict_size > 0) {
-        memcpy(vb, dict, dict_size);
-    }
-    if (litref && litref_size > 0) {
-        memcpy(vb + dict_size, litref, litref_size);
-    }
-    memcpy(vb + prefix, src, raw_size);
-
-#ifndef ZGEC_FASTDFAST_OFF
-    if (tier == ZGEC_TIER_FAST) {
-        zgec_err fe = fast_parse(p, vb, prefix, vb_size);
-        zgec_free(vb);
-        if (fe != ZGEC_OK) { zgec_parse_free(p); return fe; }
-        *out = p;
-        return ZGEC_OK;
-    }
-#endif
-
-    m = zgec_matcher_create(tier, vb_size);
-    if (!m) {
-        zgec_free(vb);
-        zgec_parse_free(p);
-        return ZGEC_ERR_NOMEM;
-    }
-    zgec_matcher_reset(m, vb, vb_size, (dict && dict_size > 0) ? dict : NULL,
-                       dict_size);
-    if (litref_size > 0) {
-        /* Seed the LITREF region too, with the tier's priming stride, so
-         * matches may reach back into the predecessors' literals. */
-        size_t stride = (tier == ZGEC_TIER_HIGH) ? (size_t)1 : (size_t)2;
-        size_t pos;
-        for (pos = dict_size; pos < prefix; pos += stride) {
-            zgec_matcher_insert(m, vb, pos);
-        }
-    }
-
-    zgec_reps reps;
-    zgec_reps_init(&reps);
-
-    /* Price-gate state (section 11.4): running code
-     * histograms stand in for the previous segment's
-     * statistics (Laplace-smoothed inside the cost
-     * function, so the first segment starts uniform),
-     * and Lbar is the running average literal cost in
-     * bits with a 512-byte prior at the 6-bit initial
-     * estimate. */
-    uint32_t ll_hist[ZGEC_NSYM_SEQ];
-    uint32_t ml_hist[ZGEC_NSYM_SEQ];
-    uint32_t of_hist[ZGEC_NSYM_SEQ];
-    uint32_t lit_hist[ZGEC_NSYM_LIT];
-    /* Per-code log2(count + 1): the per-symbol half of a sequence cost.
-     * A histogram bin moves by one per accepted sequence, so only that
-     * bin changes here; see parse_seq_cost. This subsumes the throttled
-     * cost-table refresh main used for the same reason: with no
-     * materialised table there is nothing to throttle, and a cost is
-     * derived from the live total and bin at query time, which is the
-     * value the un-throttled table held. */
-    double ll_base[ZGEC_NSYM_SEQ];
-    double ml_base[ZGEC_NSYM_SEQ];
-    double of_base[ZGEC_NSYM_SEQ];
-    uint32_t ll_tot = 0, ml_tot = 0, of_tot = 0;   /* running code totals */
-    double l2tot[3];           /* log2(total + 66) for LL/ML/OF */
-    size_t lit_total = 0;      /* literals tallied into lit_hist */
-    size_t lit_eval = 0;       /* lit_total at the last lbar estimate */
-    size_t lit_step = 256u;    /* literals before the next estimate */
-    double lbar = 6.0;
-    unsigned shift = parse_skip_shift(tier);
-    memset(ll_hist, 0, sizeof(ll_hist));
-    memset(ml_hist, 0, sizeof(ml_hist));
-    memset(of_hist, 0, sizeof(of_hist));
-    memset(lit_hist, 0, sizeof(lit_hist));
-    /* Every bin starts at count 0, so log2(count + 1) is log2(1) = 0 for
-     * all 66 codes, which is what the old initial cost table held. */
-    memset(ll_base, 0, sizeof(ll_base));
-    memset(ml_base, 0, sizeof(ml_base));
-    memset(of_base, 0, sizeof(of_base));
-    l2tot[0] = zgec_fast_log2_u32(ZGEC_NSYM_SEQ);
-    l2tot[1] = l2tot[0];
-    l2tot[2] = l2tot[0];
-
-    size_t ip = prefix;
-    size_t end = prefix + raw_size;
-    size_t anchor = ip;
-
-    /* Per-position order (section 11.3): hash plus
-     * bucket prefetch for visited positions, rep
-     * checks, long table then short table with SIMD
-     * tag compare, 8-byte XOR plus tzcnt length, best
-     * by price score, lazy check at ip + 1 by score
-     * with conditional-move selection. Minimum
-     * non-repeat 5 (6 beyond 256 KiB fallback),
-     * repeat 4. */
-    while (ip + (size_t)4 <= end) {
-        uint32_t ll;
-        uint32_t need;
-        uint32_t is_rep;
-        uint32_t offbase;
-        double cur_score = 0.0;
-        uint32_t cur_len = 0;
-        uint32_t cur_off = 0;
-        zgec_match match;
-
-        /* Prefetch the upcoming input line; the
-         * finder prefetches the hash bucket lines of
-         * each visited position internally. */
-        if (ip + (size_t)64 <= end) {
-            __builtin_prefetch((const void *)(vb + ip + (size_t)64), 0, 3);
-        }
-#if ZGEC_PARSE_PREFETCH
-        {
-            /* Hide table latency: prefetch the buckets of the position the
-             * skip schedule visits next (and ip + 1 for the lazy probe)
-             * before spending a whole find on ip. */
-            size_t nstep = ((ip - anchor) >> shift) + (size_t)1;
-            if (nstep > (size_t)PARSE_MAX_STEP) nstep = (size_t)PARSE_MAX_STEP;
-            zgec_matcher_prefetch(m, vb, ip + nstep);
-            if (nstep != (size_t)1) zgec_matcher_prefetch(m, vb, ip + (size_t)1);
-        }
-#endif
-        uint32_t rep_len[3];
-        match = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1],
-                                      reps.rep[2], 4u, (uint32_t)(end - ip),
-                                      rep_len);
-        ll = (uint32_t)(ip - anchor);
-        if (match.length >= 4u) {
-            is_rep = (match.offset == reps.rep[0] || match.offset == reps.rep[1] ||
-                      match.offset == reps.rep[2]) ? 1u : 0u;
-            need = (is_rep != 0u) ? 4u : parse_min_norep(ip, tier);
-            if (match.length >= need) {
-                offbase = parse_offbase(match.offset, &reps);
-                cur_score = parse_score(match.length, ll, offbase,
-                                        l2tot, ll_base, ml_base, of_base,
-                                        lbar, lscale);
-                if (cur_score > 0.0) {
-                    cur_len = match.length;
-                    cur_off = match.offset;
-                }
-            }
-        }
-        /* Evaluate repeat offset candidates (offbase 1, 2, 3) directly.
-         * zgec_matcher_find selects candidates solely based on match length,
-         * discarding repeat offsets when a non-repeat match is 1 byte longer.
-         * However, repeat offsets carry 0 extra bits for offset coding, so
-         * a repeat match can yield a significantly higher parse_score (net bit
-         * savings) than a longer non-repeat match with a large offset.
-         *
-         * The lengths are the ones find's rep scan already computed and
-         * returned in rep_len[], probed with the same reps and the same
-         * cap at this exact ip, so re-scanning them here would repeat the
-         * most expensive half of that work: a slot is 0 when the rep was
-         * not probeable there or the first four bytes differed, both of
-         * which cannot clear the rlen >= 4 gate below. */
-        {
-            size_t cap = end - ip;
-            unsigned nreps = (tier == ZGEC_TIER_FAST) ? 1u : 3u;
-            for (unsigned ri = 0u; ri < nreps; ri++) {
-                uint32_t roff = reps.rep[ri];
-                if (roff != 0u && (size_t)roff <= ip && (size_t)roff <= (1u << 24)) {
-                    if (cap >= 4u && rep_len[ri] >= 4u) {
-                        /* A repeat's score is rlen * lbar minus a
-                         * non-negative sequence cost, so it can never
-                         * exceed rlen * lbar: when that does not clear
-                         * cur_score the rep cannot win and the score is
-                         * skipped rather than computed and discarded.
-                         * The test is exact, so the choice is unchanged. */
-                        if ((double)rep_len[ri] * lbar > cur_score) {
-                            uint32_t rlen = rep_len[ri];
-                            uint32_t roffbase = parse_offbase(roff, &reps);
-                            double rscore = parse_score(rlen, ll, roffbase,
-                                                        l2tot, ll_base, ml_base,
-                                                        of_base, lbar, lscale);
-                            if (rscore > cur_score) {
-                                cur_score = rscore;
-                                cur_len = rlen;
-                                cur_off = roff;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        /* Lazy evaluation at ip + 1, driven by the
-         * same price score and selected with a
-         * conditional move on the score. */
-        if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
-            cur_len <= PARSE_LAZY_MAX_LEN &&
-            tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
-            zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
-                                              (uint32_t)(end - (ip + (size_t)1)));
-            uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
-            uint32_t nis_rep = (nm.length >= 4u &&
-                                (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
-                                 nm.offset == reps.rep[2])) ? 1u : 0u;
-            uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1, tier);
-            double base = cur_score;
-            double nscore = -1.0;
-            uint32_t defer;
-            /* The lazy probe has to beat `base` to be worth deferring to,
-             * and a candidate's score never exceeds its length priced as
-             * literals, so a length that does not clear base ends the
-             * comparison before any score is computed. Exact either way:
-             * the branch below only runs when cur_len > 0, and only then
-             * is base > 0, so the -1.0 sentinel loses the same comparison
-             * the real score would. */
-            if (nm.length >= nneed && (double)nm.length * lbar > base) {
-                uint32_t noffbase = parse_offbase(nm.offset, &reps);
-                nscore = parse_score(nm.length, nll, noffbase,
-                                     l2tot, ll_base, ml_base, of_base,
-                                     lbar, lscale);
-            }
-            /* cmov-style: the score comparison feeds a
-             * 0/1 select, not a length branch. */
-            defer = (nscore > base) ? 1u : 0u;
-            if (defer != 0u) {
-                zgec_matcher_insert(m, vb, ip);
-                ip += (size_t)1;
-                continue;
-            }
-        }
-
-        if (cur_len > 0u) {
-            uint32_t ml = cur_len;
-            uint32_t off = cur_off;
-            uint8_t nb = 0;
-            /* Shared MTF update (section 8.2): encode then resolve applies
-             * the same move-to-front step the decoder performs. */
-            uint32_t ob = zgec_reps_encode(&reps, off);
-            (void)zgec_reps_resolve(&reps, ob);
-#if ZGEC_PARSE_PREFETCH
-            /* Issue the table prefetches for the insert samples and for the next
-             * position now; the sequence bookkeeping below is independent
-             * work that overlaps the misses. */
-            zgec_matcher_prefetch_match(m, vb, ip, ml);
-            zgec_matcher_prefetch(m, vb, ip + (size_t)ml);
-#endif
-
-            if (ll > 0) {
-                uint32_t u;
-                for (u = 0; u < ll; u++) lit_hist[vb[anchor + (size_t)u]]++;
-                memcpy(p->lit + p->n_lit, vb + anchor, ll);
-                p->n_lit += ll;
-                lit_total += ll;
-            }
-
-            if (p->n_seq >= seq_cap) {
-                size_t new_cap;
-                zgec_sequence *new_seq;
-                /* The doubling and the byte size are both checked: a
-                 * wrapped capacity allocates short and the writes past it
-                 * corrupt the heap. sizeof(zgec_sequence) > 1, so the
-                 * product test also rules the doubling itself out. */
-                if (parse_mul_overflows(seq_cap, 2u * sizeof(zgec_sequence))) {
-                    zgec_matcher_destroy(m);
-                    zgec_free(vb);
-                    zgec_parse_free(p);
-                    return ZGEC_ERR_NOMEM;
-                }
-                new_cap = seq_cap * 2u;
-                new_seq = (zgec_sequence *)zgec_alloc(new_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
-                if (!new_seq) {
-                    zgec_matcher_destroy(m);
-                    zgec_free(vb);
-                    zgec_parse_free(p);
-                    return ZGEC_ERR_NOMEM;
-                }
-                memcpy(new_seq, p->seq, p->n_seq * sizeof(zgec_sequence));
-                zgec_free(p->seq);
-                p->seq = new_seq;
-                seq_cap = new_cap;
-            }
-
-            p->seq[p->n_seq].ll = ll;
-            p->seq[p->n_seq].ml = ml;
-            p->seq[p->n_seq].offbase = ob;
-            p->n_seq++;
-
-            /* Fold the accepted triple into the
-             * running statistics for the price gate.
-             * Two numbers move per accepted sequence -- one histogram bin
-             * in each of the three tables and the three totals -- so that
-             * is all this updates; parse_seq_cost derives every cost from
-             * these. */
-            {
-                uint8_t c_ll_acc = zgec_seq_code_of(ll, &nb);
-                uint8_t c_ml_acc = zgec_seq_code_of(ml >= 3u ? ml - 3u : 0u, &nb);
-                uint8_t c_of_acc = zgec_seq_code_of(ob >= 1u ? ob - 1u : 0u, &nb);
-                ll_hist[c_ll_acc]++;
-                ml_hist[c_ml_acc]++;
-                of_hist[c_of_acc]++;
-                ll_tot++;
-                ml_tot++;
-                of_tot++;
-                l2tot[0] = zgec_fast_log2_u32(ll_tot + (uint32_t)ZGEC_NSYM_SEQ);
-                l2tot[1] = zgec_fast_log2_u32(ml_tot + (uint32_t)ZGEC_NSYM_SEQ);
-                l2tot[2] = zgec_fast_log2_u32(of_tot + (uint32_t)ZGEC_NSYM_SEQ);
-                ll_base[c_ll_acc] = zgec_fast_log2_u32(ll_hist[c_ll_acc] + 1u);
-                ml_base[c_ml_acc] = zgec_fast_log2_u32(ml_hist[c_ml_acc] + 1u);
-                of_base[c_of_acc] = zgec_fast_log2_u32(of_hist[c_of_acc] + 1u);
-            }
-            /* Re-estimate Lbar when the literal count has grown by a
-             * growing margin. parse_lbar walks all 256 symbols and takes
-             * two logarithms of each, so a fixed 256-literal step
-             * recomputes it thousands of times per block for a statistic
-             * that moves smoothly: on a 1 MiB block of text that was over
-             * 4000 estimates, and the estimate itself changed the parse
-             * no more than the geometric schedule below does. */
-            if (lit_total >= lit_eval + lit_step) {
-                lbar = parse_lbar(lit_hist, lit_total);
-                lit_eval = lit_total;
-                lit_step = lit_total >> 4;
-                if (lit_step < 256u) lit_step = 256u;
-            }
-
-            zgec_matcher_insert_match(m, vb, ip, ml);
-            ip += ml;
-            anchor = ip;
-        } else {
-            /* Skip schedule: visit every position on
-             * compressible data, stride out on runs
-             * of literals (section 11.3). Only
-             * visited positions are inserted. */
-            size_t step;
-            zgec_matcher_insert(m, vb, ip);
-            step = ((ip - anchor) >> shift) + (size_t)1;
-            if (step > (size_t)PARSE_MAX_STEP) step = (size_t)PARSE_MAX_STEP;
-            ip += step;
-        }
-    }
-
-    if (anchor < end) {
-        size_t tail_len = end - anchor;
-        memcpy(p->lit + p->n_lit, vb + anchor, tail_len);
-        p->n_lit += tail_len;
-    }
-
-    zgec_matcher_destroy(m);
-    zgec_free(vb);
-
-    *out = p;
     return ZGEC_OK;
 }
