@@ -143,3 +143,21 @@ Always use 256-bit AVX2 vector operations for literal copies, pattern broadcasts
 
 **Action:**
 Vectorize sub-literal prediction subtraction with 256-bit AVX2 byte operations, replace linear lane-boundary scans with monotonically advancing pointer checks, and use static 256-entry lookup tables for symbol classification.
+
+## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
+
+**Learning:**
+1. In  (), checking repeat offset candidates previously used a 32-bit compare followed by . Replacing with a single 64-bit load XOR  and branchless  for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
+2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (, ) and dual hash calculations (, ) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
+
+**Action:**
+In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and , and unroll match-interior table insertion loops for improved store pipelining.
+
+## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
+
+**Learning:**
+1. In fast_parse (src/parse.c), checking repeat offset candidates previously used a 32-bit compare followed by fast_match_len. Replacing with a single 64-bit load XOR zgec_rd64(vb + ip - r) ^ cur8 and branchless __builtin_ctzll(diff) >> 3 for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
+2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (iv0, iv1) and dual hash calculations (hs0/hl0, hs1/hl1) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
+
+**Action:**
+In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and ctzll, and unroll match-interior table insertion loops for improved store pipelining.

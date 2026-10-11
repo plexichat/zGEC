@@ -553,7 +553,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         uint32_t best_len = 0u;
         uint32_t best_off = 0u;
         uint64_t cur8 = zgec_rd64(vb + ip);
-        uint32_t cur4 = (uint32_t)cur8;
+        (void)cur8;
         uint32_t hs = fast_hash_s_v(cur8) >> sshift;
         uint32_t hl = fast_hash_l_v(cur8) >> lshift;
 #if ZGEC_FAST_PREFETCH
@@ -584,10 +584,14 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             uint32_t ri;
             for (ri = 0; ri < 3u; ri++) {
                 uint32_t r = reps.rep[ri];
-                uint32_t len;
                 if (r == 0u || (size_t)r > ip) continue;
-                if (zgec_rd32(vb + ip - r) != cur4) continue;
-                len = fast_match_len(vb, ip, r, cap);
+                uint64_t diff = zgec_rd64(vb + ip - r) ^ cur8;
+                uint32_t len;
+                if (diff != 0u) {
+                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                } else {
+                    len = 8u + fast_match_len_tail(vb + ip - r + 8u, vb + ip + 8u, cap - 8u);
+                }
                 if (len >= 4u && len > best_len) {
                     best_len = len;
                     best_off = r;
@@ -692,14 +696,31 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             seq[p->n_seq].offbase = ob;
             p->n_seq++;
 #if ZGEC_FAST_INS_ALL
-            for (ins = ip + 1u; ins + 8u <= end && ins < ip + (size_t)best_len; ins += (size_t)ZGEC_FAST_INS_STRIDE) {
-                uint64_t iv = zgec_rd64(vb + ins);
-                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
+            {
+                size_t ins_end = ip + (size_t)best_len;
+                if (ins_end + 8u > end) ins_end = (end >= 8u) ? end - 8u : 0u;
+                ins = ip + 1u;
+                for (; ins + 2u <= ins_end; ins += 2u) {
+                    uint64_t iv0 = zgec_rd64(vb + ins);
+                    uint64_t iv1 = zgec_rd64(vb + ins + 1u);
+                    uint32_t hs0 = fast_hash_s_v(iv0) >> sshift;
+                    uint32_t hl0 = fast_hash_l_v(iv0) >> lshift;
+                    uint32_t hs1 = fast_hash_s_v(iv1) >> sshift;
+                    uint32_t hl1 = fast_hash_l_v(iv1) >> lshift;
+                    ts[hs0] = (uint32_t)ins + 1u;
+                    tl[hl0] = (uint32_t)ins + 1u;
+                    ts[hs1] = (uint32_t)ins + 2u;
+                    tl[hl1] = (uint32_t)ins + 2u;
+                }
+                for (; ins < ins_end; ins++) {
+                    uint64_t iv = zgec_rd64(vb + ins);
+                    ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
 #if ZGEC_FAST_INS_LONG
-                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
+                    tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
 #endif
+                }
+                ins = ip + (size_t)best_len;
             }
-            ins = ip + (size_t)best_len;
 #else
             /* Sparse inserts inside the match: second and last position. */
             ins = ip + 1u;
