@@ -1055,21 +1055,33 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         uint32_t *h3 = hist4 + (size_t)3 * (size_t)64 * 256u;
         size_t j;
         memset(hist4, 0, 4u * hist_bytes);
-        for (j = 1; j < n_lit; j++) {
-            unsigned c0, c1, c2, c3;
-            uint32_t nxt;
-            uint8_t prev;
-            if (zgec_rs_get(runstart, j)) continue; /* own table */
-            prev = lit[j - 1];
-            nxt = (uint32_t)lit[j];
-            c0 = (unsigned)(prev & 63u);
-            c1 = (unsigned)(prev >> 2u);
-            c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
-            c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
-            h0[(size_t)c0 * 256u + nxt]++;
-            h1[(size_t)c1 * 256u + nxt]++;
-            h2[(size_t)c2 * 256u + nxt]++;
-            h3[(size_t)c3 * 256u + nxt]++;
+        if (zgec_rs_is_empty(runstart, n_lit)) {
+            for (j = 1; j < n_lit; j++) {
+                uint8_t prev = lit[j - 1];
+                uint32_t nxt = (uint32_t)lit[j];
+                unsigned c0 = (unsigned)(prev & 63u);
+                unsigned c1 = (unsigned)(prev >> 2u);
+                unsigned c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
+                unsigned c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
+                h0[(size_t)c0 * 256u + nxt]++;
+                h1[(size_t)c1 * 256u + nxt]++;
+                h2[(size_t)c2 * 256u + nxt]++;
+                h3[(size_t)c3 * 256u + nxt]++;
+            }
+        } else {
+            for (j = 1; j < n_lit; j++) {
+                if (zgec_rs_get(runstart, j)) continue; /* own table */
+                uint8_t prev = lit[j - 1];
+                uint32_t nxt = (uint32_t)lit[j];
+                unsigned c0 = (unsigned)(prev & 63u);
+                unsigned c1 = (unsigned)(prev >> 2u);
+                unsigned c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
+                unsigned c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
+                h0[(size_t)c0 * 256u + nxt]++;
+                h1[(size_t)c1 * 256u + nxt]++;
+                h2[(size_t)c2 * 256u + nxt]++;
+                h3[(size_t)c3 * 256u + nxt]++;
+            }
         }
     }
 
