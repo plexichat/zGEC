@@ -282,7 +282,29 @@ static zgec_err dec_check_dict_size(const zgec_decoder *d,
     return ZGEC_OK;
 }
 
-/* Resolve the worker count, capped at the item count and 64. */
+/* Resolve the worker count, capped at the item count and 64.
+ * S3-ser (measured): thread spawn/join plus work distribution only pay
+ * off once there is real parallel work to hand out, and item count is
+ * the reliable proxy for it. Frames of one block (sub-2 MiB inputs,
+ * which at -l 9 is a single 2 MiB block) measured T6 *slower* than T1
+ * here because the block-parallel path still creates a worker decoder
+ * and spawns one thread for one item; measured +11% (256 KiB),
+ * +4% (1 MiB), +6% (2 MiB) when the serial path is taken instead.
+ *
+ * The cut-off was tuned by measurement against silesia at -l 9. A
+ * wider cut-off (n_items < 2 * nt, the first attempt) was a clear
+ * regression: it also forced sao (4 blocks), ooffice (3) and xml (3)
+ * onto the serial path, where T6 measured 1.9-2.0x *below* the
+ * parallel path. Two blocks already amortise the spawn cost, so only
+ * the single-item case goes serial.
+ *
+ * This is the one decision point: both the block-parallel dispatch in
+ * zgec_decode_frame() and the segment-parallel dispatch in
+ * decode_compressed() reduce to it, so both stay serial by
+ * construction. It is scheduling only -- the serial and parallel paths
+ * run the same decode code on the same bytes -- so the ratio is
+ * unchanged: the fix changes when workers start, never what they
+ * compute. */
 static size_t dec_resolve_workers(const zgec_decoder *d, size_t n_items)
 {
     long long nt;
@@ -292,6 +314,7 @@ static size_t dec_resolve_workers(const zgec_decoder *d, size_t n_items)
     if (nt < 1LL) nt = 1LL;
     if (nt > (long long)ZGEC_MAX_WORKERS) nt = (long long)ZGEC_MAX_WORKERS;
     if ((uint64_t)nt > (uint64_t)n_items) nt = (long long)n_items;
+    if ((uint64_t)n_items < 2u) return 1u;
     return (size_t)nt;
 }
 
@@ -2138,7 +2161,8 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
     if (n_workers > 1u) {
         /* §10.6: the segment headers and the inheritance chain are
          * resolved serially (cheap), then Phase A of every segment
-         * runs on worker threads; Phase B stays serial below. */
+         * runs on worker threads; Phase B stays serial below. A single
+         * segment stays serial via dec_resolve_workers(). */
         e = decode_segments_parallel(ba, payload, psz, dir, sc, &bp, Ld,
                                      litref_len,
                                      params_len + (size_t)sc * 8u,
@@ -3088,11 +3112,14 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
     }
 
     /* Block-parallel decode (10.6). Falls back to the scan below when the
-     * frame carries embedded dictionaries. */
+     * frame carries embedded dictionaries, and dec_resolve_workers()
+     * already forces the serial path for single-block frames (S3-ser), so
+     * only dispatch when it grants more than one worker. Anything left
+     * with a single worker falls through to the scan, which decodes the
+     * same block with the same code. */
     if (have_footer && footer.block_count > 0u) {
-        size_t want = (d != NULL && d->limits.n_threads > 0) ? (size_t)d->limits.n_threads : (size_t)zgec_cpu_count();
-        if (want > 1u) {
-            size_t nw = dec_resolve_workers(d, (size_t)footer.block_count);
+        size_t nw = dec_resolve_workers(d, (size_t)footer.block_count);
+        if (nw > 1u) {
             int took = 0;
             err = zgec_dec_frame_blocks(d, src, src_size, &fh, &footer,
                                         scan_end, nw, &took, dst, dst_size);
