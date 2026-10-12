@@ -413,7 +413,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_SHORT_HASH_BYTES 5u
 #endif
 #ifndef ZGEC_FAST_INS_ALL
-#define ZGEC_FAST_INS_ALL 1
+#define ZGEC_FAST_INS_ALL 0
 #endif
 #ifndef ZGEC_FAST_INS_STRIDE
 #define ZGEC_FAST_INS_STRIDE 1
@@ -463,6 +463,36 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #ifndef ZGEC_FAST_LAZY_LONG_ONLY
 #define ZGEC_FAST_LAZY_LONG_ONLY 1
 #endif
+/* Table entries pack the position in the low 24 bits and a per-block
+ * generation in the high 8. The P24 contract (vb_size <= 2^24, enforced by
+ * zgec_parse_block_ex before the parse runs) makes the position field exact,
+ * so the generation is free to serve as the validity tag: an entry left by an
+ * earlier block reads as empty. The two 1 MiB tables therefore no longer need
+ * a memset per block -- they are cleared only when the generation wraps, i.e.
+ * once every 255 blocks -- which removes about one byte of clearing per input
+ * byte at the 2 MiB presets. With ZGEC_FAST_GEN=0 the tables are cleared every
+ * block and the tag is pinned to 1, which reproduces the pre-tag parse. */
+#ifndef ZGEC_FAST_GEN
+#define ZGEC_FAST_GEN 1
+#endif
+/* Carry the long table's candidate for the next visited position across the
+ * loop, as zstd's dfast does: the hash and the table load for that position
+ * are issued an iteration before the compare that consumes them, so the miss
+ * overlaps this position's rep and candidate compares. The carried value is
+ * kept equal to what a fresh load would return (see the store site). */
+#ifndef ZGEC_FAST_PIPE
+#define ZGEC_FAST_PIPE 1
+#endif
+/* Probe only the first repeat offset, as zstd's dfast does, instead of the
+ * whole three-deep chain. */
+#ifndef ZGEC_FAST_ONEREP
+#define ZGEC_FAST_ONEREP 1
+#endif
+/* Extend an accepted match backwards into the pending literals while the byte
+ * before it still agrees, as zstd's dfast and lazy accept paths do. */
+#ifndef ZGEC_FAST_BACKEXT
+#define ZGEC_FAST_BACKEXT 1
+#endif
 #ifndef ZGEC_FAST_BITS_MIN
 #define ZGEC_FAST_BITS_MIN 10u
 #endif
@@ -505,6 +535,24 @@ static inline uint32_t fast_hash_s_v(uint64_t v)
 static inline uint32_t fast_hash_l_v(uint64_t v)
 {
     return (uint32_t)((v * 0xD6E8FEB86659FD93ULL) >> (64u - ZGEC_FAST_LONG_BITS));
+}
+
+/* Entry packing for the two fast-tier tables. See the ZGEC_FAST_GEN comment. */
+static ZGEC_ENC_TLS unsigned fast_scratch_gen;
+
+static inline uint32_t fast_pack(uint32_t gen, size_t pos)
+{
+    return (gen << 24) | (uint32_t)pos;
+}
+
+static inline int fast_live(uint32_t e, uint32_t gen)
+{
+    return (e >> 24) == gen;
+}
+
+static inline size_t fast_pos_of(uint32_t e)
+{
+    return (size_t)(e & 0xFFFFFFu);
 }
 
 
@@ -550,6 +598,12 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     unsigned fbits = fast_table_bits(end - prefix);
     unsigned sshift = (unsigned)ZGEC_FAST_SHORT_BITS - fbits;
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
+    uint32_t gen = 1u;      /* validity tag written into every entry */
+#if ZGEC_FAST_PIPE
+    size_t pipe_ip = (size_t)-1; /* position the carried candidate belongs to */
+    uint32_t pipe_hl = 0u;
+    uint32_t pipe_cl = 0u;
+#endif
 
     int ts_owned = 0;
     if (fbits <= ZGEC_FAST_SCRATCH_BITS) {
@@ -567,14 +621,32 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         zgec_free(seq);
         return ZGEC_ERR_NOMEM;
     }
+#if ZGEC_FAST_GEN
+    if (ts_owned) {
+        /* A fresh allocation is not zeroed, so clear it and pin the tag. */
+        memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
+        memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
+        gen = 1u;
+    } else {
+        /* Scratch tables: bump the tag, clearing only when it wraps. */
+        gen = (fast_scratch_gen % 255u) + 1u;
+        if (gen == 1u) {
+            memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
+            memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
+        }
+        fast_scratch_gen = gen;
+    }
+#else
     memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
     memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
+    gen = 1u;
+#endif
 
     /* Seed the tables with the dictionary / literal-reference prefix, sparsely. */
     for (pos = 0; pos + 8u <= prefix; pos += 4u) {
         uint64_t sv = zgec_rd64(vb + pos);
-        ts[fast_hash_s_v(sv) >> sshift] = (uint32_t)pos + 1u;
-        tl[fast_hash_l_v(sv) >> lshift] = (uint32_t)pos + 1u;
+        ts[fast_hash_s_v(sv) >> sshift] = fast_pack(gen, pos);
+        tl[fast_hash_l_v(sv) >> lshift] = fast_pack(gen, pos);
     }
 
     zgec_reps_init(&reps);
@@ -589,7 +661,20 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         uint64_t cur8 = zgec_rd64(vb + ip);
         (void)cur8;
         uint32_t hs = fast_hash_s_v(cur8) >> sshift;
-        uint32_t hl = fast_hash_l_v(cur8) >> lshift;
+        uint32_t hl;
+        uint32_t cl;
+#if ZGEC_FAST_PIPE
+        if (pipe_ip == ip) {
+            hl = pipe_hl;
+            cl = pipe_cl;
+        } else {
+            hl = fast_hash_l_v(cur8) >> lshift;
+            cl = tl[hl];
+        }
+#else
+        hl = fast_hash_l_v(cur8) >> lshift;
+        cl = tl[hl];
+#endif
 #if ZGEC_FAST_PREFETCH
         {
             /* Prefetch the buckets of the position the skip schedule visits
@@ -604,9 +689,21 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         }
 #endif
         uint32_t cs = ts[hs];
-        uint32_t cl = tl[hl];
         size_t cap = end - ip;
-        size_t step;
+        size_t step = ((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u;
+#if ZGEC_FAST_PIPE
+        {
+            size_t pnext = ip + step;
+            if (pnext + 8u <= end) {
+                uint64_t nv = zgec_rd64(vb + pnext);
+                pipe_hl = fast_hash_l_v(nv) >> lshift;
+                pipe_cl = tl[pipe_hl];
+                pipe_ip = pnext;
+            } else {
+                pipe_ip = (size_t)-1;
+            }
+        }
+#endif
 
         /* 1. Repeat offsets rep0, rep1, rep2 (4-byte minimum). Probing the
          * whole chain costs two extra 4-byte compares on the common path and
@@ -618,6 +715,8 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             uint32_t r0 = reps.rep[0];
             uint32_t r1 = reps.rep[1];
             uint32_t r2 = reps.rep[2];
+            (void)r1;
+            (void)r2;
 
             if (r0 != 0u && (size_t)r0 <= ip) {
                 uint64_t diff = zgec_rd64(vb + ip - r0) ^ cur8;
@@ -632,6 +731,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     best_off = r0;
                 }
             }
+#if !ZGEC_FAST_ONEREP
             if (r1 != 0u && r1 != r0 && (size_t)r1 <= ip) {
                 uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
                 uint32_t len;
@@ -658,15 +758,16 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     best_off = r2;
                 }
             }
+#endif
         }
 
         /* 2 & 3. Table probes (short table cs and long table cl).
          * When cs == cl, both tables point to the same candidate position,
          * so a single combined probe evaluates both 5-byte short and 8-byte
          * long match criteria without re-reading memory or re-calculating tail lengths. */
-        if (cs == cl) {
-            if (cl != 0u && (size_t)(cl - 1u) < ip) {
-                size_t d = ip - (size_t)(cl - 1u);
+        if (cs == cl && fast_live(cl, gen)) {
+            if (fast_pos_of(cl) < ip) {
+                size_t d = ip - fast_pos_of(cl);
                 if (d != (size_t)best_off && (best_len == 0u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len]))) {
                     uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
                     if (diff == 0u) {
@@ -686,8 +787,8 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             }
         } else {
             /* 2. Long table (8-byte hash, minimum length 8). */
-            if (cl != 0u && (size_t)(cl - 1u) < ip) {
-                size_t d = ip - (size_t)(cl - 1u);
+            if (fast_live(cl, gen) && fast_pos_of(cl) < ip) {
+                size_t d = ip - fast_pos_of(cl);
                 if (d != (size_t)best_off) {
                     uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
                     if (diff == 0u) {
@@ -702,8 +803,8 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 }
             }
             /* 3. Short table (5-byte hash, minimum length 5). */
-            if (cs != 0u && (size_t)(cs - 1u) < ip) {
-                size_t d = ip - (size_t)(cs - 1u);
+            if (fast_live(cs, gen) && fast_pos_of(cs) < ip) {
+                size_t d = ip - fast_pos_of(cs);
                 if (d != (size_t)best_off && (best_len == 0u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len]))) {
                     uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
                     if (diff != 0u) {
@@ -723,8 +824,13 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             }
         }
         /* Insert the visited position. */
-        ts[hs] = (uint32_t)ip + 1u;
-        tl[hl] = (uint32_t)ip + 1u;
+        ts[hs] = fast_pack(gen, ip);
+        tl[hl] = fast_pack(gen, ip);
+#if ZGEC_FAST_PIPE
+        /* The lookahead read above may have taken this very bucket before the
+         * store; the carried value must agree with a fresh load. */
+        if (pipe_ip != (size_t)-1 && pipe_hl == hl) pipe_cl = fast_pack(gen, ip);
+#endif
 
 #if ZGEC_FAST_LAZY
         if (best_len >= 4u && best_len < ZGEC_FAST_LAZY_MAX && ip + 9u <= end) {
@@ -734,8 +840,8 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             uint32_t l1 = 0u;
             uint64_t v1 = zgec_rd64(vb + p1);
             uint32_t c1 = tl[fast_hash_l_v(v1) >> lshift];
-            if (c1 != 0u && (size_t)(c1 - 1u) < p1) {
-                size_t d1 = p1 - (size_t)(c1 - 1u);
+            if (fast_live(c1, gen) && fast_pos_of(c1) < p1) {
+                size_t d1 = p1 - fast_pos_of(c1);
                 uint64_t diff1 = zgec_rd64(vb + p1 - d1) ^ v1;
                 if (diff1 == 0u) {
                     uint32_t len1 = 8u + fast_match_len_tail(vb + p1 - d1 + 8u, vb + p1 + 8u, end - p1 - 8u);
@@ -744,8 +850,8 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             }
 #if !ZGEC_FAST_LAZY_LONG_ONLY
             c1 = ts[fast_hash_s_v(v1) >> sshift];
-            if (c1 != 0u && (size_t)(c1 - 1u) < p1) {
-                size_t d1 = p1 - (size_t)(c1 - 1u);
+            if (fast_live(c1, gen) && fast_pos_of(c1) < p1) {
+                size_t d1 = p1 - fast_pos_of(c1);
                 uint64_t diff1 = zgec_rd64(vb + p1 - d1) ^ v1;
                 if (diff1 != 0u) {
                     uint32_t len1 = (uint32_t)((unsigned)__builtin_ctzll(diff1) >> 3);
@@ -763,9 +869,24 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         }
 #endif
         if (best_len >= 4u) {
+#if ZGEC_FAST_BACKEXT
+            /* Extend the match backwards into the pending literals while the
+             * byte before the match still agrees, as zstd's dfast and lazy
+             * accept paths do. The match end does not move, so the offset
+             * stays valid and the sequence only sheds literals. */
+            while (ip > anchor && (size_t)best_off <= ip &&
+                   vb[ip - 1u] == vb[ip - (size_t)best_off - 1u]) {
+                ip--;
+                best_len++;
+            }
+#endif
+#if ZGEC_FAST_PIPE
+            /* An accepted match jumps ip and rewrites the tables below, so the
+             * carried candidate is no longer what a fresh load would return. */
+            pipe_ip = (size_t)-1;
+#endif
             uint32_t ll = (uint32_t)(ip - anchor);
             uint32_t ob = zgec_reps_encode(&reps, best_off);
-            size_t ins;
             (void)zgec_reps_resolve(&reps, ob);
             if (ll > 0u) {
                 memcpy(p->lit + p->n_lit, vb + anchor, ll);
@@ -789,6 +910,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             p->n_seq++;
 #if ZGEC_FAST_INS_ALL
             {
+                size_t ins;
                 size_t ins_end = ip + (size_t)best_len;
                 if (ins_end + 8u > end) ins_end = (end >= 8u) ? end - 8u : 0u;
 #if ZGEC_FAST_INS_SPAN > 0u
@@ -803,37 +925,48 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     uint32_t hl0 = fast_hash_l_v(iv0) >> lshift;
                     uint32_t hs1 = fast_hash_s_v(iv1) >> sshift;
                     uint32_t hl1 = fast_hash_l_v(iv1) >> lshift;
-                    ts[hs0] = (uint32_t)ins + 1u;
+                    ts[hs0] = fast_pack(gen, ins);
 #if ZGEC_FAST_INS_LONG
-                    tl[hl0] = (uint32_t)ins + 1u;
+                    tl[hl0] = fast_pack(gen, ins);
 #endif
-                    ts[hs1] = (uint32_t)ins + 2u;
+                    ts[hs1] = fast_pack(gen, ins + 1u);
 #if ZGEC_FAST_INS_LONG
-                    tl[hl1] = (uint32_t)ins + 2u;
+                    tl[hl1] = fast_pack(gen, ins + 1u);
 #endif
                 }
                 for (; ins < ins_end; ins++) {
                     uint64_t iv = zgec_rd64(vb + ins);
-                    ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
+                    ts[fast_hash_s_v(iv) >> sshift] = fast_pack(gen, ins);
 #if ZGEC_FAST_INS_LONG
-                    tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
+                    tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, ins);
 #endif
                 }
                 ins = ip + (size_t)best_len;
             }
 #else
-            /* Sparse inserts inside the match: second and last position. */
-            ins = ip + 1u;
-            if (ins + 8u <= end) {
-                uint64_t iv = zgec_rd64(vb + ins);
-                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
-                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
-            }
-            ins = ip + (size_t)best_len - 1u;
-            if (ins + 8u <= end) {
-                uint64_t iv = zgec_rd64(vb + ins);
-                ts[fast_hash_s_v(iv) >> sshift] = (uint32_t)ins + 1u;
-                tl[fast_hash_l_v(iv) >> lshift] = (uint32_t)ins + 1u;
+            /* Sparse inserts inside the match, mirroring zstd's dfast accept
+             * path: four positions at fixed offsets, constant work per
+             * sequence instead of the O(best_len) walk above. The position two
+             * past the match start goes into both tables, and the last two
+             * positions into the table whose key can still reach them. */
+            {
+                size_t i2 = ip + 2u;
+                size_t ie = ip + (size_t)best_len;
+                if (i2 + 8u <= end) {
+                    uint64_t iv = zgec_rd64(vb + i2);
+                    ts[fast_hash_s_v(iv) >> sshift] = fast_pack(gen, i2);
+                    tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i2);
+                }
+                if (ie >= 2u && ie - 2u + 8u <= end) {
+                    size_t i1 = ie - 2u;
+                    uint64_t iv = zgec_rd64(vb + i1);
+                    tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i1);
+                }
+                if (ie >= 1u && ie - 1u + 8u <= end) {
+                    size_t i1 = ie - 1u;
+                    uint64_t iv = zgec_rd64(vb + i1);
+                    ts[fast_hash_s_v(iv) >> sshift] = fast_pack(gen, i1);
+                }
             }
 #endif
             ip += best_len;
