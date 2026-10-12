@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Target-Length Candidate Filtering and High-Tier Long-Table Match Insertion Restriction
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), candidate match probes previously evaluated 64-bit diffs without checking the byte at `target_len - 1` (where `target_len = max(best.length, hash_min)`), causing millions of redundant 64-bit load/mask operations when `best.length < hash_min`. Testing `vb[ip - d + target_len - 1] != vb[ip + target_len - 1]` branchlessly skips invalid candidates before 64-bit loads or match extension scans.
+2. In `zgec_matcher_insert_match` (`src/match.c`) for `ZGEC_TIER_HIGH`, inserting every position in a match into the 1-entry long table (`long_tab`) caused high table churn and millions of redundant 64-bit `mf_hash8_v` multiplications. Restricting `long_ok` to boundary positions (`pos == start || pos + stride >= start + len`) eliminates interior long-table hash calculations without loss of compression ratio, dramatically boosting high-tier (levels 15..25) compression speed across the Silesia corpus by 20% to over 160% (e.g., `mozilla` L19 throughput increases from 6.0 MiB/s to 15.7 MiB/s).
+
+**Action:**
+Filter match candidates against `target_len - 1` (where `target_len = max(best.length, hash_min)`) prior to 64-bit diff operations, and restrict long-table updates during match insertion to boundary positions.

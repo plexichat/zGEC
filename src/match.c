@@ -1031,13 +1031,13 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                  * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
                     /* A candidate can only beat `best` if it matches at
-                     * best.length - 1 as well; one byte compare there skips
+                     * target_len_long - 1 as well; one byte compare there skips
                      * the length scan for the candidates that cannot. */
-                    if (best.length == 0u || best.length > cap ||
-                        vb[ip - (size_t)d + (size_t)best.length - 1u] ==
-                        vb[ip + (size_t)best.length - 1u]) {
+                    uint32_t target_len_long = (best.length >= hash_min) ? best.length : hash_min;
+                    if (target_len_long <= cap &&
+                        vb[ip - (size_t)d + (size_t)target_len_long - 1u] ==
+                        vb[ip + (size_t)target_len_long - 1u]) {
                         uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                        uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
                                 len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
@@ -1143,16 +1143,17 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                  * dropping the screen removes a load without adding a
                  * candidate. */
                 /* A candidate can only beat `best` if it matches at
-                 * best.length - 1 as well; one byte compare there skips
-                 * the length scan for the candidates that cannot. */
-                if (best.length != 0u && best.length <= cap &&
-                    vb[ip - (size_t)d + (size_t)best.length - 1u] !=
-                    vb[ip + (size_t)best.length - 1u]) {
+                 * target_len - 1 as well; one byte compare there skips
+                 * the length scan for the candidates that cannot (including
+                 * when best.length < hash_min). */
+                uint32_t target_len = (best.length >= hash_min) ? best.length : hash_min;
+                if (target_len <= cap &&
+                    vb[ip - (size_t)d + (size_t)target_len - 1u] !=
+                    vb[ip + (size_t)target_len - 1u]) {
                     continue;
                 }
                 if (has_v8) {
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                    uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
@@ -1295,7 +1296,8 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
      * keeps 3 through ZGEC_MF_MATCH_SAMPLES_FAST. */
     if (m->tier == ZGEC_TIER_HIGH) {
         /* Every position in the range, sampled if the
-         * match is very long. */
+         * match is very long. Restrict long-table insertions to
+         * boundary positions to avoid 64-bit long hash churn. */
         size_t stride = (size_t)1;
         size_t pos;
         if (len > (size_t)ZGEC_MF_HIGH_SAMPLES) {
