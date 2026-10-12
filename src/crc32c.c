@@ -155,9 +155,20 @@ __attribute__((target("sse4.2")))
 static uint32_t zgec_crc32c_hw(uint32_t crc, const uint8_t *p, size_t len)
 {
     crc = ~crc;
+    while (len >= 32) {
+        uint64_t v0 = zgec_rd64(p);
+        uint64_t v1 = zgec_rd64(p + 8);
+        uint64_t v2 = zgec_rd64(p + 16);
+        uint64_t v3 = zgec_rd64(p + 24);
+        crc = (uint32_t)_mm_crc32_u64(crc, v0);
+        crc = (uint32_t)_mm_crc32_u64(crc, v1);
+        crc = (uint32_t)_mm_crc32_u64(crc, v2);
+        crc = (uint32_t)_mm_crc32_u64(crc, v3);
+        p += 32;
+        len -= 32;
+    }
     while (len >= 8) {
-        uint64_t v;
-        memcpy(&v, p, 8);
+        uint64_t v = zgec_rd64(p);
         crc = (uint32_t)_mm_crc32_u64(crc, v);
         p += 8;
         len -= 8;

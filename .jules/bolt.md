@@ -190,3 +190,14 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Decompression Hot Path SIMD Vectorization and Unrolled Hardware CRC32C
+
+**Learning:**
+1. In `seq_decode_cond` (`src/decode.c`), match length classification previously evaluated `zgec_mlclass` sequentially per sequence element. Vectorizing 8 elements at a time with 256-bit AVX2 SIMD (`_mm256_cmpgt_epi32` and byte shuffles) computes `clsbuf` in parallel.
+2. In `exec_literals_plain` (`src/decode.c`), tail literal copies near buffer boundaries previously used `memcpy`. Vectorizing with AVX2 (`_mm256_loadu_si256`/`_mm256_storeu_si256`) and SSE (`_mm_loadu_si128`/`_mm_storeu_si128`) eliminates standard library function call overhead.
+3. In `exec_literals_sub` (`src/decode.c`), sub-literal prediction residual addition was accelerated with 128-bit SIMD (`_mm_add_epi8`) when `rep0 >= 16`.
+4. In `zgec_crc32c_hw` (`src/crc32c.c`), unrolling 64-bit hardware CRC32C instructions 4-wide (32 bytes per loop iteration) reduces loop branch overhead during block validation.
+
+**Action:**
+In decoders, use AVX2 vector comparisons and shuffle intrinsics for sequence classification, vectorize tail literal transfers with direct SIMD loads/stores, and unroll hardware CRC loops 4-wide.
