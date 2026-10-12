@@ -1,4 +1,4 @@
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_rans.h"
@@ -7,10 +7,6 @@
 
 #include <stdlib.h>
 #include <string.h>
-
-#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
 
 /* ---- context mode validation (Annex C) ----
  *
@@ -417,7 +413,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     size_t words_cap = n_lit;
     uint16_t *words = (uint16_t *)zgec_alloc(words_cap * sizeof(uint16_t), 64);
     if (!words) return 0;
-    size_t nwords = 0;
+    size_t nw = 0;
 
     uint32_t state[8];
     for (unsigned lane = 0; lane < 8; lane++) state[lane] = ZGEC_RANS_STATE_MIN;
@@ -441,14 +437,14 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 size_t j2 = start[2] + round;
                 size_t j1 = start[1] + round;
                 size_t j0 = start[0] + round;
-                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
+                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nw, words_cap) != 0) {
                     zgec_free(words);
                     return 0;
                 }
@@ -458,7 +454,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     if (round >= len[lane]) continue;
                     j = start[lane] + round;
                     uint8_t s = Z[j];
-                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nw, words_cap) != 0) {
                         zgec_free(words);
                         return 0;
                     }
@@ -484,13 +480,14 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
                 const zgec_rans_enc_table *tab = &tables[table_idx];
                 uint8_t s = Z[j];
-                if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nw, words_cap) != 0) {
                     zgec_free(words);
                     return 0;
                 }
             }
         }
     }
+    size_t nwords = nw;
 
     /* Size the whole result -- header plus words -- before writing any of
      * it, so a capacity failure leaves the caller's buffer untouched. The
@@ -624,9 +621,36 @@ zgec_err zgec_rans_normalise(int16_t *counts, const uint32_t *hist)
     if (counts == NULL || hist == NULL) return ZGEC_ERR_INVAL;
     uint64_t total = 0;
     int non_zero = 0;
-    for (int s = 0; s < ZGEC_NSYM_LIT; s++) {
-        total += hist[s];
-        if (hist[s] > 0) non_zero++;
+    int idx_s = 0;
+#if defined(__AVX2__)
+    __m256i vzero = _mm256_setzero_si256();
+    __m256i vsum = _mm256_setzero_si256();
+    __m256i vnz_count = _mm256_setzero_si256();
+    __m256i v1 = _mm256_set1_epi32(1);
+
+    for (; idx_s + 8 <= ZGEC_NSYM_LIT; idx_s += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + idx_s));
+        vsum = _mm256_add_epi32(vsum, v);
+        __m256i vgt = _mm256_cmpgt_epi32(v, vzero);
+        vnz_count = _mm256_add_epi32(vnz_count, _mm256_and_si256(vgt, v1));
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+
+    __m128i vnz_low = _mm256_castsi256_si128(vnz_count);
+    __m128i vnz_high = _mm256_extracti128_si256(vnz_count, 1);
+    vnz_low = _mm_add_epi32(vnz_low, vnz_high);
+    vnz_low = _mm_hadd_epi32(vnz_low, vnz_low);
+    vnz_low = _mm_hadd_epi32(vnz_low, vnz_low);
+    non_zero = _mm_cvtsi128_si32(vnz_low);
+#endif
+    for (; idx_s < ZGEC_NSYM_LIT; idx_s++) {
+        total += hist[idx_s];
+        if (hist[idx_s] > 0) non_zero++;
     }
     if (total == 0) {
         /* No information at all: spread M uniformly over the alphabet.

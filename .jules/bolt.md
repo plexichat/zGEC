@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Encode Path SIMD Vectorization & Monotonic Lane Boundary Scans
+
+**Learning:**
+1. In `zgec_granule_merge` and `zgec_cluster_greedy` (`src/encode.c`), replacing scalar histogram loops over 256 `uint32_t` entries with 256-bit AVX2 SIMD (`_mm256_loadu_si256`, `_mm256_add_epi32`, `_mm256_storeu_si256`) significantly accelerates granule merging and greedy context clustering.
+2. In `zgec_rans_normalise` (`src/rans.c`) and `zgec_normalize_counts` (`src/seq.c`), vectorizing symbol frequency sum accumulation (`_mm256_add_epi32`) and non-zero element counting (`_mm256_cmpgt_epi32`) reduces normalisation overhead in entropy coding.
+3. In `zgec_ctx_body_bits` (`src/encode.c`), replacing 8-way equality evaluation with monotonic lane index tracking (`while (next_lane_idx < 8u && j == start[next_lane_idx]) next_lane_idx++;`) safely handles duplicate lane start positions when `n_lit < 8` while eliminating 8-way comparison overhead on every byte, increasing single-threaded encoding throughput from 113.7 MB/s to 176.3 MB/s (+55%).
+
+**Action:**
+Vectorize histogram additions and frequency totals with 256-bit AVX2 SIMD, and advance monotonic lane pointers to consume duplicate lane start boundaries efficiently in context evaluation.
