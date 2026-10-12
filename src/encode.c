@@ -2807,6 +2807,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                             uint32_t block_index,
                             const uint8_t *dict, size_t dict_size,
                             const uint8_t *litref, size_t litref_size,
+                            int seg_threads,
                             zgec_block_result *res)
 {
     zgec_parse *parse = NULL;
@@ -3239,7 +3240,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         sp.seg_sizes = seg_sizes;
         sp.errs = seg_errs;
 
-        zgec_enc_parallel_for(params.n_threads, n_segments, zgec_enc_seg_job, &sp);
+        zgec_enc_parallel_for(seg_threads, n_segments, zgec_enc_seg_job, &sp);
 
         for (s = 0; s < n_segments; s++) {
             if (seg_errs[s] != ZGEC_OK) {
@@ -3326,7 +3327,8 @@ static zgec_err zgec_encode_block_ex(zgec_encoder *e,
     if (segment_count) *segment_count = 0;
     if (filtered_out) *filtered_out = 0;
     err = zgec_encode_block_full(e, src, raw_size, block_index, dict,
-                                 dict_size, NULL, 0, &r);
+                                 dict_size, NULL, 0,
+                                 e->params.n_threads, &r);
     if (err != ZGEC_OK) return err;
     zgec_free(r.lit);
     *dst = r.payload;
@@ -3521,12 +3523,19 @@ typedef struct {
 typedef struct {
     zgec_encoder      *e;
     zgec_enc_blockjob *jobs;
+    size_t             n_blocks;
 } zgec_enc_blockpass;
 
 static void zgec_enc_block_phaseA(void *ctx, size_t i)
 {
     zgec_enc_blockpass *bp = (zgec_enc_blockpass *)ctx;
     zgec_enc_blockjob *j = &bp->jobs[i];
+    /* Segment threading budget: this pass is already parallel across blocks,
+     * so nesting a full-width segment pool inside every block worker would
+     * spawn n_threads^2 threads and oversubscribe the machine. Spend the
+     * segment budget only when there is a single block and the block-level
+     * pool therefore has nothing to distribute. */
+    int seg_threads = (bp->n_blocks > 1u) ? 1 : bp->e->params.n_threads;
     j->err = ZGEC_OK;
     if (j->raw_size > 0 && zgec_enc_all_same_byte(j->src, j->raw_size)) {
         uint8_t *rp = (uint8_t *)zgec_alloc(1, 1);
@@ -3542,7 +3551,8 @@ static void zgec_enc_block_phaseA(void *ctx, size_t i)
     }
     j->kind = ZGEC_REC_COMPRESSED;
     j->err = zgec_encode_block_full(bp->e, j->src, j->raw_size, j->index,
-                                    j->dict, j->dict_len, NULL, 0, &j->r);
+                                    j->dict, j->dict_len, NULL, 0,
+                                    seg_threads, &j->r);
 }
 
 /* External-dictionary pass (5.8): best of {none, each registered dict}
@@ -3970,6 +3980,7 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
         zgec_enc_blockpass bpx;
         bpx.e = e;
         bpx.jobs = jobs;
+        bpx.n_blocks = n_blocks;
         zgec_enc_parallel_for(params.n_threads, n_blocks,
                               zgec_enc_block_phaseA, &bpx);
     }
@@ -4092,7 +4103,8 @@ zgec_err zgec_encode_frame(zgec_encoder *e,
             if (lr_region_len > 0 && lr_use_ptr && !r0.filtered) {
                 err = zgec_encode_block_full(e, jobs[i].src, bs, (uint32_t)i,
                                              jobs[i].dict, jobs[i].dict_len,
-                                             lr_use_ptr, lr_region_len, &r1);
+                                             lr_use_ptr, lr_region_len,
+                                             1, &r1);
                 if (err != ZGEC_OK) {
                     zgec_free(r0.payload);
                     zgec_free(r0.lit);

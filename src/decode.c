@@ -3668,14 +3668,22 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
     }
 
     /* Block-parallel decode (10.6). Falls back to the scan below when the
-     * frame carries embedded dictionaries, and dec_resolve_workers()
-     * already forces the serial path for single-block frames (S3-ser), so
-     * only dispatch when it grants more than one worker. Anything left
-     * with a single worker falls through to the scan, which decodes the
-     * same block with the same code. */
+     * frame carries embedded dictionaries. Dispatch is gated on the
+     * *requested* thread count rather than the workers dec_resolve_workers()
+     * grants, because it clamps to the block count: gating on the granted
+     * count sends every single-block frame down the serial scan even when
+     * the caller asked for many threads, and leaves the segment-parallel
+     * inner pass in zgec_dec_frame_blocks (n_blocks < n_threads) with no
+     * frame that can reach it. The block loop below still runs one worker
+     * per block; the surplus threads become that block's segment workers,
+     * and anything left with a single worker decodes the same block with
+     * the same code. */
     if (have_footer && footer.block_count > 0u) {
+        size_t want = (d != NULL && d->limits.n_threads > 0)
+                          ? (size_t)d->limits.n_threads
+                          : (size_t)zgec_cpu_count();
         size_t nw = dec_resolve_workers(d, (size_t)footer.block_count);
-        if (nw > 1u) {
+        if (want > 1u) {
             int took = 0;
             err = zgec_dec_frame_blocks(d, src, src_size, &fh, &footer,
                                         scan_end, nw, &took, dst, dst_size);

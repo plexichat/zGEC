@@ -1037,12 +1037,26 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         vb[ip - (size_t)d + (size_t)best.length - 1u] ==
                         vb[ip + (size_t)best.length - 1u]) {
                         uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                        len = (diff == 0u)
-                                  ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
-                                  : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                        if (len >= hash_min) {
-                            mf_update_best(d, len, &best, rep0, rep1, rep2,
-                                           &best_is_rep);
+                        uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
+                        if (target_len_long >= 8u) {
+                            if (diff == 0u) {
+                                len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                                if (len >= hash_min) {
+                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                   &best_is_rep);
+                                }
+                            }
+                        } else {
+                            uint64_t diff_mask = (1ULL << (target_len_long * 8u)) - 1ULL;
+                            if ((diff & diff_mask) == 0u) {
+                                len = (diff == 0u)
+                                          ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                                          : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                                if (len >= hash_min) {
+                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                   &best_is_rep);
+                                }
+                            }
                         }
                     }
                 }
@@ -1138,9 +1152,17 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 }
                 if (has_v8) {
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                    len = (diff == 0u)
-                              ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
-                              : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                    uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
+                    if (target_len >= 8u) {
+                        if (diff != 0u) continue;
+                        len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                    } else {
+                        uint64_t diff_mask = (1ULL << (target_len * 8u)) - 1ULL;
+                        if ((diff & diff_mask) != 0u) continue;
+                        len = (diff == 0u)
+                                  ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                                  : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                    }
                 } else {
                     /* No 8-byte window here -- v8 is the zero
                      * placeholder, not eight readable bytes -- so the

@@ -615,53 +615,109 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
          * many times. The move-to-front update below keeps the chain in step
          * with the decoder exactly as the main tier's matcher does. */
         {
-            uint32_t ri;
-            for (ri = 0; ri < 3u; ri++) {
-                uint32_t r = reps.rep[ri];
-                if (r == 0u || (size_t)r > ip) continue;
-                uint64_t diff = zgec_rd64(vb + ip - r) ^ cur8;
+            uint32_t r0 = reps.rep[0];
+            uint32_t r1 = reps.rep[1];
+            uint32_t r2 = reps.rep[2];
+
+            if (r0 != 0u && (size_t)r0 <= ip) {
+                uint64_t diff = zgec_rd64(vb + ip - r0) ^ cur8;
                 uint32_t len;
                 if (diff != 0u) {
                     len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
                 } else {
-                    len = 8u + fast_match_len_tail(vb + ip - r + 8u, vb + ip + 8u, cap - 8u);
+                    len = 8u + fast_match_len_tail(vb + ip - r0 + 8u, vb + ip + 8u, cap - 8u);
                 }
                 if (len >= 4u && len > best_len) {
                     best_len = len;
-                    best_off = r;
+                    best_off = r0;
                 }
             }
-        }
-        /* 2. Long table (8-byte hash, minimum length 8). */
-        if (cl != 0u && (size_t)(cl - 1u) < ip) {
-            size_t d = ip - (size_t)(cl - 1u);
-            uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
-            if (diff == 0u) {
-                if (best_len <= 8u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len])) {
-                    uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
-                    if (len > best_len) {
-                        best_len = len;
-                        best_off = (uint32_t)d;
-                    }
-                }
-            }
-        }
-        /* 3. Short table (5-byte hash, minimum length 5). */
-        if (cs != 0u && (size_t)(cs - 1u) < ip) {
-            size_t d = ip - (size_t)(cs - 1u);
-            if (best_len == 0u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len])) {
-                uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
+            if (r1 != 0u && r1 != r0 && (size_t)r1 <= ip) {
+                uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
+                uint32_t len;
                 if (diff != 0u) {
-                    uint32_t len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                    if (len >= ZGEC_FAST_MIN_SHORT && len > best_len) {
-                        best_len = len;
-                        best_off = (uint32_t)d;
-                    }
+                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
                 } else {
-                    uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
-                    if (len > best_len) {
-                        best_len = len;
-                        best_off = (uint32_t)d;
+                    len = 8u + fast_match_len_tail(vb + ip - r1 + 8u, vb + ip + 8u, cap - 8u);
+                }
+                if (len >= 4u && len > best_len) {
+                    best_len = len;
+                    best_off = r1;
+                }
+            }
+            if (r2 != 0u && r2 != r0 && r2 != r1 && (size_t)r2 <= ip) {
+                uint64_t diff = zgec_rd64(vb + ip - r2) ^ cur8;
+                uint32_t len;
+                if (diff != 0u) {
+                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                } else {
+                    len = 8u + fast_match_len_tail(vb + ip - r2 + 8u, vb + ip + 8u, cap - 8u);
+                }
+                if (len >= 4u && len > best_len) {
+                    best_len = len;
+                    best_off = r2;
+                }
+            }
+        }
+
+        /* 2 & 3. Table probes (short table cs and long table cl).
+         * When cs == cl, both tables point to the same candidate position,
+         * so a single combined probe evaluates both 5-byte short and 8-byte
+         * long match criteria without re-reading memory or re-calculating tail lengths. */
+        if (cs == cl) {
+            if (cl != 0u && (size_t)(cl - 1u) < ip) {
+                size_t d = ip - (size_t)(cl - 1u);
+                if (d != (size_t)best_off && (best_len == 0u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len]))) {
+                    uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
+                    if (diff == 0u) {
+                        uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                        if (len > best_len) {
+                            best_len = len;
+                            best_off = (uint32_t)d;
+                        }
+                    } else {
+                        uint32_t len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                        if (len >= ZGEC_FAST_MIN_SHORT && len > best_len) {
+                            best_len = len;
+                            best_off = (uint32_t)d;
+                        }
+                    }
+                }
+            }
+        } else {
+            /* 2. Long table (8-byte hash, minimum length 8). */
+            if (cl != 0u && (size_t)(cl - 1u) < ip) {
+                size_t d = ip - (size_t)(cl - 1u);
+                if (d != (size_t)best_off) {
+                    uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
+                    if (diff == 0u) {
+                        if (best_len <= 8u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len])) {
+                            uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                            if (len > best_len) {
+                                best_len = len;
+                                best_off = (uint32_t)d;
+                            }
+                        }
+                    }
+                }
+            }
+            /* 3. Short table (5-byte hash, minimum length 5). */
+            if (cs != 0u && (size_t)(cs - 1u) < ip) {
+                size_t d = ip - (size_t)(cs - 1u);
+                if (d != (size_t)best_off && (best_len == 0u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len]))) {
+                    uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
+                    if (diff != 0u) {
+                        uint32_t len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                        if (len >= ZGEC_FAST_MIN_SHORT && len > best_len) {
+                            best_len = len;
+                            best_off = (uint32_t)d;
+                        }
+                    } else {
+                        uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                        if (len > best_len) {
+                            best_len = len;
+                            best_off = (uint32_t)d;
+                        }
                     }
                 }
             }
@@ -894,6 +950,15 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         return ZGEC_ERR_INVAL;
     }
     size_t vb_size = prefix + raw_size;
+    /* P24 position limit (section 6.1): the caller contract is that the whole
+     * virtual buffer -- dict + litref + src -- fits inside 2^24 positions,
+     * because every offset the parse emits is a position in it. The check on
+     * prefix above only bounds the two dictionary regions, so on its own it
+     * lets vb_size exceed P24 by up to raw_size; bound the full extent. */
+    if (vb_size > (size_t)1 << 24) {
+        zgec_parse_free(p);
+        return ZGEC_ERR_INVAL;
+    }
     uint8_t *vb;
     zgec_matcher *m;
     if (zgec_add_overflows(vb_size, 64u)) {
