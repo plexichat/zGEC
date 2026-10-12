@@ -472,16 +472,26 @@ zgec_err zgec_parse_block(zgec_parse **out,
  * once every 255 blocks -- which removes about one byte of clearing per input
  * byte at the 2 MiB presets. With ZGEC_FAST_GEN=0 the tables are cleared every
  * block and the tag is pinned to 1, which reproduces the pre-tag parse. */
+/* Measured at level 4 on the 211.9 MB Silesia concatenation (single thread,
+ * best of 5 interleaved rounds): the tag alone is 2.7% SLOWER than clearing
+ * the tables per block, at identical output. The per-block memset is not pure
+ * overhead -- it also leaves both tables resident, so a block's first touches
+ * miss less. Kept behind the macro for block sizes and levels where the
+ * clearing is a larger share of the block. */
 #ifndef ZGEC_FAST_GEN
-#define ZGEC_FAST_GEN 1
+#define ZGEC_FAST_GEN 0
 #endif
 /* Carry the long table's candidate for the next visited position across the
  * loop, as zstd's dfast does: the hash and the table load for that position
  * are issued an iteration before the compare that consumes them, so the miss
  * overlaps this position's rep and candidate compares. The carried value is
  * kept equal to what a fresh load would return (see the store site). */
+/* Measured at level 4 on Silesia (single thread, best of 5): with the tag on,
+ * the carried candidate is 2.4% SLOWER than loading it fresh, at identical
+ * output. The extra hash and load per position cost more than the memory
+ * latency they hide -- the same result the table-prefetch probe reached. */
 #ifndef ZGEC_FAST_PIPE
-#define ZGEC_FAST_PIPE 1
+#define ZGEC_FAST_PIPE 0
 #endif
 /* Probe only the first repeat offset, as zstd's dfast does, instead of the
  * whole three-deep chain. */
@@ -538,7 +548,9 @@ static inline uint32_t fast_hash_l_v(uint64_t v)
 }
 
 /* Entry packing for the two fast-tier tables. See the ZGEC_FAST_GEN comment. */
+#if ZGEC_FAST_GEN
 static ZGEC_ENC_TLS unsigned fast_scratch_gen;
+#endif
 
 static inline uint32_t fast_pack(uint32_t gen, size_t pos)
 {
@@ -874,7 +886,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
              * byte before the match still agrees, as zstd's dfast and lazy
              * accept paths do. The match end does not move, so the offset
              * stays valid and the sequence only sheds literals. */
-            while (ip > anchor && (size_t)best_off <= ip &&
+            while (ip > anchor && (size_t)best_off < ip &&
                    vb[ip - 1u] == vb[ip - (size_t)best_off - 1u]) {
                 ip--;
                 best_len++;
