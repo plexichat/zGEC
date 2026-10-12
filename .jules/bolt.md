@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Dynamic Match Prefix Bitmask Candidate Filtering in Match Finder
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), probing short bucket lanes and long table entries previously computed `ctzll` and called `mf_update_best` on every tag hit.
+2. Computing `target_len = (best.length > hash_min) ? best.length : hash_min` and checking whether the candidate 64-bit load XOR `v8` satisfies `(diff & diff_mask) != 0` (where `diff_mask = (1ULL << (target_len * 8)) - 1ULL` when `target_len < 8`, or `diff != 0` when `target_len >= 8`) immediately filters out candidates that cannot beat or match `best.length`. This skips `ctzll` and length calculation for >95% of non-matching candidates.
+
+**Action:**
+In LZ match finders, filter candidate 64-bit loads against `best.length` using bitmask comparisons (`diff & diff_mask != 0`) before computing trailing zeroes or match extensions.
