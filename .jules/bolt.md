@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Precalculated Position Costs, Sequence Symbol LUTs, and Early 64-Bit Match Extension
+
+**Learning:**
+1. In `mf_match_len_slow` (`src/match.c`), performing a 64-bit load/XOR compare on bytes 8..15 (`zgec_rd64(src + 8) ^ zgec_rd64(dst + 8)`) for `cap >= 16` before entering 32-byte SIMD or loop extensions branchlessly handles common short/medium matches (8-15 bytes).
+2. In `zgec_parse_block_ex` (`src/parse.c`), calculating `cost(LL)` once per position `ip` and reusing it via `parse_score_fast` across candidate match and repeat offset evaluations avoids redundant `zgec_seq_code_of` and log probability calculations.
+3. In `include/zgec_seq.h` and `src/seq.c`, using static 256-entry lookup tables (`zgec_seq_code_lut256` and `zgec_seq_nbits_lut256`) for `v < 256` in `zgec_seq_code_of` bypasses bit-scan and arithmetic operations on hot sequence parsing paths.
+
+**Action:**
+In LZ parsers, precompute position-invariant costs (`cost(LL)`) before scanning candidate match offsets, use static 256-entry lookup tables for sequence symbol codes, and check bytes 8..15 with 64-bit XOR before entering wide SIMD loops.

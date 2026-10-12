@@ -17,13 +17,19 @@
 
 /* ---- value codes (section 8.1) ---- */
 
+extern const uint8_t zgec_seq_code_lut256[256];
+extern const uint8_t zgec_seq_nbits_lut256[256];
+
 /* Map a value v to its code and extra-bit count.
    v < 8: code = v, nbits = 0.
    v >= 8: e = floor(log2(v)), m = (v >> (e-1)) & 1,
            code = 8 + 2*(e-3) + m, nbits = e - 1. */
 static inline uint8_t zgec_seq_code_of(uint32_t v, uint8_t *nbits) {
-    if (v < 8) { *nbits = 0; return (uint8_t)v; }
-    unsigned e = zgec_highbit32(v);            /* e >= 3 */
+    if (v < 256u) {
+        *nbits = zgec_seq_nbits_lut256[v];
+        return zgec_seq_code_lut256[v];
+    }
+    unsigned e = zgec_highbit32(v);            /* e >= 8 */
     unsigned m = (v >> (e - 1)) & 1u;
     *nbits = (uint8_t)(e - 1);
     return (uint8_t)(8 + 2 * (e - 3) + m);

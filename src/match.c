@@ -440,9 +440,22 @@ static inline __attribute__((always_inline)) uint32_t mf_len8(const uint8_t *src
  * virtual buffer. */
 static uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32_t cap)
 {
-    uint32_t len = 8u;
+    if (cap >= 16u) {
+        uint64_t diff1 = zgec_rd64(src + 8u) ^ zgec_rd64(dst + 8u);
+        if (diff1 != 0u) {
+            return 8u + ((uint32_t)__builtin_ctzll(diff1) >> 3);
+        }
+    } else {
+        uint32_t len = 8u;
+        while (len < cap && src[len] == dst[len]) {
+            len++;
+        }
+        return len;
+    }
+
+    uint32_t len = 16u;
 #if defined(__AVX2__)
-    /* Extend beyond the first 8 bytes 32 at a time; a 32-byte
+    /* Extend beyond the first 16 bytes 32 at a time; a 32-byte
      * movemask finds the first differing byte directly. */
     while (len + 32u <= cap) {
         __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(src + len));

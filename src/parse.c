@@ -279,6 +279,30 @@ static double parse_seq_cost(uint32_t ll, uint32_t ml, uint32_t offbase,
     return cost;
 }
 
+/* Pre-calculate cost(LL) so it is not recomputed for every candidate at position ip. */
+static inline double parse_ll_cost(uint32_t ll, const double l2tot0, const double *ll_base)
+{
+    uint8_t nb_ll = 0;
+    uint8_t c_ll = zgec_seq_code_of(ll, &nb_ll);
+    return (double)(float)(l2tot0 - ll_base[c_ll]) + (double)nb_ll;
+}
+
+/* Fast price score of a candidate given precalculated ll_cost. */
+static inline double parse_score_fast(uint32_t len, uint32_t offbase, double ll_cost,
+                                     const double *l2tot,
+                                     const double *ml_base,
+                                     const double *of_base,
+                                     double lbar, double lscale)
+{
+    uint8_t nb_ml = 0, nb_of = 0;
+    uint8_t c_ml = zgec_seq_code_of(len >= 3 ? len - 3 : 0, &nb_ml);
+    uint8_t c_of = zgec_seq_code_of(offbase >= 1 ? offbase - 1 : 0, &nb_of);
+    double cost = ll_cost;
+    cost += (double)(float)(l2tot[1] - ml_base[c_ml]) + (double)nb_ml;
+    cost += (double)(float)(l2tot[2] - of_base[c_of]) + (double)nb_of;
+    return (double)len * lbar - cost * lscale;
+}
+
 /* Price score of a candidate (section 11.4):
  * score = len * Lbar - cost(LL, ML, OF) * lscale.
  * Positive means the match saves bits over coding its len bytes as
@@ -1236,15 +1260,17 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                                       reps.rep[2], 4u, (uint32_t)(end - ip),
                                       rep_len);
         ll = (uint32_t)(ip - anchor);
+        double ll_cost = parse_ll_cost(ll, l2tot[0], ll_base);
+
         if (match.length >= 4u) {
             is_rep = (match.offset == reps.rep[0] || match.offset == reps.rep[1] ||
                       match.offset == reps.rep[2]) ? 1u : 0u;
             need = (is_rep != 0u) ? 4u : parse_min_norep(ip, tier);
             if (match.length >= need) {
                 offbase = parse_offbase(match.offset, &reps);
-                cur_score = parse_score(match.length, ll, offbase,
-                                        l2tot, ll_base, ml_base, of_base,
-                                        lbar, lscale);
+                cur_score = parse_score_fast(match.length, offbase, ll_cost,
+                                             l2tot, ml_base, of_base,
+                                             lbar, lscale);
                 if (cur_score > 0.0) {
                     cur_len = match.length;
                     cur_off = match.offset;
@@ -1279,10 +1305,10 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                          * The test is exact, so the choice is unchanged. */
                         if ((double)rep_len[ri] * lbar > cur_score) {
                             uint32_t rlen = rep_len[ri];
-                            uint32_t roffbase = parse_offbase(roff, &reps);
-                            double rscore = parse_score(rlen, ll, roffbase,
-                                                        l2tot, ll_base, ml_base,
-                                                        of_base, lbar, lscale);
+                            uint32_t roffbase = ri + 1u;
+                            double rscore = parse_score_fast(rlen, roffbase, ll_cost,
+                                                             l2tot, ml_base, of_base,
+                                                             lbar, lscale);
                             if (rscore > cur_score) {
                                 cur_score = rscore;
                                 cur_len = rlen;
