@@ -430,6 +430,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     if (k == 1) {
         const zgec_rans_enc_table *tab = &tables[0];
         size_t full = len[7];
+        size_t nw = nwords;
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;
             if (round < full) {
@@ -441,14 +442,14 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 size_t j2 = start[2] + round;
                 size_t j1 = start[1] + round;
                 size_t j0 = start[0] + round;
-                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
+                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nw, words_cap) != 0 ||
+                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nw, words_cap) != 0) {
                     zgec_free(words);
                     return 0;
                 }
@@ -458,13 +459,14 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     if (round >= len[lane]) continue;
                     j = start[lane] + round;
                     uint8_t s = Z[j];
-                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nw, words_cap) != 0) {
                         zgec_free(words);
                         return 0;
                     }
                 }
             }
         }
+        nwords = nw;
     } else {
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;

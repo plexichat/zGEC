@@ -890,6 +890,11 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     }
 
     if (base != NULL && nbits != NULL) {
+        uint64_t bw_acc = bw->acc;
+        unsigned bw_nacc = bw->nacc;
+        uint8_t *bw_ptr = bw->ptr;
+        const uint8_t *bw_end = bw->end;
+
         for (size_t i = n - 1; i > 0; i--) {
             uint8_t s = syms[i - 1];
             const zgec_fse_enc_entry *row;
@@ -905,16 +910,55 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             bits = (state >= (uint32_t)entry.baseline)
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
-            zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
+
+            /* State bits emission */
+            unsigned e_nb = (unsigned)entry.nb_bits;
+            if (e_nb > 0u) {
+                uint64_t mask = (e_nb == 32u) ? 0xFFFFFFFFull : ((1ull << e_nb) - 1ull);
+                bw_acc |= (uint64_t)(bits & mask) << bw_nacc;
+                bw_nacc += e_nb;
+                if (bw_nacc >= 32u) {
+                    unsigned bytes = bw_nacc >> 3;
+                    bw_nacc &= 7u;
+                    if ((size_t)(bw_end - bw_ptr) < (size_t)bytes) {
+                        bw->overflow = 1;
+                        return ZGEC_ERR_BITSTREAM_OVERFLOW;
+                    }
+                    zgec_bw_flush(bw_ptr, bw_acc, bytes);
+                    bw_ptr += bytes;
+                    bw_acc >>= bytes * 8u;
+                }
+            }
+
+            /* Extra bits emission */
             if (nb > 0u) {
                 uint32_t lo = base[s];
                 if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
                 uint32_t extra = val - lo;
                 if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-                zgec_bw_write(bw, extra, nb);
+
+                uint64_t mask = (nb == 32u) ? 0xFFFFFFFFull : ((1ull << nb) - 1ull);
+                bw_acc |= (uint64_t)(extra & mask) << bw_nacc;
+                bw_nacc += nb;
+                if (bw_nacc >= 32u) {
+                    unsigned bytes = bw_nacc >> 3;
+                    bw_nacc &= 7u;
+                    if ((size_t)(bw_end - bw_ptr) < (size_t)bytes) {
+                        bw->overflow = 1;
+                        return ZGEC_ERR_BITSTREAM_OVERFLOW;
+                    }
+                    zgec_bw_flush(bw_ptr, bw_acc, bytes);
+                    bw_ptr += bytes;
+                    bw_acc >>= bytes * 8u;
+                }
             }
+
             state = entry.new_state;
         }
+
+        bw->acc = bw_acc;
+        bw->nacc = bw_nacc;
+        bw->ptr = bw_ptr;
     } else {
         for (size_t i = n - 1; i > 0; i--) {
             uint8_t s = syms[i - 1];
