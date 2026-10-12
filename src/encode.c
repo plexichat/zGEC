@@ -599,9 +599,33 @@ static double zgec_granule_cost_bits(const zgec_granule *g)
 
 static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
 {
-    int s;
-    for (s = 0; s < ZGEC_NSYM_LIT; s++) dst->lit[(size_t)s] += src->lit[(size_t)s];
-    for (s = 0; s < ZGEC_NSYM_SEQ; s++) {
+    int s = 0;
+#if defined(__AVX2__)
+    for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+        __m256i vd = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s));
+        __m256i vs = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s), _mm256_add_epi32(vd, vs));
+    }
+#endif
+    for (; s < ZGEC_NSYM_LIT; s++) dst->lit[(size_t)s] += src->lit[(size_t)s];
+
+    s = 0;
+#if defined(__AVX2__)
+    for (; s + 8 <= ZGEC_NSYM_SEQ; s += 8) {
+        __m256i vdll = _mm256_loadu_si256((const __m256i *)(const void *)(dst->ll + s));
+        __m256i vsll = _mm256_loadu_si256((const __m256i *)(const void *)(src->ll + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->ll + s), _mm256_add_epi32(vdll, vsll));
+
+        __m256i vdml = _mm256_loadu_si256((const __m256i *)(const void *)(dst->ml + s));
+        __m256i vsml = _mm256_loadu_si256((const __m256i *)(const void *)(src->ml + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->ml + s), _mm256_add_epi32(vdml, vsml));
+
+        __m256i vdof = _mm256_loadu_si256((const __m256i *)(const void *)(dst->of + s));
+        __m256i vsof = _mm256_loadu_si256((const __m256i *)(const void *)(src->of + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->of + s), _mm256_add_epi32(vdof, vsof));
+    }
+#endif
+    for (; s < ZGEC_NSYM_SEQ; s++) {
         dst->ll[(size_t)s] += src->ll[(size_t)s];
         dst->ml[(size_t)s] += src->ml[(size_t)s];
         dst->of[(size_t)s] += src->of[(size_t)s];
@@ -869,7 +893,22 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
 
     for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
         uint64_t t = 0;
-        for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+        s = 0;
+#if defined(__AVX2__)
+        __m256i vsum = _mm256_setzero_si256();
+        for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(cls_hist + (size_t)c * 256u + (uint32_t)s));
+            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)c] + s), v);
+            vsum = _mm256_add_epi32(vsum, v);
+        }
+        __m128i vlow = _mm256_castsi256_si128(vsum);
+        __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+        vlow = _mm_add_epi32(vlow, vhigh);
+        vlow = _mm_hadd_epi32(vlow, vlow);
+        vlow = _mm_hadd_epi32(vlow, vlow);
+        t += (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+#endif
+        for (; s < ZGEC_NSYM_LIT; s++) {
             work[(size_t)c][(size_t)s] = cls_hist[(size_t)c * 256u + (uint32_t)s];
             t += (uint64_t)work[(size_t)c][(size_t)s];
         }
@@ -891,7 +930,15 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         int bb;
         for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
             uint64_t mt = ctot[(size_t)c] + ctot[(size_t)bb];
-            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+            s = 0;
+#if defined(__AVX2__)
+            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)c] + s));
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)bb] + s));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(v0, v1));
+            }
+#endif
+            for (; s < ZGEC_NSYM_LIT; s++) {
                 merged[(size_t)s] =
                     work[(size_t)c][(size_t)s] + work[(size_t)bb][(size_t)s];
             }
@@ -936,7 +983,15 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             int ver_a = -1;
             int ver_b = -1;
             double ver_delta = 0.0;
-            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+            s = 0;
+#if defined(__AVX2__)
+            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(v0, v1));
+            }
+#endif
+            for (; s < ZGEC_NSYM_LIT; s++) {
                 merged[(size_t)s] =
                     work[(size_t)cand_a][(size_t)s] +
                     work[(size_t)cand_b][(size_t)s];
@@ -972,7 +1027,15 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         }
         if (best_a < 0) break;
         /* Merge best_b into best_a. */
-        for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+        s = 0;
+#if defined(__AVX2__)
+        for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_a] + s));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_b] + s));
+            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)best_a] + s), _mm256_add_epi32(v0, v1));
+        }
+#endif
+        for (; s < ZGEC_NSYM_LIT; s++) {
             work[(size_t)best_a][(size_t)s] += work[(size_t)best_b][(size_t)s];
         }
         {

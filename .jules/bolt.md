@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - SIMD Vectorization of Granule Merging, Context Clustering, and Frequency Normalisation
+
+**Learning:**
+1. In `src/encode.c` (`zgec_granule_merge` and `zgec_cluster_greedy`), scalar 256-element histogram merging and pairwise cluster delta calculations previously performed millions of scalar additions per block. Vectorizing `work[c]` copies, initial pair delta additions (`work[c][s] + work[bb][s]`), and cluster merges (`work[best_a][s] += work[best_b][s]`) using 256-bit AVX2 SIMD intrinsics (`_mm256_loadu_si256`, `_mm256_add_epi32`, `_mm256_storeu_si256`) eliminates loop overhead during block segmentation and context map selection.
+2. In `src/rans.c` (`zgec_rans_normalise`) and `src/seq.c` (`zgec_normalize_counts`), symbol frequency histogram total summation and non-zero element counting operated in scalar loops. Using AVX2 vector additions (`_mm256_add_epi32`) and non-zero comparisons (`_mm256_cmpgt_epi32`) accelerates frequency table normalisation.
+
+**Action:**
+Vectorize 256-element histogram additions and symbol counts with 256-bit AVX2 SIMD intrinsics across all segmentation, context clustering, and normalisation routines in the encode path.
