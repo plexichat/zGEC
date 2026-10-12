@@ -358,7 +358,7 @@ static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_
     uint32_t f = tab->f[s];
     if (f == 0u) return -1;
     uint32_t x = *state_ptr;
-    if (x >= tab->xmax[s]) {
+    while (x >= tab->xmax[s]) {
         if (*nwords_ptr >= words_cap) return -1;
         words[(*nwords_ptr)++] = (uint16_t)(x & 0xFFFFu);
         x >>= 16;
