@@ -1056,7 +1056,55 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         size_t j;
         memset(hist4, 0, 4u * hist_bytes);
         if (zgec_rs_is_empty(runstart, n_lit)) {
-            for (j = 1; j < n_lit; j++) {
+            j = 1;
+#if defined(__AVX2__)
+            for (; j + 32 <= n_lit; j += 32) {
+                __m256i vp = _mm256_loadu_si256((const __m256i *)(const void *)(lit + j - 1));
+                __m256i vn = _mm256_loadu_si256((const __m256i *)(const void *)(lit + j));
+                uint8_t p_buf[32], n_buf[32];
+                _mm256_storeu_si256((__m256i *)(void *)p_buf, vp);
+                _mm256_storeu_si256((__m256i *)(void *)n_buf, vn);
+                for (size_t u = 0; u < 32; u++) {
+                    uint8_t prev = p_buf[u];
+                    uint32_t nxt = (uint32_t)n_buf[u];
+                    h0[(size_t)(prev & 63u) * 256u + nxt]++;
+                    h1[(size_t)(prev >> 2u) * 256u + nxt]++;
+                    h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, prev) * 256u + nxt]++;
+                    h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, prev) * 256u + nxt]++;
+                }
+            }
+#endif
+            for (; j + 3 < n_lit; j += 4) {
+                uint8_t p0 = lit[j - 1];
+                uint8_t p1 = lit[j];
+                uint8_t p2 = lit[j + 1];
+                uint8_t p3 = lit[j + 2];
+                uint32_t n0 = p1;
+                uint32_t n1 = p2;
+                uint32_t n2 = p3;
+                uint32_t n3 = (uint32_t)lit[j + 3];
+
+                h0[(size_t)(p0 & 63u) * 256u + n0]++;
+                h1[(size_t)(p0 >> 2u) * 256u + n0]++;
+                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p0) * 256u + n0]++;
+                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p0) * 256u + n0]++;
+
+                h0[(size_t)(p1 & 63u) * 256u + n1]++;
+                h1[(size_t)(p1 >> 2u) * 256u + n1]++;
+                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p1) * 256u + n1]++;
+                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p1) * 256u + n1]++;
+
+                h0[(size_t)(p2 & 63u) * 256u + n2]++;
+                h1[(size_t)(p2 >> 2u) * 256u + n2]++;
+                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p2) * 256u + n2]++;
+                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p2) * 256u + n2]++;
+
+                h0[(size_t)(p3 & 63u) * 256u + n3]++;
+                h1[(size_t)(p3 >> 2u) * 256u + n3]++;
+                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p3) * 256u + n3]++;
+                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p3) * 256u + n3]++;
+            }
+            for (; j < n_lit; j++) {
                 uint8_t prev = lit[j - 1];
                 uint32_t nxt = (uint32_t)lit[j];
                 unsigned c0 = (unsigned)(prev & 63u);
@@ -1325,22 +1373,53 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        for (j = 0; j < n_z; j++) {
-            if (runstart && zgec_rs_get(runstart, j)) {
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
+        size_t next_lane_idx = 0;
+        size_t next_lane_pos = start[0];
+
+        if (!runstart || zgec_rs_is_empty(runstart, n_z)) {
+            for (j = 0; j < n_z; j++) {
+                if (j == next_lane_pos) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    while (next_lane_idx < ZGEC_NLANES && start[next_lane_idx] <= j) {
+                        next_lane_idx++;
+                    }
+                    next_lane_pos = (next_lane_idx < ZGEC_NLANES) ? start[next_lane_idx] : (size_t)-1;
+                    continue;
+                }
+                {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
-            if (j == start[0] || j == start[1] || j == start[2] || j == start[3] ||
-                j == start[4] || j == start[5] || j == start[6] || j == start[7]) {
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
-            }
-            {
-                unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                grp_total[grp]++;
+        } else {
+            for (j = 0; j < n_z; j++) {
+                if (zgec_rs_get(runstart, j)) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    if (j == next_lane_pos) {
+                        while (next_lane_idx < ZGEC_NLANES && start[next_lane_idx] <= j) {
+                            next_lane_idx++;
+                        }
+                        next_lane_pos = (next_lane_idx < ZGEC_NLANES) ? start[next_lane_idx] : (size_t)-1;
+                    }
+                    continue;
+                }
+                if (j == next_lane_pos) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    while (next_lane_idx < ZGEC_NLANES && start[next_lane_idx] <= j) {
+                        next_lane_idx++;
+                    }
+                    next_lane_pos = (next_lane_idx < ZGEC_NLANES) ? start[next_lane_idx] : (size_t)-1;
+                    continue;
+                }
+                {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
         }
     }
