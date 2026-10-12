@@ -763,3 +763,267 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     }
     return ZGEC_OK;
 }
+#endif /* ZGEC_FASTDFAST_OFF */
+
+zgec_err zgec_parse_block_ex(zgec_parse **out,
+                             const uint8_t *src, size_t raw_size,
+                             const uint8_t *dict, size_t dict_size,
+                             const uint8_t *litref, size_t litref_size,
+                             zgec_tier tier, double lambda)
+{
+    if (!out || !src) return ZGEC_ERR_INVAL;
+    if (raw_size == 0) {
+        zgec_parse *p = (zgec_parse *)zgec_alloc(sizeof(*p), _Alignof(zgec_parse));
+        if (!p) return ZGEC_ERR_NOMEM;
+        memset(p, 0, sizeof(*p));
+        *out = p;
+        return ZGEC_OK;
+    }
+
+    size_t prefix_size = dict_size + litref_size;
+    if (zgec_add_overflows(prefix_size, raw_size)) return ZGEC_ERR_INVAL;
+    size_t vb_size = prefix_size + raw_size;
+
+    /* P24 limit check: dict_size + litref_size + raw_size <= 2^24 */
+    if (vb_size > ((size_t)1 << 24)) return ZGEC_ERR_INVAL;
+
+    uint8_t *vb = (uint8_t *)zgec_alloc(vb_size ? vb_size : 1, 64);
+    zgec_parse *p = (zgec_parse *)zgec_alloc(sizeof(*p), _Alignof(zgec_parse));
+    if (!vb || !p) {
+        zgec_free(vb);
+        zgec_free(p);
+        return ZGEC_ERR_NOMEM;
+    }
+    memset(p, 0, sizeof(*p));
+    p->raw_size = (uint32_t)raw_size;
+
+    p->lit = (uint8_t *)zgec_alloc(raw_size, 64);
+    size_t seq_cap = (raw_size / 8u) + 16u;
+    if (parse_mul_overflows(seq_cap, sizeof(zgec_sequence))) {
+        zgec_free(vb);
+        zgec_parse_free(p);
+        return ZGEC_ERR_NOMEM;
+    }
+    p->seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
+    if (!p->lit || !p->seq) {
+        zgec_free(vb);
+        zgec_parse_free(p);
+        return ZGEC_ERR_NOMEM;
+    }
+
+    if (dict && dict_size > 0) memcpy(vb, dict, dict_size);
+    if (litref && litref_size > 0) memcpy(vb + dict_size, litref, litref_size);
+    memcpy(vb + prefix_size, src, raw_size);
+
+#ifndef ZGEC_FASTDFAST_OFF
+    if (tier == ZGEC_TIER_FAST) {
+        zgec_err err = fast_parse(p, vb, prefix_size, vb_size);
+        zgec_free(vb);
+        if (err != ZGEC_OK) {
+            zgec_parse_free(p);
+            return err;
+        }
+        *out = p;
+        return ZGEC_OK;
+    }
+#endif
+
+    /* Main / High tier match finding and parsing */
+    zgec_matcher *m = zgec_matcher_create(tier, vb_size);
+    if (!m) {
+        zgec_free(vb);
+        zgec_parse_free(p);
+        return ZGEC_ERR_NOMEM;
+    }
+    zgec_matcher_reset(m, vb, vb_size, dict, dict_size);
+    if (litref_size > 0) {
+        size_t stride = (tier == ZGEC_TIER_HIGH) ? 1u : 2u;
+        for (size_t pos = dict_size; pos < prefix_size; pos += stride) {
+            zgec_matcher_insert(m, vb, pos);
+        }
+    }
+
+    zgec_reps reps;
+    zgec_reps_init(&reps);
+
+    uint32_t ll_hist[ZGEC_NSYM_SEQ] = {0};
+    uint32_t ml_hist[ZGEC_NSYM_SEQ] = {0};
+    uint32_t of_hist[ZGEC_NSYM_SEQ] = {0};
+    uint32_t lit_hist[256] = {0};
+    size_t lit_total = 0;
+
+    double ll_base[ZGEC_NSYM_SEQ];
+    double ml_base[ZGEC_NSYM_SEQ];
+    double of_base[ZGEC_NSYM_SEQ];
+    double l2tot[3];
+
+    for (int s = 0; s < ZGEC_NSYM_SEQ; s++) {
+        ll_base[s] = log2(1.0);
+        ml_base[s] = log2(1.0);
+        of_base[s] = log2(1.0);
+    }
+    l2tot[0] = log2((double)ZGEC_NSYM_SEQ);
+    l2tot[1] = log2((double)ZGEC_NSYM_SEQ);
+    l2tot[2] = log2((double)ZGEC_NSYM_SEQ);
+
+    double lscale = 1.0;
+    if (lambda > 0.0) {
+        lscale = 1.0 + lambda;
+    }
+
+    size_t ip = prefix_size;
+    size_t anchor = prefix_size;
+    size_t end = vb_size;
+
+    while (ip + 4u <= end) {
+        uint32_t rep_len[3] = {0};
+        uint32_t min_len = parse_min_norep(ip - prefix_size, tier);
+        uint32_t max_len = (uint32_t)(end - ip);
+
+        zgec_match m0 = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1], reps.rep[2], min_len, max_len, rep_len);
+
+        uint32_t best_len = m0.length;
+        uint32_t best_off = m0.offset;
+        uint32_t best_ob = (best_len >= 3) ? parse_offbase(best_off, &reps) : 0;
+        uint32_t ll0 = (uint32_t)(ip - anchor);
+
+        double lbar0 = parse_lbar(lit_hist, lit_total);
+        double s0 = (best_len >= 3) ? parse_score(best_len, ll0, best_ob, l2tot, ll_base, ml_base, of_base, lbar0, lscale) : -1.0;
+
+        /* Evaluate repeat offset price scores */
+        for (int ri = 0; ri < 3; ri++) {
+            uint32_t rlen = rep_len[ri];
+            if (rlen >= 4) {
+                uint32_t rob = (uint32_t)(ri + 1);
+                double rs = parse_score(rlen, ll0, rob, l2tot, ll_base, ml_base, of_base, lbar0, lscale);
+                if (rs > s0) {
+                    s0 = rs;
+                    best_len = rlen;
+                    best_off = reps.rep[ri];
+                    best_ob = rob;
+                }
+            }
+        }
+
+        /* Price gate threshold: score > 0 */
+        if (s0 > 0.0 && best_len >= 3) {
+            /* 1-position lazy lookahead check */
+            if (best_len < PARSE_LAZY_MAX_LEN && ip + 1u + 4u <= end) {
+                size_t p1 = ip + 1u;
+                uint32_t max_len1 = (uint32_t)(end - p1);
+                uint32_t rep_len1[3] = {0};
+                zgec_match m1 = zgec_matcher_find_lens(m, vb, p1, reps.rep[0], reps.rep[1], reps.rep[2], min_len, max_len1, rep_len1);
+                uint32_t l1_len = m1.length;
+                uint32_t l1_off = m1.offset;
+                uint32_t l1_ob = (l1_len >= 3) ? parse_offbase(l1_off, &reps) : 0;
+                uint32_t ll1 = ll0 + 1u;
+                double s1 = (l1_len >= 3) ? parse_score(l1_len, ll1, l1_ob, l2tot, ll_base, ml_base, of_base, lbar0, lscale) : -1.0;
+
+                for (int ri = 0; ri < 3; ri++) {
+                    uint32_t rlen1 = rep_len1[ri];
+                    if (rlen1 >= 4) {
+                        uint32_t rob1 = (uint32_t)(ri + 1);
+                        double rs1 = parse_score(rlen1, ll1, rob1, l2tot, ll_base, ml_base, of_base, lbar0, lscale);
+                        if (rs1 > s1) {
+                            s1 = rs1;
+                            l1_len = rlen1;
+                            l1_off = reps.rep[ri];
+                            l1_ob = rob1;
+                        }
+                    }
+                }
+
+                if (s1 > s0 + lbar0) {
+                    /* Lazy step: emit current position byte as literal and step */
+                    lit_hist[vb[ip]]++;
+                    lit_total++;
+                    zgec_matcher_insert(m, vb, ip);
+                    ip++;
+                    continue;
+                }
+            }
+
+            /* Accept match `best_len` at `best_off` */
+            uint32_t ll = (uint32_t)(ip - anchor);
+            if (ll > 0) {
+                memcpy(p->lit + p->n_lit, vb + anchor, ll);
+                for (size_t k = 0; k < ll; k++) {
+                    lit_hist[vb[anchor + k]]++;
+                }
+                lit_total += ll;
+                p->n_lit += ll;
+            }
+
+            if (p->n_seq >= seq_cap) {
+                size_t nc = seq_cap * 2u;
+                zgec_sequence *ns = (zgec_sequence *)zgec_alloc(nc * sizeof(zgec_sequence), _Alignof(zgec_sequence));
+                if (!ns) {
+                    zgec_matcher_destroy(m);
+                    zgec_free(vb);
+                    zgec_parse_free(p);
+                    return ZGEC_ERR_NOMEM;
+                }
+                memcpy(ns, p->seq, p->n_seq * sizeof(zgec_sequence));
+                zgec_free(p->seq);
+                p->seq = ns;
+                seq_cap = nc;
+            }
+
+            p->seq[p->n_seq].ll = ll;
+            p->seq[p->n_seq].ml = best_len;
+            p->seq[p->n_seq].offbase = best_ob;
+            p->n_seq++;
+
+            /* Update histograms and running costs */
+            uint8_t nb = 0;
+            uint8_t c_ll = zgec_seq_code_of(ll, &nb);
+            uint8_t c_ml = zgec_seq_code_of(best_len - 3u, &nb);
+            uint8_t c_ob = zgec_seq_code_of(best_ob >= 1 ? best_ob - 1u : 0u, &nb);
+
+            ll_hist[c_ll]++;
+            ml_hist[c_ml]++;
+            of_hist[c_ob]++;
+
+            double tot_ll = 0.0, tot_ml = 0.0, tot_of = 0.0;
+            for (int s = 0; s < ZGEC_NSYM_SEQ; s++) {
+                tot_ll += (double)ll_hist[s];
+                tot_ml += (double)ml_hist[s];
+                tot_of += (double)of_hist[s];
+            }
+            ll_base[c_ll] = log2((double)ll_hist[c_ll] + 1.0);
+            ml_base[c_ml] = log2((double)ml_hist[c_ml] + 1.0);
+            of_base[c_ob] = log2((double)of_hist[c_ob] + 1.0);
+            l2tot[0] = log2(tot_ll + (double)ZGEC_NSYM_SEQ);
+            l2tot[1] = log2(tot_ml + (double)ZGEC_NSYM_SEQ);
+            l2tot[2] = log2(tot_of + (double)ZGEC_NSYM_SEQ);
+
+            zgec_reps_resolve(&reps, best_ob);
+            zgec_matcher_insert_match(m, vb, ip, best_len);
+
+            ip += best_len;
+            anchor = ip;
+        } else {
+            /* Skip schedule */
+            lit_hist[vb[ip]]++;
+            lit_total++;
+            zgec_matcher_insert(m, vb, ip);
+
+            unsigned shift = parse_skip_shift(tier);
+            size_t step = ((ip - anchor) >> shift) + 1u;
+            if (step > PARSE_MAX_STEP) step = PARSE_MAX_STEP;
+            ip += step;
+        }
+    }
+
+    if (anchor < end) {
+        size_t tail = end - anchor;
+        memcpy(p->lit + p->n_lit, vb + anchor, tail);
+        p->n_lit += tail;
+    }
+
+    zgec_matcher_destroy(m);
+    zgec_free(vb);
+
+    *out = p;
+    return ZGEC_OK;
+}
