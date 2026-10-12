@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Phase B Match Reconstruction Bounds and Pattern Phase Alignment
+
+**Learning:**
+1. In LZ77 Phase B match reconstruction (`exec_block` in `src/decode.c`), stores must NEVER write past `d + mlen`. Unwritten output buffer positions serve as prediction targets for sub-literal predictive decoding (`lit_form == 1`), so writing past `d + mlen` (e.g. writing an 8-byte word for `mlen == 5`) corrupts unwritten prediction bytes and causes decoder validation errors.
+2. For short 3-byte matches (`mlen == 3`), using explicit scalar byte copies `d[0] = msrc[0]; d[1] = msrc[1]; d[2] = msrc[2];` avoids scalar loop overhead without writing past `d + 3`.
+3. For small match offsets (`moff == 2`), overlapping pattern stores of length $W$ at position $P$ are phase-aligned if and only if $P \equiv 0 \pmod 2$. Parity-aware pattern broadcasting (`v32_even` / `v32_odd`) allows 32-bit unaligned stores without phase-shift errors.
+
+**Action:**
+In LZ77 match reconstructors, ensure no store operation writes past `d + mlen`, and maintain pattern phase alignment when using overlapping stores for short offsets.
