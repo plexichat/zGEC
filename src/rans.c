@@ -106,7 +106,14 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts)
             if (eff > (uint32_t)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
             t->f[s] = (uint16_t)eff;
             t->c[s] = (uint16_t)sum;
-            t->xmax[s] = eff << 21;
+            /* Renormalise while x >= f << 21. For f == ZGEC_RANS_M the
+             * true threshold is 2^32, which overflows a 32-bit xmax;
+             * zgec_rans_encode_symbol handles that single-symbol case
+             * before it ever reads xmax, so saturate here rather than
+             * store 0. */
+            t->xmax[s] = (eff >= (uint32_t)ZGEC_RANS_M)
+                             ? 0xFFFFFFFFu
+                             : (eff << 21u);
             sum += eff;
             /* Precompute a biased reciprocal for the encode loop's
              * division by f[s]. floor(2^32 / f) + 1 is the bias that
@@ -357,6 +364,13 @@ static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_
 {
     uint32_t f = tab->f[s];
     if (f == 0u) return -1;
+    /* A single-symbol table (f == ZGEC_RANS_M, c == 0, probability 1)
+     * is an exact identity on the state: x/f<<L + x%f + c == x, and the
+     * renormalisation threshold f<<21 is 2^32, which does not fit the
+     * 32-bit xmax field (it wraps to 0 and would renormalise forever).
+     * Handle it before the threshold test so it neither renormalises nor
+     * depends on xmax. */
+    if (f == (uint32_t)ZGEC_RANS_M) return 0;
     uint32_t x = *state_ptr;
     while (x >= tab->xmax[s]) {
         if (*nwords_ptr >= words_cap) return -1;
