@@ -1306,9 +1306,25 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
-            zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
-                                              (uint32_t)(end - (ip + (size_t)1)));
+            uint32_t min_lazy_len = 4u;
+            if (lbar > 0.0 && cur_score > 0.0) {
+                double req_len = (cur_score / lbar) - 0.5;
+                if (req_len > 4.0) {
+                    size_t rem_len = end - (ip + (size_t)1);
+                    min_lazy_len = (req_len < (double)rem_len)
+                                       ? (uint32_t)req_len
+                                       : (uint32_t)rem_len;
+                }
+            }
+            zgec_match nm;
+            nm.offset = 0;
+            nm.length = 0;
+            if (min_lazy_len <= (uint32_t)(end - (ip + (size_t)1))) {
+                nm = zgec_matcher_find(m, vb, ip + (size_t)1,
+                                       reps.rep[0], reps.rep[1], reps.rep[2],
+                                       min_lazy_len,
+                                       (uint32_t)(end - (ip + (size_t)1)));
+            }
             uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
             uint32_t nis_rep = (nm.length >= 4u &&
                                 (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||

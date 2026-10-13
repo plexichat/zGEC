@@ -157,30 +157,11 @@ In LZ match parsers, stride intermediate match positions during insertion for lo
 ## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
 
 **Learning:**
-1. In  (), checking repeat offset candidates previously used a 32-bit compare followed by . Replacing with a single 64-bit load XOR  and branchless  for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
-2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (, ) and dual hash calculations (, ) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
-
-**Action:**
-In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and , and unroll match-interior table insertion loops for improved store pipelining.
-
-## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
-
-**Learning:**
 1. In fast_parse (src/parse.c), checking repeat offset candidates previously used a 32-bit compare followed by fast_match_len. Replacing with a single 64-bit load XOR zgec_rd64(vb + ip - r) ^ cur8 and branchless __builtin_ctzll(diff) >> 3 for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
 2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (iv0, iv1) and dual hash calculations (hs0/hl0, hs1/hl1) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
 
 **Action:**
 In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and ctzll, and unroll match-interior table insertion loops for improved store pipelining.
-## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
-
-**Learning:**
-1. In rANS encoding ( in ), precomputing  in  eliminates repeated 64-bit shifts () per symbol. Replacing 64-bit signed division () with 32-bit unsigned wraparound math () removes 64-bit integer conversion overhead in the inner encoding loop.
-2. In  () and  (), checking  before iterating over literals bypasses bitwise  queries whenever no run-starts exist.
-3. In  for single-context streams (), unrolling the 4-way loop to 16-way increases instruction-level parallelism and L1 cache throughput.
-
-**Action:**
-Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
-
 ## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
 
 **Learning:**
@@ -190,3 +171,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Dynamic Lazy Match Length Screening and Candidate Target Length Filtering
+
+**Learning:**
+1. In `zgec_parse_block_ex` (`src/parse.c`), lazy evaluation probes at `ip + 1` previously searched for matches starting at 4 bytes even when a high-scoring match (`cur_score`) was already found at `ip`. Since a lazy candidate at `ip + 1` must satisfy `nm.length * lbar > cur_score` to exceed `cur_score`, calculating `min_lazy_len = (cur_score / lbar) - 0.5` and passing `min_lazy_len` to `zgec_matcher_find` allows `zgec_matcher_find_lens` to filter out short candidates instantly.
+2. In `zgec_matcher_find_lens` (`src/match.c`), candidate byte pre-filtering previously tested `vb[ip - d + best.length - 1] == vb[ip + best.length - 1]`. Updating the target length to `target_len = max(best.length, hash_min)` ensures that candidate positions which fail at the required threshold length (e.g., byte 11 for a 12-byte target) are rejected immediately in a single byte comparison before executing 64-bit XOR diffs or `mf_match_len_slow` extensions.
+3. In `zgec_matcher_find_lens` (`src/match.c`) and `fast_parse` (`src/parse.c`), testing `(uint32_t)diff == 0` on candidate repeat offset 64-bit loads bypasses `ctzll` and length assignments for non-matching repeat offset candidate prefixes.
+
+**Action:**
+Calculate score-based minimum required match lengths (`min_lazy_len`) for lazy evaluation probes in LZ parsers, and filter candidate matches against `target_len = max(best.length, hash_min)` before issuing 64-bit load XOR diffs in hash table matchers.
