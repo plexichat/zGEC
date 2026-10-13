@@ -412,7 +412,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_MIN_LONG 8u
 #endif
 #ifndef ZGEC_FAST_SHIFT
-#define ZGEC_FAST_SHIFT 5u
+#define ZGEC_FAST_SHIFT 6u
 #endif
 
 #ifndef ZGEC_FAST_SHORT_HASH_BYTES
@@ -515,7 +515,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 /* Buckets wanted per indexed position, as a shift: 2 means one bucket per
  * four positions. */
 #ifndef ZGEC_FAST_BITS_SHIFT
-#define ZGEC_FAST_BITS_SHIFT 3u
+#define ZGEC_FAST_BITS_SHIFT 2u
 #endif
 
 /* Bucket count for the fast tier's two tables, chosen from the number of
