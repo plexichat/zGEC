@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Precomputed Matcher Masks, Shift Indexing, and Bytes 8..15 64-Bit Fast Match Extension
+
+**Learning:**
+1. In `src/match.c` (`mf_match_len_slow`), matches that extend past 8 bytes frequently end in the 8..15 byte range. Adding an early 64-bit load/XOR check for bytes 8..15 before the 32-byte AVX2 loop evaluates 8..15 byte match extensions using fast scalar 64-bit register math without AVX2 vector setup overhead, reducing `mf_match_len_slow` execution share from 23.4% to 16.7%.
+2. In `struct zgec_matcher` (`src/match.c`), precomputing `nbuckets_mask`, `long_buckets_mask`, `lanes_mask`, and `nlanes_shift` at creation time replaces 64-bit integer multiplication (`bucket * m->nlanes`) and mask subtractions (`m->nbuckets - 1u`) with fast bitwise shifts (`bucket << m->nlanes_shift`) and precomputed masks across match search, insertion, and prefetch inner loops, raising 1T compression speed from 221.9 MB/s to 243.4 MB/s (+9.7%).
+
+**Action:**
+When extending matches, check bytes 8..15 with scalar 64-bit XOR math before entering AVX2 vector loops, and precompute array stride shifts and bucket masks in lookup structures to eliminate integer multiplications in hot loops.
