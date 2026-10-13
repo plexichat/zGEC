@@ -878,73 +878,105 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
         return ZGEC_ERR_FSE_SYMBOL;
     state = (t->e + ((size_t)last_s << t->al))[0].new_state;
 
+    uint64_t bw_acc = bw->acc;
+    unsigned bw_nacc = bw->nacc;
+    uint8_t *bw_ptr = bw->ptr;
+    const uint8_t *bw_end = bw->end;
+    int bw_overflow = bw->overflow;
+
+#define WRITE_BITS_LOCAL(val, nbits_val) do { \
+        unsigned _n = (nbits_val); \
+        if (_n > 0u) { \
+            uint64_t _mask = (_n >= 64u) ? (uint64_t)~0ull : (((uint64_t)1u << _n) - 1u); \
+            bw_acc |= (uint64_t)((val) & _mask) << bw_nacc; \
+            bw_nacc += _n; \
+            if (bw_nacc >= 32u) { \
+                if (bw_ptr + 4 > bw_end) { bw_overflow = 1; goto fse_done; } \
+                zgec_wr32(bw_ptr, (uint32_t)bw_acc); \
+                bw_ptr += 4; \
+                bw_acc >>= 32u; \
+                bw_nacc -= 32u; \
+            } \
+        } \
+    } while (0)
+
     {
-        uint32_t extra = 0u;    /* written through the pointer; the
-                                   initialisers keep -Wmaybe-uninitialized
-                                   quiet in a -Werror build */
+        uint32_t extra = 0u;
         unsigned nb = 0u;
         err = zgec_fse_symbol_extra(last_s, values[n - 1], base, nbits,
                                     &extra, &nb);
         if (err != ZGEC_OK) return err;
-        if (nb > 0u) zgec_bw_write(bw, extra, nb);
+        WRITE_BITS_LOCAL(extra, nb);
     }
 
     if (base != NULL && nbits != NULL) {
         for (size_t i = n - 1; i > 0; i--) {
             uint8_t s = syms[i - 1];
-            const zgec_fse_enc_entry *row;
-            zgec_fse_enc_entry entry;
-            uint32_t bits;
-            uint32_t val = values[i - 1];
-            unsigned nb = (unsigned)nbits[s];
-
             if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-            row = t->e + ((size_t)s << t->al);
+            const zgec_fse_enc_entry *row = t->e + ((size_t)s << t->al);
             if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
-            entry = row[(size_t)state];
-            bits = (state >= (uint32_t)entry.baseline)
+            zgec_fse_enc_entry entry = row[(size_t)state];
+            uint32_t bits = (state >= (uint32_t)entry.baseline)
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
-            zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
+            WRITE_BITS_LOCAL(bits, (unsigned)entry.nb_bits);
+            unsigned nb = (unsigned)nbits[s];
             if (nb > 0u) {
+                uint32_t val = values[i - 1];
                 uint32_t lo = base[s];
                 if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
                 uint32_t extra = val - lo;
                 if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-                zgec_bw_write(bw, extra, nb);
+                WRITE_BITS_LOCAL(extra, nb);
             }
             state = entry.new_state;
         }
     } else {
         for (size_t i = n - 1; i > 0; i--) {
             uint8_t s = syms[i - 1];
-            const zgec_fse_enc_entry *row;
-            zgec_fse_enc_entry entry;
-            uint32_t bits;
-            uint32_t extra = 0u;
-            unsigned nb = 0u;
-
             if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-            row = t->e + ((size_t)s << t->al);
+            const zgec_fse_enc_entry *row = t->e + ((size_t)s << t->al);
             if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
-            entry = row[(size_t)state];
-            bits = (state >= (uint32_t)entry.baseline)
+            zgec_fse_enc_entry entry = row[(size_t)state];
+            uint32_t bits = (state >= (uint32_t)entry.baseline)
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
-            zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
+            WRITE_BITS_LOCAL(bits, (unsigned)entry.nb_bits);
+            uint32_t extra = 0u;
+            unsigned nb = 0u;
             err = zgec_fse_symbol_extra(s, values[i - 1], base, nbits, &extra, &nb);
             if (err != ZGEC_OK) return err;
-            if (nb > 0u) zgec_bw_write(bw, extra, nb);
+            WRITE_BITS_LOCAL(extra, nb);
             state = entry.new_state;
         }
     }
 
-    /* The writer records an overflow in its own struct instead of returning
-     * it, so a stream that did not fit used to be reported as encoded
-     * (fix.md entry 14). The flag is sticky, so one test after the loop
-     * covers every write above, and one more covers the state field below. */
-    if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
-    zgec_bw_write(bw, state, (unsigned)t->al);
+    WRITE_BITS_LOCAL(state, (unsigned)t->al);
+
+fse_done:
+    {
+        unsigned rem_bytes = bw_nacc >> 3u;
+        bw_nacc &= 7u;
+        if (rem_bytes > 0u) {
+            if (bw_ptr + rem_bytes > bw_end) {
+                bw_overflow = 1;
+            } else {
+                for (unsigned b_i = 0u; b_i < rem_bytes; b_i++) {
+                    bw_ptr[b_i] = (uint8_t)(bw_acc >> (8u * b_i));
+                }
+                bw_ptr += rem_bytes;
+                bw_acc >>= rem_bytes * 8u;
+            }
+        }
+    }
+
+    bw->acc = bw_acc;
+    bw->nacc = bw_nacc;
+    bw->ptr = bw_ptr;
+    bw->overflow = bw_overflow;
+
+#undef WRITE_BITS_LOCAL
+
     if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
     return ZGEC_OK;
 }

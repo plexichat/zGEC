@@ -245,20 +245,41 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
     last_s = syms[n - 1];
     last_cls = use_prev ? ((n >= 2) ? zgec_mlclass(ml[n - 2]) : 0u)
                         : zgec_mlclass(ml[n - 1]);
-    /* zgec_mlclass() is total on 0..2, but the index must not depend on
-       that staying true (entry 3). */
     if (last_cls >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
     first_entry = enc[last_cls]->e[(size_t)last_s * (size_t)S];
     state = first_entry.new_state;
     if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
+
+    uint64_t bw_acc = bw->acc;
+    unsigned bw_nacc = bw->nacc;
+    uint8_t *bw_ptr = bw->ptr;
+    const uint8_t *bw_end = bw->end;
+    int bw_overflow = bw->overflow;
+
+#define WRITE_BITS_COND(val, nbits_val) do { \
+        unsigned _n = (nbits_val); \
+        if (_n > 0u) { \
+            uint64_t _mask = (_n >= 64u) ? (uint64_t)~0ull : (((uint64_t)1u << _n) - 1u); \
+            bw_acc |= (uint64_t)((val) & _mask) << bw_nacc; \
+            bw_nacc += _n; \
+            if (bw_nacc >= 32u) { \
+                if (bw_ptr + 4 > bw_end) { bw_overflow = 1; goto cond_done; } \
+                zgec_wr32(bw_ptr, (uint32_t)bw_acc); \
+                bw_ptr += 4; \
+                bw_acc >>= 32u; \
+                bw_nacc -= 32u; \
+            } \
+        } \
+    } while (0)
+
     if (nbits[last_s] > 0) {
         uint32_t extra;
         if (!zgec_seq_get_extra(values[n - 1], last_s, base, nbits, &extra)) {
             if (syms_allocated) zgec_free(syms);
             return 0;
         }
-        zgec_bw_write(bw, extra, (unsigned)nbits[last_s]);
-        if (bw->overflow) { if (syms_allocated) zgec_free(syms); return 0; }
+        WRITE_BITS_COND(extra, (unsigned)nbits[last_s]);
+        if (bw_overflow) { if (syms_allocated) zgec_free(syms); return 0; }
     }
 
     for (i = n - 1; i > 0; i--) {
@@ -275,35 +296,52 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         bits = (state >= (uint32_t)entry.baseline)
                    ? (uint32_t)(state - (uint32_t)entry.baseline)
                    : 0u;
-        /* The transition is representable only if it fits nb_bits. For a
-           table built by zgec_fse_build_enc the occurrence whose range covers
-           `state` guarantees bits < 2^nb_bits, but that invariant is
-           constructed and never checked, and zgec_bw_write() masks its value
-           to the low n bits rather than reporting the ones it lost -- so an
-           inconsistent baseline/nb_bits pair would emit a stream that decodes
-           to a different value and still return a byte count as on success
-           (finding 1). nb_bits < 32 so the shift below is defined. */
         if ((unsigned)entry.nb_bits < 32u &&
             bits >= (UINT32_C(1) << (unsigned)entry.nb_bits)) {
             if (syms_allocated) zgec_free(syms);
             return 0;
         }
-        zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
+        WRITE_BITS_COND(bits, (unsigned)entry.nb_bits);
         if (nbits[s] > 0) {
             uint32_t extra;
             if (!zgec_seq_get_extra(values[i - 1], s, base, nbits, &extra)) {
                 if (syms_allocated) zgec_free(syms);
                 return 0;
             }
-            zgec_bw_write(bw, extra, (unsigned)nbits[s]);
+            WRITE_BITS_COND(extra, (unsigned)nbits[s]);
         }
-        if (bw->overflow) { if (syms_allocated) zgec_free(syms); return 0; }
+        if (bw_overflow) { if (syms_allocated) zgec_free(syms); return 0; }
         state = entry.new_state;
         if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
     }
 
+    WRITE_BITS_COND(state, (unsigned)al);
+
+cond_done:
+    {
+        unsigned rem_bytes = bw_nacc >> 3u;
+        bw_nacc &= 7u;
+        if (rem_bytes > 0u) {
+            if (bw_ptr + rem_bytes > bw_end) {
+                bw_overflow = 1;
+            } else {
+                for (unsigned b_i = 0u; b_i < rem_bytes; b_i++) {
+                    bw_ptr[b_i] = (uint8_t)(bw_acc >> (8u * b_i));
+                }
+                bw_ptr += rem_bytes;
+                bw_acc >>= rem_bytes * 8u;
+            }
+        }
+    }
+
+    bw->acc = bw_acc;
+    bw->nacc = bw_nacc;
+    bw->ptr = bw_ptr;
+    bw->overflow = bw_overflow;
+
+#undef WRITE_BITS_COND
+
     if (syms_allocated) zgec_free(syms);
-    zgec_bw_write(bw, state, (unsigned)al);
     if (bw->overflow) return 0;
     if (zgec_bw_finish(bw) == 0) return 0;
     return (size_t)(bw->ptr - bw->start);
