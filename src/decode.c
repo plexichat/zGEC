@@ -1034,11 +1034,47 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     }
     if (use_prev) {
         clsbuf[0] = 0;
-        for (i = 1; i < n; i++)
-            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
+        i = 1;
+        const uint32_t *ml_ptr = ml;
+#if defined(__AVX2__)
+        __m256i v_seven = _mm256_set1_epi32(6);
+        __m256i v_nineteen = _mm256_set1_epi32(18);
+        while (i + 8 <= n) {
+            __m256i v_ml = _mm256_loadu_si256((const __m256i *)(ml_ptr + i - 1));
+            __m256i c1 = _mm256_cmpgt_epi32(v_ml, v_seven);
+            __m256i c2 = _mm256_cmpgt_epi32(v_ml, v_nineteen);
+            __m256i v_cls = _mm256_sub_epi32(_mm256_sub_epi32(_mm256_setzero_si256(), c1), c2);
+            __m128i lo = _mm256_castsi256_si128(v_cls);
+            __m128i hi = _mm256_extracti128_si256(v_cls, 1);
+            __m128i p16 = _mm_packs_epi32(lo, hi);
+            __m128i p8 = _mm_packus_epi16(p16, p16);
+            zgec_wr64(clsbuf + i, (uint64_t)_mm_cvtsi128_si64(p8));
+            i += 8;
+        }
+#endif
+        for (; i < n; i++)
+            clsbuf[i] = (uint8_t)zgec_mlclass(ml_ptr[i - 1]);
     } else {
-        for (i = 0; i < n; i++)
-            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
+        i = 0;
+        const uint32_t *ml_ptr = ml;
+#if defined(__AVX2__)
+        __m256i v_seven = _mm256_set1_epi32(6);
+        __m256i v_nineteen = _mm256_set1_epi32(18);
+        while (i + 8 <= n) {
+            __m256i v_ml = _mm256_loadu_si256((const __m256i *)(ml_ptr + i));
+            __m256i c1 = _mm256_cmpgt_epi32(v_ml, v_seven);
+            __m256i c2 = _mm256_cmpgt_epi32(v_ml, v_nineteen);
+            __m256i v_cls = _mm256_sub_epi32(_mm256_sub_epi32(_mm256_setzero_si256(), c1), c2);
+            __m128i lo = _mm256_castsi256_si128(v_cls);
+            __m128i hi = _mm256_extracti128_si256(v_cls, 1);
+            __m128i p16 = _mm_packs_epi32(lo, hi);
+            __m128i p8 = _mm_packus_epi16(p16, p16);
+            zgec_wr64(clsbuf + i, (uint64_t)_mm_cvtsi128_si64(p8));
+            i += 8;
+        }
+#endif
+        for (; i < n; i++)
+            clsbuf[i] = (uint8_t)zgec_mlclass(ml_ptr[i]);
     }
     zgec_br_init(&br, stream, ssize);
     if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM_SENTINEL; }
@@ -1809,6 +1845,17 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                         i += 8;
                     }
                     for (; i < mlen; i++) d[i] = msrc[i % 2];
+                } else if (moff == 3 && mlen >= 6) {
+                    uint8_t s0 = msrc[0], s1 = msrc[1], s2 = msrc[2];
+                    uint64_t w64 = (uint64_t)s0 | ((uint64_t)s1 << 8) | ((uint64_t)s2 << 16) |
+                                   ((uint64_t)s0 << 24) | ((uint64_t)s1 << 32) | ((uint64_t)s2 << 40) |
+                                   ((uint64_t)s0 << 48) | ((uint64_t)s1 << 56);
+                    size_t i = 0;
+                    while (i + 8 <= mlen) {
+                        zgec_wr64(d + i, w64);
+                        i += 6;
+                    }
+                    for (; i < mlen; i++) d[i] = msrc[i % 3];
                 } else if (moff == 4 && mlen >= 8) {
                     uint32_t p32 = zgec_rd32(msrc);
                     __m256i v256 = _mm256_set1_epi32((int)p32);
