@@ -466,7 +466,9 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
             }
         }
     } else {
-        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+        size_t full = len[7];
+        int rs_empty = zgec_rs_is_empty(runstart, n_lit);
+        for (size_t round_p1 = max_rounds; round_p1 > full + 1; round_p1--) {
             size_t round = round_p1 - 1;
             for (int lane = 7; lane >= 0; lane--) {
                 int table_idx = 0;
@@ -485,6 +487,46 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 const zgec_rans_enc_table *tab = &tables[table_idx];
                 uint8_t s = Z[j];
                 if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                    zgec_free(words);
+                    return 0;
+                }
+            }
+        }
+        for (size_t round_p1 = full + 1; round_p1 > 1; round_p1--) {
+            size_t round = round_p1 - 1;
+            if (rs_empty) {
+                for (int lane = 7; lane >= 0; lane--) {
+                    if (round >= len[lane]) continue;
+                    size_t j = start[lane] + round;
+                    uint8_t pidx = idx_lut[Z[j - 1]];
+                    if (pidx == 0xFFu || (int)pidx > k) { zgec_free(words); return 0; }
+                    const zgec_rans_enc_table *tab = &tables[(int)pidx];
+                    if (zgec_rans_encode_symbol(tab, Z[j], &state[lane], words, &nwords, words_cap) != 0) {
+                        zgec_free(words);
+                        return 0;
+                    }
+                }
+            } else {
+                for (int lane = 7; lane >= 0; lane--) {
+                    if (round >= len[lane]) continue;
+                    size_t j = start[lane] + round;
+                    int table_idx = zgec_rs_get(runstart, j) ? k : (int)idx_lut[Z[j - 1]];
+                    if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
+                    const zgec_rans_enc_table *tab = &tables[table_idx];
+                    if (zgec_rans_encode_symbol(tab, Z[j], &state[lane], words, &nwords, words_cap) != 0) {
+                        zgec_free(words);
+                        return 0;
+                    }
+                }
+            }
+        }
+        if (max_rounds > 0) {
+            /* round 0: all active lanes with len[lane] > 0 */
+            const zgec_rans_enc_table *tab = &tables[k];
+            for (int lane = 7; lane >= 0; lane--) {
+                if (len[lane] == 0) continue;
+                size_t j = start[lane];
+                if (zgec_rans_encode_symbol(tab, Z[j], &state[lane], words, &nwords, words_cap) != 0) {
                     zgec_free(words);
                     return 0;
                 }
