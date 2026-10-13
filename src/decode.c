@@ -68,10 +68,12 @@ static void zgec_block_arrays_free(zgec_block_arrays *a)
     if (a->segs) {
         for (size_t i = 0; i < a->n_seg; i++) {
             zgec_free(a->segs[i].ll);
-            zgec_free(a->segs[i].ml);
-            zgec_free(a->segs[i].of);
-            zgec_free(a->segs[i].rep0_before);
+            a->segs[i].ll = NULL;
+            a->segs[i].ml = NULL;
+            a->segs[i].of = NULL;
+            a->segs[i].rep0_before = NULL;
             zgec_free(a->segs[i].lit);
+            a->segs[i].lit = NULL;
         }
         zgec_free(a->segs);
     }
@@ -1215,35 +1217,23 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     seg->ll_cond = h.ctx_ll;
 
     if (seg->n_seq > 0) {
-        seg->ll = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->ml = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->of = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->rep0_before =
-            (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        if (!seg->ll || !seg->ml || !seg->of || !seg->rep0_before) {
-            zgec_free(seg->ll);
-            zgec_free(seg->ml);
-            zgec_free(seg->of);
-            zgec_free(seg->rep0_before);
-            seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
-            return ZGEC_ERR_NOMEM;
-        }
+        if (seg->n_seq > SIZE_MAX / (4u * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
+        uint32_t *seq_buf = (uint32_t *)zgec_alloc(4u * seg->n_seq * sizeof(uint32_t), 64);
+        if (!seq_buf) return ZGEC_ERR_NOMEM;
+        seg->ll = seq_buf;
+        seg->ml = seq_buf + seg->n_seq;
+        seg->of = seq_buf + 2u * seg->n_seq;
+        seg->rep0_before = seq_buf + 3u * seg->n_seq;
     }
     if (seg->n_lit > 0) {
         if (!lit_buf_fits(seg->n_lit)) {
             zgec_free(seg->ll);
-            zgec_free(seg->ml);
-            zgec_free(seg->of);
-            zgec_free(seg->rep0_before);
             seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
             return ZGEC_ERR_NOMEM;
         }
         seg->lit = (uint8_t *)zgec_alloc(seg->n_lit + ZGEC_LIT_SLACK, 64);
         if (!seg->lit) {
             zgec_free(seg->ll);
-            zgec_free(seg->ml);
-            zgec_free(seg->of);
-            zgec_free(seg->rep0_before);
             seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
             return ZGEC_ERR_NOMEM;
         }
