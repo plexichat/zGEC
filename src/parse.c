@@ -321,7 +321,7 @@ static double parse_lbar(const uint32_t *lit_hist, size_t total)
     t = (double)total + PARSE_LBAR_PRIOR * 256.0;
     for (s = 0; s < 256; s++) {
         double c = (double)lit_hist[s] + PARSE_LBAR_PRIOR;
-        bits += c * (log(t) - log(c));
+        bits += c * (log2(t) - log2(c));
     }
     per = bits / (double)total;
     if (per < 2.0) per = 2.0;
