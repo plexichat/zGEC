@@ -419,7 +419,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #define ZGEC_FAST_SHORT_HASH_BYTES 5u
 #endif
 #ifndef ZGEC_FAST_INS_ALL
-#define ZGEC_FAST_INS_ALL 0
+#define ZGEC_FAST_INS_ALL 1
 #endif
 #ifndef ZGEC_FAST_INS_STRIDE
 #define ZGEC_FAST_INS_STRIDE 1
