@@ -70,6 +70,8 @@
 #include <assert.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
 #endif
 
 /* Entry layout: 24-bit position (stored as pos + 1)
@@ -470,6 +472,17 @@ static uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32
                       (uint64_t)zgec_rd64(dst + (size_t)len + 24u);
         if (d3 != 0u) return len + 24u + ((uint32_t)__builtin_ctzll(d3) >> 3);
         len += 32u;
+    }
+#endif
+#if defined(__AVX2__) || defined(__SSE2__)
+    while (len + 16u <= cap) {
+        __m128i a16 = _mm_loadu_si128((const __m128i *)(const void *)(src + len));
+        __m128i b16 = _mm_loadu_si128((const __m128i *)(const void *)(dst + len));
+        unsigned m16 = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(a16, b16));
+        if (m16 != 0xFFFFu) {
+            return len + (uint32_t)__builtin_ctz(~m16);
+        }
+        len += 16u;
     }
 #endif
     while (len + 8u <= cap) {
@@ -1030,14 +1043,11 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 /* Retained explicit capacity check on the long-table path:
                  * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
-                    /* A candidate can only beat `best` if it matches at
-                     * best.length - 1 as well; one byte compare there skips
-                     * the length scan for the candidates that cannot. */
-                    if (best.length == 0u || best.length > cap ||
-                        vb[ip - (size_t)d + (size_t)best.length - 1u] ==
-                        vb[ip + (size_t)best.length - 1u]) {
+                    uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
+                    size_t check_idx_long = (size_t)target_len_long - 1u;
+                    if (check_idx_long < (size_t)cap &&
+                        vb[ip - (size_t)d + check_idx_long] == vb[ip + check_idx_long]) {
                         uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                        uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
                                 len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
@@ -1142,17 +1152,18 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                  * pos < ip keeps the 8-byte read inside the buffer, so
                  * dropping the screen removes a load without adding a
                  * candidate. */
-                /* A candidate can only beat `best` if it matches at
-                 * best.length - 1 as well; one byte compare there skips
-                 * the length scan for the candidates that cannot. */
-                if (best.length != 0u && best.length <= cap &&
-                    vb[ip - (size_t)d + (size_t)best.length - 1u] !=
-                    vb[ip + (size_t)best.length - 1u]) {
+                /* Candidate character filtering check:
+                 * A candidate can only beat `best` (or reach `hash_min`) if it matches
+                 * at target_len - 1 as well; one byte compare there skips
+                 * 64-bit loads and diff operations for candidates that cannot. */
+                uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
+                size_t check_idx = (size_t)target_len - 1u;
+                if (check_idx >= (size_t)cap ||
+                    vb[ip - (size_t)d + check_idx] != vb[ip + check_idx]) {
                     continue;
                 }
                 if (has_v8) {
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                    uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);

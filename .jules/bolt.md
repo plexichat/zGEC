@@ -190,3 +190,14 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Unaligned Memcpy Inline Reads, Hoisted Parser Literal Costs, and SSE2 16-byte Match Extensions
+
+**Learning:**
+1. Implementing `zgec_rd16`/`32`/`64` and `zgec_wr16`/`32`/`64` with `memcpy` on little-endian architectures allows compilers (GCC/Clang) to emit single unaligned load/store instructions (`mov`/`movdqu`) instead of multi-instruction byte shift/OR loops while maintaining portable C standards.
+2. In `zgec_parse_block_ex` (`src/parse.c`), hoisting literal length cost (`parse_ll_cost`) per position `ip` and using `parse_score_fast` eliminates redundant calls to `zgec_seq_code_of(ll)` across main and repeat offset candidate match scoring loops.
+3. In `zgec_matcher_find_lens` (`src/match.c`), checking candidate bytes against `target_len = max(best.length, hash_min)` prior to 64-bit loads/diffs skips non-matching candidates branchlessly.
+4. In `mf_match_len_slow` (`src/match.c`), adding a 16-byte SSE2 SIMD comparison loop (`_mm_loadu_si128` + `_mm_cmpeq_epi8` + `_mm_movemask_epi8`) accelerates match length extensions when match lengths fall between 16 and 39 bytes where 32-byte AVX2 loops do not fire.
+
+**Action:**
+Use `memcpy` for unaligned little-endian memory access helpers, hoist per-position literal length sequence costs in optimal parser price gates, and use 16-byte SSE2 SIMD steps for short-to-medium match extension loops.
