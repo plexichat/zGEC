@@ -224,13 +224,19 @@ static unsigned parse_skip_shift(zgec_tier tier)
     }
 }
 
-/* Fixed fallback minimum non-repeat length for the
- * first implementation: 5, 6 beyond 256 KiB
- * (section 11.4). Repeat offsets keep minimum 4. */
+/* Minimum non-repeat length (section 11.4). A 5-byte short hash cannot
+ * find a 4-byte match, so 5 is the floor the format's hashing imposes;
+ * 4 stays available to repeat offsets. The old fallback raised the main
+ * tier's floor to 6 past 256 KiB, but that discarded the profitable
+ * 5-byte matches the fast tier keeps, and left the main tier *worse*
+ * than the fast one on binary data once its literals were priced in
+ * bits (mr 2.69 vs 2.81 at level 6). Keep 5 everywhere: the price gate
+ * above, not a length floor, decides whether a match pays. */
 static uint32_t parse_min_norep(size_t ip, zgec_tier tier)
 {
-    if (tier >= ZGEC_TIER_HIGH) return 5u;
-    return (ip >= (size_t)262144) ? 6u : 5u;
+    (void)ip;
+    (void)tier;
+    return 5u;
 }
 
 /* Offbase selection is the shared zgec_reps_encode helper (section 8.2);

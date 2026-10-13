@@ -863,7 +863,10 @@ previous segment's actual code statistics (offset cost from the leading-zero cou
 extra bits). The initial estimate is 6 bits per literal. This replaces fixed offset thresholds, adapts
 as context modelling makes literals cheaper, and lowers the sequence count, which speeds decoding. The
 same score drives the lazy comparison. A fixed fallback (minimum length 5, 6 beyond 256 KiB) is
-acceptable in the first implementation.
+acceptable in the first implementation. The reference encoder drops the 6-byte half: at the 2 MiB
+block it priced the same 5-byte matches the fast tier accepts out of the parse on binary data (mr
+2.69 vs 2.81 at level 6) and cost more in ratio than the shorter matches cost in speed. The price
+gate above, not a length floor, is the intended decision point.
 
 ### 11.5 Segmentation
 
