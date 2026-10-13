@@ -1303,8 +1303,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         /* Lazy evaluation at ip + 1, driven by the
          * same price score and selected with a
          * conditional move on the score. */
-        if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
-            cur_len <= PARSE_LAZY_MAX_LEN &&
+        uint32_t lazy_max = (tier == ZGEC_TIER_HIGH) ? 64u : PARSE_LAZY_MAX_LEN;
+        if (lazy_max > 0u && cur_len > 0u &&
+            cur_len <= lazy_max &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
                                               reps.rep[0], reps.rep[1], reps.rep[2], 4u,

@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Target Length Candidate Pre-Filtering and High-Tier Lazy Ceiling Expansion
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), short bucket and long table candidate probes previously checked candidate byte matching only when `best.length > 0`. Computing `target_len = max(best.length, hash_min)` and pre-filtering candidate bytes at `target_len - 1` before fetching 64-bit unaligned words skips false hash-tag collisions branchlessly even when no best match has been established yet.
+2. In `zgec_parse_block_ex` (`src/parse.c`), expanding lazy lookahead max match length (`lazy_max`) to 64 for `ZGEC_TIER_HIGH` enables high-tier preset levels (levels 15-25) to evaluate longer candidate matches during lookahead probing, yielding higher compression density across large virtual block windows.
+
+**Action:**
+In LZ match finders, calculate `target_len = max(best.length, hash_min)` to pre-screen candidate matches at `target_len - 1` prior to 64-bit memory reads, and expand lazy evaluation limits for top-tier compression levels.
