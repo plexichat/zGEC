@@ -1034,10 +1034,42 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     }
     if (use_prev) {
         clsbuf[0] = 0;
-        for (i = 1; i < n; i++)
+        i = 1;
+#if defined(__AVX2__)
+        __m256i v_six = _mm256_set1_epi32(6);
+        __m256i v_eighteen = _mm256_set1_epi32(18);
+        for (; i + 8 <= n; i += 8) {
+            __m256i v_ml = _mm256_loadu_si256((const __m256i *)(ml + i - 1));
+            __m256i v1 = _mm256_cmpgt_epi32(v_ml, v_six);
+            __m256i v2 = _mm256_cmpgt_epi32(v_ml, v_eighteen);
+            __m256i v_cls = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(v1, v2));
+            __m256i v16 = _mm256_packs_epi32(v_cls, v_cls);
+            __m256i v8b = _mm256_packus_epi16(v16, v16);
+            uint32_t lo = (uint32_t)_mm256_cvtsi256_si32(v8b);
+            uint32_t hi = (uint32_t)_mm256_extract_epi32(v8b, 4);
+            zgec_wr64(clsbuf + i, (uint64_t)lo | ((uint64_t)hi << 32));
+        }
+#endif
+        for (; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
     } else {
-        for (i = 0; i < n; i++)
+        i = 0;
+#if defined(__AVX2__)
+        __m256i v_six = _mm256_set1_epi32(6);
+        __m256i v_eighteen = _mm256_set1_epi32(18);
+        for (; i + 8 <= n; i += 8) {
+            __m256i v_ml = _mm256_loadu_si256((const __m256i *)(ml + i));
+            __m256i v1 = _mm256_cmpgt_epi32(v_ml, v_six);
+            __m256i v2 = _mm256_cmpgt_epi32(v_ml, v_eighteen);
+            __m256i v_cls = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(v1, v2));
+            __m256i v16 = _mm256_packs_epi32(v_cls, v_cls);
+            __m256i v8b = _mm256_packus_epi16(v16, v16);
+            uint32_t lo = (uint32_t)_mm256_cvtsi256_si32(v8b);
+            uint32_t hi = (uint32_t)_mm256_extract_epi32(v8b, 4);
+            zgec_wr64(clsbuf + i, (uint64_t)lo | ((uint64_t)hi << 32));
+        }
+#endif
+        for (; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
     }
     zgec_br_init(&br, stream, ssize);
