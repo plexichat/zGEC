@@ -259,6 +259,10 @@ static inline int zgec_add_overflows(size_t a, size_t b) {
     return a > SIZE_MAX - b;
 }
 
+static inline int zgec_mul_overflows(size_t a, size_t b) {
+    return a != 0u && b > SIZE_MAX / a;
+}
+
 /* ---- memory helpers (aligned) ---- */
 void *zgec_alloc(size_t n, size_t align);
 void  zgec_free(void *p);

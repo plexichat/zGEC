@@ -68,9 +68,7 @@ static void zgec_block_arrays_free(zgec_block_arrays *a)
     if (a->segs) {
         for (size_t i = 0; i < a->n_seg; i++) {
             zgec_free(a->segs[i].ll);
-            zgec_free(a->segs[i].ml);
-            zgec_free(a->segs[i].of);
-            zgec_free(a->segs[i].rep0_before);
+            a->segs[i].ml = a->segs[i].of = a->segs[i].rep0_before = NULL;
             zgec_free(a->segs[i].lit);
         }
         zgec_free(a->segs);
@@ -1215,35 +1213,28 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     seg->ll_cond = h.ctx_ll;
 
     if (seg->n_seq > 0) {
-        seg->ll = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->ml = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->of = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->rep0_before =
-            (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        if (!seg->ll || !seg->ml || !seg->of || !seg->rep0_before) {
+        if (zgec_mul_overflows(seg->n_seq, 4 * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
+        uint32_t *seq_buf = (uint32_t *)zgec_alloc(4 * seg->n_seq * sizeof(uint32_t), 64);
+        if (!seq_buf) return ZGEC_ERR_NOMEM;
+        seg->ll = seq_buf;
+        seg->ml = seq_buf + seg->n_seq;
+        seg->of = seq_buf + 2 * seg->n_seq;
+        seg->rep0_before = seq_buf + 3 * seg->n_seq;
+    }
+    if (seg->n_lit > 0) {
+        if (zgec_add_overflows(seg->n_lit, ZGEC_LIT_SLACK)) {
             zgec_free(seg->ll);
-            zgec_free(seg->ml);
-            zgec_free(seg->of);
-            zgec_free(seg->rep0_before);
             seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
             return ZGEC_ERR_NOMEM;
         }
-    }
-    if (seg->n_lit > 0) {
         if (!lit_buf_fits(seg->n_lit)) {
             zgec_free(seg->ll);
-            zgec_free(seg->ml);
-            zgec_free(seg->of);
-            zgec_free(seg->rep0_before);
             seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
             return ZGEC_ERR_NOMEM;
         }
         seg->lit = (uint8_t *)zgec_alloc(seg->n_lit + ZGEC_LIT_SLACK, 64);
         if (!seg->lit) {
             zgec_free(seg->ll);
-            zgec_free(seg->ml);
-            zgec_free(seg->of);
-            zgec_free(seg->rep0_before);
             seg->ll = seg->ml = seg->of = seg->rep0_before = NULL;
             return ZGEC_ERR_NOMEM;
         }
@@ -2398,6 +2389,8 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         size_t seg_size;
         const uint8_t *lit_stream;
         const uint8_t *ll_stream;
+        uint8_t stack_rs[8192];
+        uint32_t stack_ll[2048];
         uint32_t *ll = NULL;
         uint8_t *runstart = NULL;
         uint64_t sum_ll = 0;
@@ -2438,10 +2431,15 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         lit_stream = seg_buf + h.header_size;
         ll_stream = lit_stream + (size_t)h.lit_size;
         if (h.n_lit > 0 && h.lit_coder != 0 && h.k > 1) {
-            runstart = (uint8_t *)zgec_alloc(zgec_rs_bytes((size_t)h.n_lit), 1);
-            if (!runstart) {
-                e = ZGEC_ERR_NOMEM;
-                goto efail;
+            size_t rs_bytes = zgec_rs_bytes((size_t)h.n_lit);
+            if (rs_bytes <= sizeof(stack_rs)) {
+                runstart = stack_rs;
+            } else {
+                runstart = (uint8_t *)zgec_alloc(rs_bytes, 1);
+                if (!runstart) {
+                    e = ZGEC_ERR_NOMEM;
+                    goto efail;
+                }
             }
             zgec_rs_clear(runstart, (size_t)h.n_lit);
         }
@@ -2453,24 +2451,33 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
          * before the LL array because this loop writes it, so every
          * failure path below releases it too. */
         if (h.n_seq > 0) {
-            ll = (uint32_t *)zgec_alloc((size_t)h.n_seq * sizeof(uint32_t), 64);
-            if (!ll) {
-                zgec_free(runstart);
+            if (zgec_mul_overflows((size_t)h.n_seq, sizeof(uint32_t))) {
+                if (runstart && runstart != stack_rs) zgec_free(runstart);
                 e = ZGEC_ERR_NOMEM;
                 goto efail;
+            }
+            if ((size_t)h.n_seq <= sizeof(stack_ll) / sizeof(stack_ll[0])) {
+                ll = stack_ll;
+            } else {
+                ll = (uint32_t *)zgec_alloc((size_t)h.n_seq * sizeof(uint32_t), 64);
+                if (!ll) {
+                    if (runstart && runstart != stack_rs) zgec_free(runstart);
+                    e = ZGEC_ERR_NOMEM;
+                    goto efail;
+                }
             }
             e = seq_decode_one(ll, (size_t)h.n_seq, cur.ll[0],
                                cur.ll_rle[0], ll_stream, (size_t)h.ll_size);
             if (e != ZGEC_OK) {
-                zgec_free(ll);
-                zgec_free(runstart);
+                if (ll && ll != stack_ll) zgec_free(ll);
+                if (runstart && runstart != stack_rs) zgec_free(runstart);
                 goto efail;
             }
             for (j = 0; j < (size_t)h.n_seq; j++) {
                 sum_ll += (uint64_t)ll[j];
                 if (sum_ll > (uint64_t)h.n_lit) {
-                    zgec_free(ll);
-                    zgec_free(runstart);
+                    if (ll && ll != stack_ll) zgec_free(ll);
+                    if (runstart && runstart != stack_rs) zgec_free(runstart);
                     e = ZGEC_ERR_LL_SUM;
                     goto efail;
                 }
@@ -2481,8 +2488,8 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         if (sum_ll < (uint64_t)h.n_lit && h.n_lit > 0 && runstart)
             zgec_rs_set(runstart, (size_t)sum_ll);
         if (lit_len + (size_t)h.n_lit < lit_len) {
-            zgec_free(ll);
-            zgec_free(runstart);
+            if (ll && ll != stack_ll) zgec_free(ll);
+            if (runstart && runstart != stack_rs) zgec_free(runstart);
             e = ZGEC_ERR_OUTPUT_SIZE;
             goto efail;
         }
@@ -2491,8 +2498,8 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
             size_t nc = lit_cap ? lit_cap : 1024;
             uint8_t *nb;
             if (need > SIZE_MAX - 1024) {
-                zgec_free(ll);
-                zgec_free(runstart);
+                if (ll && ll != stack_ll) zgec_free(ll);
+                if (runstart && runstart != stack_rs) zgec_free(runstart);
                 e = ZGEC_ERR_OUTPUT_SIZE;
                 goto efail;
             }
@@ -2502,8 +2509,8 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
             }
             nb = (uint8_t *)zgec_alloc(nc ? nc : 1, 64);
             if (!nb) {
-                zgec_free(ll);
-                zgec_free(runstart);
+                if (ll && ll != stack_ll) zgec_free(ll);
+                if (runstart && runstart != stack_rs) zgec_free(runstart);
                 e = ZGEC_ERR_NOMEM;
                 goto efail;
             }
@@ -2527,15 +2534,15 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
                                          h.class_map, runstart);
                 }
                 if (e != ZGEC_OK) {
-                    zgec_free(ll);
-                    zgec_free(runstart);
+                    if (ll && ll != stack_ll) zgec_free(ll);
+                    if (runstart && runstart != stack_rs) zgec_free(runstart);
                     goto efail;
                 }
             }
             lit_len += (size_t)h.n_lit;
         }
-        zgec_free(ll);
-        zgec_free(runstart);
+        if (ll && ll != stack_ll) zgec_free(ll);
+        if (runstart && runstart != stack_rs) zgec_free(runstart);
         seg_tables_free(&prev);
         prev = cur;
         seg_tables_init(&cur);

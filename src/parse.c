@@ -1306,9 +1306,10 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
-            zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
-                                              (uint32_t)(end - (ip + (size_t)1)));
+            uint32_t nrep_len[3] = {0};
+            zgec_match nm = zgec_matcher_find_lens(m, vb, ip + (size_t)1,
+                                                   reps.rep[0], reps.rep[1], reps.rep[2], 4u,
+                                                   (uint32_t)(end - (ip + (size_t)1)), nrep_len);
             uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
             uint32_t nis_rep = (nm.length >= 4u &&
                                 (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
@@ -1329,6 +1330,26 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                 nscore = parse_score(nm.length, nll, noffbase,
                                      l2tot, ll_base, ml_base, of_base,
                                      lbar, lscale);
+            }
+            {
+                unsigned nreps = (tier == ZGEC_TIER_FAST) ? 1u : 3u;
+                for (unsigned ri = 0u; ri < nreps; ri++) {
+                    uint32_t roff = reps.rep[ri];
+                    if (roff != 0u && (size_t)roff <= ip + (size_t)1 && (size_t)roff <= (1u << 24)) {
+                        if (nrep_len[ri] >= 4u) {
+                            if ((double)nrep_len[ri] * lbar > base && (double)nrep_len[ri] * lbar > nscore) {
+                                uint32_t rlen = nrep_len[ri];
+                                uint32_t roffbase = parse_offbase(roff, &reps);
+                                double rscore = parse_score(rlen, nll, roffbase,
+                                                            l2tot, ll_base, ml_base, of_base,
+                                                            lbar, lscale);
+                                if (rscore > nscore) {
+                                    nscore = rscore;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             /* cmov-style: the score comparison feeds a
              * 0/1 select, not a length branch. */
