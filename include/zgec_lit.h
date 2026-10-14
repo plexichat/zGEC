@@ -27,6 +27,10 @@
  * against the byte at the current repeat offset.
  */
 
+/* Classification lookup tables (Annex C) */
+extern const uint8_t zgec_ctx_text_lut[256];
+extern const uint8_t zgec_ctx_signed_lut[256];
+
 /* Classification functions (Annex C). Maps a byte to one
  * of 64 classes. */
 unsigned zgec_classify(int ctx_mode, uint8_t b);

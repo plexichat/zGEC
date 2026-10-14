@@ -1,4 +1,4 @@
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_seq.h"
@@ -355,9 +355,34 @@ int zgec_normalize_counts(int16_t *counts, const uint32_t *hist,
     int S = 1 << al;
     uint64_t total = 0;
     int n_non_zero = 0;
-    for (int s = 0; s < nsym; s++) {
-        total += hist[s];
-        if (hist[s] > 0) n_non_zero++;
+    int i_sym = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    __m256i vcnt = _mm256_setzero_si256();
+    __m256i vzero = _mm256_setzero_si256();
+    for (; i_sym + 8 <= nsym; i_sym += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + i_sym));
+        vsum = _mm256_add_epi32(vsum, v);
+        __m256i mask = _mm256_cmpgt_epi32(v, vzero);
+        vcnt = _mm256_sub_epi32(vcnt, mask);
+    }
+    __m128i vlow_sum = _mm256_castsi256_si128(vsum);
+    __m128i vhigh_sum = _mm256_extracti128_si256(vsum, 1);
+    vlow_sum = _mm_add_epi32(vlow_sum, vhigh_sum);
+    vlow_sum = _mm_hadd_epi32(vlow_sum, vlow_sum);
+    vlow_sum = _mm_hadd_epi32(vlow_sum, vlow_sum);
+    total = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow_sum);
+
+    __m128i vlow_cnt = _mm256_castsi256_si128(vcnt);
+    __m128i vhigh_cnt = _mm256_extracti128_si256(vcnt, 1);
+    vlow_cnt = _mm_add_epi32(vlow_cnt, vhigh_cnt);
+    vlow_cnt = _mm_hadd_epi32(vlow_cnt, vlow_cnt);
+    vlow_cnt = _mm_hadd_epi32(vlow_cnt, vlow_cnt);
+    n_non_zero = (int)(uint32_t)_mm_cvtsi128_si32(vlow_cnt);
+#endif
+    for (; i_sym < nsym; i_sym++) {
+        total += hist[i_sym];
+        if (hist[i_sym] > 0) n_non_zero++;
     }
     if (n_non_zero > S) return 0;
     if (total == 0 || n_non_zero == 0) {

@@ -6,7 +6,7 @@
 
 /* ---- Annex C classification ---- */
 
-static const uint8_t text_table[256] = {
+const uint8_t zgec_ctx_text_lut[256] = {
     [0x00] = 2,
     [0x09] = 1, [0x0A] = 0, [0x0D] = 1,
     /* Annex C: other 0x01-0x1F => 3 (remaining control characters). */
@@ -80,7 +80,7 @@ static const uint8_t text_table[256] = {
     [0xFC] = 49, [0xFD] = 49, [0xFE] = 49, [0xFF] = 49,
 };
 
-static const uint8_t signed_table[256] = {
+const uint8_t zgec_ctx_signed_lut[256] = {
     [0x00] = 32, [0x01] = 33, [0x02] = 34, [0x03] = 35, [0x04] = 36, [0x05] = 37, [0x06] = 38, [0x07] = 39,
     [0x08] = 40, [0x09] = 41, [0x0A] = 42, [0x0B] = 43, [0x0C] = 44, [0x0D] = 45, [0x0E] = 46, [0x0F] = 47,
     [0x10] = 48, [0x11] = 49, [0x12] = 50, [0x13] = 51, [0x14] = 52, [0x15] = 53, [0x16] = 54, [0x17] = 55,
@@ -125,9 +125,9 @@ unsigned zgec_classify(int ctx_mode, uint8_t b)
     case 2:
         return (unsigned)(b >> 2u);
     case 3:
-        return (unsigned)text_table[b];
+        return (unsigned)zgec_ctx_text_lut[b];
     case 4:
-        return (unsigned)signed_table[b];
+        return (unsigned)zgec_ctx_signed_lut[b];
     default:
         return 0;
     }
