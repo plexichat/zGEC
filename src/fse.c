@@ -657,23 +657,24 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
      * exceeds 63 afterwards, so `w >> nacc` is never a shift by 64. The
      * `left > 16u` test keeps nb <= 7 well inside the stream, so the 8-byte
      * load at ptr-7 never reads below the stream start. */
+    const zgec_fse_dec_entry *te = t->e;
+
     if (!syms && out && base && nbits) {
-    
+        if (nbits != NULL) {
+            for (int s = 0; s < t->nsym; s++) {
+                if (nbits[s] > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+            }
+        }
         while (i + 1 < n && left > 16u) {
-            const zgec_fse_dec_entry *e = &t->e[state];
-            unsigned sym;
-            unsigned xb;
+            const zgec_fse_dec_entry *e = &te[state];
+            unsigned sym = (unsigned)e->symbol;
+            unsigned xb = (unsigned)nbits[sym];
             uint32_t extra;
             unsigned nbq;
             uint32_t bits;
             int32_t next;
             unsigned nb;
             uint64_t w;
-
-            if (e->symbol < 0 || e->symbol >= t->nsym) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
-            sym = (unsigned)e->symbol;
-            xb = (unsigned)nbits[sym];
-            if (xb > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
 
             /* refill to 56..63 bits */
             if (nacc < 56u) {
@@ -702,9 +703,14 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             i++;
         }
     } else {
+        if (nbits != NULL) {
+            for (int s = 0; s < t->nsym; s++) {
+                if (nbits[s] > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+            }
+        }
         while (i + 1 < n && left > 16u) {
-            const zgec_fse_dec_entry *e = &t->e[state];
-            unsigned sym;
+            const zgec_fse_dec_entry *e = &te[state];
+            unsigned sym = (unsigned)e->symbol;
             unsigned xb = 0u;
             uint32_t extra;
             unsigned nbq;
@@ -712,10 +718,8 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             int32_t next;
             unsigned nb;
             uint64_t w;
-            if (e->symbol < 0 || e->symbol >= t->nsym) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
-            sym = (unsigned)e->symbol;
+
             if (nbits != NULL) xb = (unsigned)nbits[sym];
-            if (xb > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
 
             /* refill to 56..63 bits */
             if (nacc < 56u) {
@@ -736,7 +740,7 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             acc <<= nbq;
             nacc -= nbq;
             next = e->baseline + (int32_t)bits;
-            if (next < 0 || next >= (int32_t)S) { err = ZGEC_ERR_BITSTREAM; goto bad; }
+            if ((unsigned)next >= S) { err = ZGEC_ERR_BITSTREAM; goto bad; }
             state = (unsigned)next;
             i++;
         }
