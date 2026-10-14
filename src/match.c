@@ -441,8 +441,15 @@ static inline __attribute__((always_inline)) uint32_t mf_len8(const uint8_t *src
 static uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32_t cap)
 {
     uint32_t len = 8u;
+    if (len + 8u <= cap) {
+        uint64_t diff = zgec_rd64(src + 8) ^ zgec_rd64(dst + 8);
+        if (diff != 0u) {
+            return 8u + ((uint32_t)__builtin_ctzll(diff) >> 3);
+        }
+        len = 16u;
+    }
 #if defined(__AVX2__)
-    /* Extend beyond the first 8 bytes 32 at a time; a 32-byte
+    /* Extend beyond the first 16 bytes 32 at a time; a 32-byte
      * movemask finds the first differing byte directly. */
     while (len + 32u <= cap) {
         __m256i a = _mm256_loadu_si256((const __m256i *)(const void *)(src + len));
@@ -1040,12 +1047,19 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
+                                if (target_len_long <= cap && target_len_long > 8u) {
+                                    if ((zgec_rd64(vb + ip - (size_t)d + target_len_long - 8u) ^
+                                         zgec_rd64(vb + ip + target_len_long - 8u)) != 0u) {
+                                        goto skip_long;
+                                    }
+                                }
                                 len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                                 if (len >= hash_min) {
                                     mf_update_best(d, len, &best, rep0, rep1, rep2,
                                                    &best_is_rep);
                                 }
                             }
+                        skip_long:;
                         } else {
                             uint64_t diff_mask = (1ULL << (target_len_long * 8u)) - 1ULL;
                             if ((diff & diff_mask) == 0u) {
@@ -1155,6 +1169,12 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
+                        if (target_len <= cap && target_len > 8u) {
+                            if ((zgec_rd64(vb + ip - (size_t)d + target_len - 8u) ^
+                                 zgec_rd64(vb + ip + target_len - 8u)) != 0u) {
+                                continue;
+                            }
+                        }
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
                         uint64_t diff_mask = (1ULL << (target_len * 8u)) - 1ULL;

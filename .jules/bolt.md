@@ -157,30 +157,11 @@ In LZ match parsers, stride intermediate match positions during insertion for lo
 ## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
 
 **Learning:**
-1. In  (), checking repeat offset candidates previously used a 32-bit compare followed by . Replacing with a single 64-bit load XOR  and branchless  for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
-2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (, ) and dual hash calculations (, ) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
-
-**Action:**
-In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and , and unroll match-interior table insertion loops for improved store pipelining.
-
-## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
-
-**Learning:**
 1. In fast_parse (src/parse.c), checking repeat offset candidates previously used a 32-bit compare followed by fast_match_len. Replacing with a single 64-bit load XOR zgec_rd64(vb + ip - r) ^ cur8 and branchless __builtin_ctzll(diff) >> 3 for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
 2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (iv0, iv1) and dual hash calculations (hs0/hl0, hs1/hl1) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
 
 **Action:**
 In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and ctzll, and unroll match-interior table insertion loops for improved store pipelining.
-## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
-
-**Learning:**
-1. In rANS encoding ( in ), precomputing  in  eliminates repeated 64-bit shifts () per symbol. Replacing 64-bit signed division () with 32-bit unsigned wraparound math () removes 64-bit integer conversion overhead in the inner encoding loop.
-2. In  () and  (), checking  before iterating over literals bypasses bitwise  queries whenever no run-starts exist.
-3. In  for single-context streams (), unrolling the 4-way loop to 16-way increases instruction-level parallelism and L1 cache throughput.
-
-**Action:**
-Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
-
 ## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
 
 **Learning:**
@@ -190,3 +171,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Target End-Window Candidate Filtering and 64-bit Short-to-Medium Match Length Fast Paths
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), when probing short and long bucket match candidates where `target_len > 8` (where `target_len = max(best.length, hash_min)`), candidates that matched the first 8 bytes previously entered `mf_match_len_slow` even when they differed before reaching `target_len`. Pre-checking whether `zgec_rd64(vb + ip - d + target_len - 8) ^ zgec_rd64(vb + ip + target_len - 8) != 0` branchlessly skips candidates whose end 8-byte window fails to align with the target, avoiding millions of redundant `mf_match_len_slow` extension loops.
+2. In `mf_match_len_slow` (`src/match.c`), adding an early 64-bit unaligned load XOR check for `len = 8` (bytes 8..15) before entering the 32-byte AVX2 vector loop accelerates match length extension for common 8–15 byte matches without AVX2 SIMD register setup overhead, dropping `mf_match_len_slow` runtime share from 35% to 5% on high-tier benchmarks.
+
+**Action:**
+Filter candidate matches against `target_len - 8` end-window alignment using 64-bit XOR loads before invoking match extension routines, and check `len = 8` (bytes 8..15) with scalar 64-bit XOR prior to wide AVX2 vector loops.
