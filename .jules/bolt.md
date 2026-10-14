@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Target Length Candidate Filtering, Precomputed Diff Masks, and Short Match Unrolling
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), short bucket and long table candidate probes previously checked candidate bytes against `best.length - 1`. When `best.length == 0`, candidates bypassed the boundary check entirely even when failing the `hash_min` threshold. Updating the boundary target to `target_len = max(best.length, hash_min)` and filtering `vb[ip - d + target_len - 1] != vb[ip + target_len - 1]` skips failing candidate memory loads branchlessly across all positions.
+2. Replacing variable 64-bit diff mask bitwise shifts `(1ULL << (target_len * 8)) - 1ULL` with a static 9-entry lookup table (`zgec_mask_table`) removes variable bit shifts in inner candidate search loops.
+3. Unrolling 64-bit unaligned load XOR byte comparisons for `len = 8` and `len = 16` in `mf_match_len_slow` prior to entering the 32-byte AVX2 loop accelerates short-to-medium match extensions without vector setup overhead.
+
+**Action:**
+Filter candidate matches against `target_len = max(best.length, hash_min)` boundary bytes before issuing 64-bit diff loads, precompute 64-bit diff masks in static array lookup tables, and unroll short 64-bit unaligned load extensions before entering 32-byte AVX2 SIMD loops.
