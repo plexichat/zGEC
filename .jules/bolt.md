@@ -190,3 +190,14 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Decompression AVX2 Pattern Broadcasting, Sub-Literal Prefix Sums and 4-Wide CRC32C
+
+**Learning:**
+1. In `exec_block` (`src/decode.c`), LZ77 match copying for small odd offsets (`moff = 3, 5, 6, 7`) previously fell back to scalar byte-by-byte loops. Broadcasting `moff`-length byte patterns into 256-bit AVX2 registers using lane-aware `_mm256_shuffle_epi8` masks enables copying 32-byte chunks in a single AVX2 store, dramatically speeding up small-offset match reconstruction.
+2. In `exec_literals_sub` (`src/decode.c`), for sub-literal prediction with `rep0 == 1`, 8-bit parallel prefix sums (`_mm_slli_si128` + `_mm_add_epi8`) compute 16 cumulative sub-literal additions per SIMD iteration. For `rep0 >= 16`, 16-byte SSE/AVX2 vector loads and additions (`_mm_add_epi8`) reconstruct sub-literals efficiently.
+3. In `seq_decode_cond` (`src/decode.c`), vectorizing `zgec_mlclass` match-length classification using 256-bit AVX2 SIMD (`_mm256_cmpgt_epi32`, `_mm256_add_epi32`, `_mm_packus_epi16`) processes 8 match lengths simultaneously.
+4. In `zgec_crc32c_hw` (`src/crc32c.c`), unrolling hardware CRC32C computation 4-wide (32 bytes per iteration using 4 `_mm_crc32_u64` calls) reduces checksum calculation overhead during frame decompression.
+
+**Action:**
+Use AVX2 `_mm256_shuffle_epi8` for small non-power-of-2 match pattern broadcasts, 8-bit SIMD shift-adds for `rep0 == 1` sub-literal cumulative sums, and unroll hardware CRC32C 4-wide to accelerate decompression.
