@@ -72,6 +72,18 @@
 #include <immintrin.h>
 #endif
 
+static const uint64_t zgec_mask_table[9] = {
+    0x0000000000000000ULL,
+    0x00000000000000FFULL,
+    0x000000000000FFFFULL,
+    0x0000000000FFFFFFULL,
+    0x00000000FFFFFFFFULL,
+    0x000000FFFFFFFFFFULL,
+    0x0000FFFFFFFFFFFFULL,
+    0x00FFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL
+};
+
 /* Entry layout: 24-bit position (stored as pos + 1)
  * and an 8-bit tag from the spare hash bits (P24). */
 #define ZGEC_MF_POS_BITS  24u
@@ -1040,14 +1052,17 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
-                                len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
-                                if (len >= hash_min) {
-                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
-                                                   &best_is_rep);
+                                if (target_len_long <= 8u || target_len_long > cap ||
+                                    zgec_rd64(vb + ip - (size_t)d + target_len_long - 8u) == zgec_rd64(vb + ip + target_len_long - 8u)) {
+                                    len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                                    if (len >= hash_min) {
+                                        mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                       &best_is_rep);
+                                    }
                                 }
                             }
                         } else {
-                            uint64_t diff_mask = (1ULL << (target_len_long * 8u)) - 1ULL;
+                            uint64_t diff_mask = zgec_mask_table[target_len_long];
                             if ((diff & diff_mask) == 0u) {
                                 len = (diff == 0u)
                                           ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
@@ -1155,9 +1170,13 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
+                        if (target_len > 8u && target_len <= cap &&
+                            zgec_rd64(vb + ip - (size_t)d + target_len - 8u) != zgec_rd64(vb + ip + target_len - 8u)) {
+                            continue;
+                        }
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
-                        uint64_t diff_mask = (1ULL << (target_len * 8u)) - 1ULL;
+                        uint64_t diff_mask = zgec_mask_table[target_len];
                         if ((diff & diff_mask) != 0u) continue;
                         len = (diff == 0u)
                                   ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
