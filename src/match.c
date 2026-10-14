@@ -1040,10 +1040,14 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
-                                len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
-                                if (len >= hash_min) {
-                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
-                                                   &best_is_rep);
+                                if (target_len_long == 8u || target_len_long > cap ||
+                                    (zgec_rd64(vb + ip - (size_t)d + target_len_long - 8u) ^
+                                     zgec_rd64(vb + ip + target_len_long - 8u)) == 0u) {
+                                    len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                                    if (len >= hash_min) {
+                                        mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                       &best_is_rep);
+                                    }
                                 }
                             }
                         } else {
@@ -1155,6 +1159,11 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
+                        if (target_len > 8u && target_len <= cap) {
+                            if ((zgec_rd64(vb + ip - (size_t)d + target_len - 8u) ^
+                                 zgec_rd64(vb + ip + target_len - 8u)) != 0u)
+                                continue;
+                        }
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
                         uint64_t diff_mask = (1ULL << (target_len * 8u)) - 1ULL;
