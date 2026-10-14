@@ -1145,9 +1145,9 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 /* A candidate can only beat `best` if it matches at
                  * best.length - 1 as well; one byte compare there skips
                  * the length scan for the candidates that cannot. */
-                if (best.length != 0u && best.length <= cap &&
-                    vb[ip - (size_t)d + (size_t)best.length - 1u] !=
-                    vb[ip + (size_t)best.length - 1u]) {
+                size_t check_idx = (best.length > 0u) ? (size_t)best.length - 1u : (size_t)hash_min - 1u;
+                if (check_idx < cap &&
+                    vb[ip - (size_t)d + check_idx] != vb[ip + check_idx]) {
                     continue;
                 }
                 if (has_v8) {

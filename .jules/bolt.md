@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Fast Sequence Code Lookup Table, Float Price Gate Score Calculations, and Match Candidate Pre-Filtering
+
+**Learning:**
+1. In `include/zgec_seq.h` and `src/seq.c`, replacing scalar `zgec_highbit32` bit-scans in `zgec_seq_code_of` with a static 512-entry lookup table (`zgec_seq_lut512`) accelerates symbol code and extra-bit count determination for values `v < 512` across all candidate match cost evaluations and sequence preparation loops.
+2. In `src/parse.c` (`zgec_parse_block_ex`), converting price-gate cost and score calculations (`parse_seq_cost`, `parse_score`, `parse_lbar`, `zgec_fast_log2_u32_f`) from 64-bit `double` to 32-bit `float` eliminates floating-point unit type conversion overhead and lowers register pressure during LZ77 parsing.
+3. In `src/match.c` (`zgec_matcher_find_lens`) and `src/parse.c` (`fast_parse`), pre-testing candidate byte equality at `check_idx = max(best_len, hash_min) - 1` before issuing 64-bit loads and `ctzll` scans filters out failing candidate positions branchlessly.
+
+**Action:**
+Use precomputed 512-entry LUTs for small sequence symbol lookups, compute LZ parser price-gate scores using 32-bit single-precision floats, and filter candidate match positions at `max(best_len, min_match) - 1` before performing 64-bit diff scans.
