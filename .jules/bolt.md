@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - High-Tier End-Window Candidate Filtering, Precomputed Matcher Masks, and Long-Table Insert Filtering
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), probing short-bucket candidates when `target_len >= 8u` previously invoked `mf_match_len_slow` for any candidate matching the first 8 bytes. Adding a 64-bit end-window check `zgec_rd64(vb + ip - d + target_len - 8) ^ zgec_rd64(vb + ip + target_len - 8) != 0` branchlessly skips candidate matches that mismatch in their tail region, eliminating millions of redundant SIMD scans per block.
+2. In `zgec_matcher_insert_match` for `ZGEC_TIER_HIGH`, inserting every position into the 8-byte long hash table (`long_tab`) constantly overwrote long table anchors with intermediate match positions. Restricting long-table inserts to match boundaries (`pos == start` and `pos + stride >= start + len`) eliminates redundant long-hash computations and prevents long-table anchor pollution.
+3. Precomputing `nbuckets_mask`, `long_buckets_mask`, and `nlanes_shift` inside `struct zgec_matcher` and introducing static lookup array `zgec_mask_table` replaces runtime integer multiplications and variable 64-bit shifts with fast bit shifts and array lookups.
+
+**Action:**
+Pre-filter candidate match targets against 64-bit end-window alignment before calling match extension loops, restrict long match table inserts to match boundary positions in high compression tiers, and precompute bucket masks and shift counts in matcher data structures.
