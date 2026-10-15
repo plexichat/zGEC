@@ -657,10 +657,10 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
      * exceeds 63 afterwards, so `w >> nacc` is never a shift by 64. The
      * `left > 16u` test keeps nb <= 7 well inside the stream, so the 8-byte
      * load at ptr-7 never reads below the stream start. */
+    const zgec_fse_dec_entry *te = t->e;
     if (!syms && out && base && nbits) {
-    
         while (i + 1 < n && left > 16u) {
-            const zgec_fse_dec_entry *e = &t->e[state];
+            const zgec_fse_dec_entry *e = &te[state];
             unsigned sym;
             unsigned xb;
             uint32_t extra;
@@ -703,7 +703,7 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
         }
     } else {
         while (i + 1 < n && left > 16u) {
-            const zgec_fse_dec_entry *e = &t->e[state];
+            const zgec_fse_dec_entry *e = &te[state];
             unsigned sym;
             unsigned xb = 0u;
             uint32_t extra;
