@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Match Finder Precomputed Table Masks and Lazy Lookahead Min-Length Filtering
+
+**Learning:**
+1. In `struct zgec_matcher` (`src/match.c`), computing table masks (`nbuckets - 1u`) and integer bucket index products (`bucket * nlanes`) on every position probe and insertion introduced repeated multiplication and subtraction cycles on hot encoding paths. Precomputing `nbuckets_mask`, `long_buckets_mask`, `nlanes_mask`, and `nlanes_shift` inside `zgec_matcher_create` enables replacing multiplications with bitwise left shifts (`bucket << nlanes_shift`) and mask operations.
+2. In `zgec_parse_block_ex` (`src/parse.c`), lazy evaluation at `ip + 1` previously probed short matches (`min_len = 4u`) even when the current score at `ip` (`cur_score`) required a much longer match to be deferred to. Computing `min_lazy_len = (uint32_t)(cur_score / lbar) + 1u` and passing it to `zgec_matcher_find` allows the matcher to skip candidates shorter than `min_lazy_len` branchlessly using diff masks (`diff & diff_mask`).
+
+**Action:**
+Precompute bucket table masks and lane bit-shift counts in match finder structures, and pass dynamic score-derived minimum length thresholds during lazy lookahead evaluation.

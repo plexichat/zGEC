@@ -1306,37 +1306,41 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
-            zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
-                                              (uint32_t)(end - (ip + (size_t)1)));
-            uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
-            uint32_t nis_rep = (nm.length >= 4u &&
-                                (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
-                                 nm.offset == reps.rep[2])) ? 1u : 0u;
-            uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1, tier);
-            double base = cur_score;
-            double nscore = -1.0;
-            uint32_t defer;
-            /* The lazy probe has to beat `base` to be worth deferring to,
-             * and a candidate's score never exceeds its length priced as
-             * literals, so a length that does not clear base ends the
-             * comparison before any score is computed. Exact either way:
-             * the branch below only runs when cur_len > 0, and only then
-             * is base > 0, so the -1.0 sentinel loses the same comparison
-             * the real score would. */
-            if (nm.length >= nneed && (double)nm.length * lbar > base) {
-                uint32_t noffbase = parse_offbase(nm.offset, &reps);
-                nscore = parse_score(nm.length, nll, noffbase,
-                                     l2tot, ll_base, ml_base, of_base,
-                                     lbar, lscale);
-            }
-            /* cmov-style: the score comparison feeds a
-             * 0/1 select, not a length branch. */
-            defer = (nscore > base) ? 1u : 0u;
-            if (defer != 0u) {
-                zgec_matcher_insert(m, vb, ip);
-                ip += (size_t)1;
-                continue;
+            uint32_t min_lazy_len = (cur_score > 0.0 && lbar > 0.0) ? (uint32_t)(cur_score / lbar) + 1u : 4u;
+            if (min_lazy_len < 4u) min_lazy_len = 4u;
+            if ((size_t)min_lazy_len <= end - (ip + (size_t)1)) {
+                zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
+                                                  reps.rep[0], reps.rep[1], reps.rep[2], min_lazy_len,
+                                                  (uint32_t)(end - (ip + (size_t)1)));
+                uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
+                uint32_t nis_rep = (nm.length >= 4u &&
+                                    (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
+                                     nm.offset == reps.rep[2])) ? 1u : 0u;
+                uint32_t nneed = (nis_rep != 0u) ? 4u : parse_min_norep(ip + (size_t)1, tier);
+                double base = cur_score;
+                double nscore = -1.0;
+                uint32_t defer;
+                /* The lazy probe has to beat `base` to be worth deferring to,
+                 * and a candidate's score never exceeds its length priced as
+                 * literals, so a length that does not clear base ends the
+                 * comparison before any score is computed. Exact either way:
+                 * the branch below only runs when cur_len > 0, and only then
+                 * is base > 0, so the -1.0 sentinel loses the same comparison
+                 * the real score would. */
+                if (nm.length >= nneed && (double)nm.length * lbar > base) {
+                    uint32_t noffbase = parse_offbase(nm.offset, &reps);
+                    nscore = parse_score(nm.length, nll, noffbase,
+                                         l2tot, ll_base, ml_base, of_base,
+                                         lbar, lscale);
+                }
+                /* cmov-style: the score comparison feeds a
+                 * 0/1 select, not a length branch. */
+                defer = (nscore > base) ? 1u : 0u;
+                if (defer != 0u) {
+                    zgec_matcher_insert(m, vb, ip);
+                    ip += (size_t)1;
+                    continue;
+                }
             }
         }
 
