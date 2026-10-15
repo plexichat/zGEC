@@ -157,30 +157,11 @@ In LZ match parsers, stride intermediate match positions during insertion for lo
 ## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
 
 **Learning:**
-1. In  (), checking repeat offset candidates previously used a 32-bit compare followed by . Replacing with a single 64-bit load XOR  and branchless  for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
-2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (, ) and dual hash calculations (, ) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
-
-**Action:**
-In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and , and unroll match-interior table insertion loops for improved store pipelining.
-
-## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
-
-**Learning:**
 1. In fast_parse (src/parse.c), checking repeat offset candidates previously used a 32-bit compare followed by fast_match_len. Replacing with a single 64-bit load XOR zgec_rd64(vb + ip - r) ^ cur8 and branchless __builtin_ctzll(diff) >> 3 for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
 2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (iv0, iv1) and dual hash calculations (hs0/hl0, hs1/hl1) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
 
 **Action:**
 In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and ctzll, and unroll match-interior table insertion loops for improved store pipelining.
-## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
-
-**Learning:**
-1. In rANS encoding ( in ), precomputing  in  eliminates repeated 64-bit shifts () per symbol. Replacing 64-bit signed division () with 32-bit unsigned wraparound math () removes 64-bit integer conversion overhead in the inner encoding loop.
-2. In  () and  (), checking  before iterating over literals bypasses bitwise  queries whenever no run-starts exist.
-3. In  for single-context streams (), unrolling the 4-way loop to 16-way increases instruction-level parallelism and L1 cache throughput.
-
-**Action:**
-Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
-
 ## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
 
 **Learning:**
@@ -190,3 +171,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Match Finder Sparse Reset, Mask Table Precomputation, and Bucket Early-Out
+
+**Learning:**
+1. In `zgec_matcher_reset` (`src/match.c`), issuing full-table `memset` calls on `short_tab` (16 MiB in high tier) and `long_tab` (1 MiB) on every block reset introduced 10% total CPU instruction overhead. Tracking modified bucket indices (`short_touched`, `touched_short`, `long_touched`, `touched_long`) and zeroing only touched buckets during block reset reduces memory write volume by up to 50x while preserving 100% byte-for-byte output determinism.
+2. In `zgec_matcher_find_lens` (`src/match.c`), checking candidate character equality at `target_len = max(best.length, hash_min)` before fetching 64-bit match prefixes filters failing candidates without 64-bit loads. Precomputing table masks (`nbuckets_mask`, `long_buckets_mask`, `nlanes_mask`, `nlanes_shift`, `probe_depth`) in `struct zgec_matcher` and static 64-bit diff masks in `zgec_mask_table` eliminates runtime shift/mask arithmetic.
+3. Adding `if (mask == 0u) return best;` immediately after `mf_bucket_hits` bypasses bit rotation and CLZ loops when no short bucket tags hit.
+
+**Action:**
+Use sparse bucket tracking for match finder block resets, precompute geometry masks and shift offsets in matcher structs, and filter candidates against `target_len - 1` before fetching 64-bit candidate loads.
