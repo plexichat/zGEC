@@ -355,9 +355,34 @@ int zgec_normalize_counts(int16_t *counts, const uint32_t *hist,
     int S = 1 << al;
     uint64_t total = 0;
     int n_non_zero = 0;
-    for (int s = 0; s < nsym; s++) {
-        total += hist[s];
-        if (hist[s] > 0) n_non_zero++;
+    int s_idx = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    __m256i vzero = _mm256_setzero_si256();
+    __m256i vcount = _mm256_setzero_si256();
+    for (; s_idx + 8 <= nsym; s_idx += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + s_idx));
+        vsum = _mm256_add_epi32(vsum, v);
+        __m256i vgt = _mm256_cmpgt_epi32(v, vzero);
+        vcount = _mm256_sub_epi32(vcount, vgt);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+
+    __m128i vclow = _mm256_castsi256_si128(vcount);
+    __m128i vchigh = _mm256_extracti128_si256(vcount, 1);
+    vclow = _mm_add_epi32(vclow, vchigh);
+    vclow = _mm_hadd_epi32(vclow, vclow);
+    vclow = _mm_hadd_epi32(vclow, vclow);
+    n_non_zero = _mm_cvtsi128_si32(vclow);
+#endif
+    for (; s_idx < nsym; s_idx++) {
+        total += hist[s_idx];
+        if (hist[s_idx] > 0) n_non_zero++;
     }
     if (n_non_zero > S) return 0;
     if (total == 0 || n_non_zero == 0) {

@@ -50,7 +50,21 @@ void zgec_parse_free(zgec_parse *p)
 double zgec_seq_cost_bits(const uint32_t *hist)
 {
     double total = 0.0;
-    for (int s = 0; s < ZGEC_NSYM_SEQ; s++) total += (double)hist[s];
+    int s_idx = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    for (; s_idx + 8 <= ZGEC_NSYM_SEQ; s_idx += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + s_idx));
+        vsum = _mm256_add_epi32(vsum, v);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total = (double)(uint32_t)_mm_cvtsi128_si32(vlow);
+#endif
+    for (; s_idx < ZGEC_NSYM_SEQ; s_idx++) total += (double)hist[s_idx];
     if (total == 0) return 0.0;
     double bits = 0.0;
     for (int s = 0; s < ZGEC_NSYM_SEQ; s++) bits += zgec_bits(total, (double)hist[s]);

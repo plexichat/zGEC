@@ -638,9 +638,34 @@ zgec_err zgec_rans_normalise(int16_t *counts, const uint32_t *hist)
     if (counts == NULL || hist == NULL) return ZGEC_ERR_INVAL;
     uint64_t total = 0;
     int non_zero = 0;
-    for (int s = 0; s < ZGEC_NSYM_LIT; s++) {
-        total += hist[s];
-        if (hist[s] > 0) non_zero++;
+    int s_idx = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    __m256i vzero = _mm256_setzero_si256();
+    __m256i vcount = _mm256_setzero_si256();
+    for (; s_idx + 8 <= ZGEC_NSYM_LIT; s_idx += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + s_idx));
+        vsum = _mm256_add_epi32(vsum, v);
+        __m256i vgt = _mm256_cmpgt_epi32(v, vzero);
+        vcount = _mm256_sub_epi32(vcount, vgt); /* vgt is -1 for >0 */
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+
+    __m128i vclow = _mm256_castsi256_si128(vcount);
+    __m128i vchigh = _mm256_extracti128_si256(vcount, 1);
+    vclow = _mm_add_epi32(vclow, vchigh);
+    vclow = _mm_hadd_epi32(vclow, vclow);
+    vclow = _mm_hadd_epi32(vclow, vclow);
+    non_zero = _mm_cvtsi128_si32(vclow);
+#endif
+    for (; s_idx < ZGEC_NSYM_LIT; s_idx++) {
+        total += hist[s_idx];
+        if (hist[s_idx] > 0) non_zero++;
     }
     if (total == 0) {
         /* No information at all: spread M uniformly over the alphabet.

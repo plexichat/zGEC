@@ -599,9 +599,33 @@ static double zgec_granule_cost_bits(const zgec_granule *g)
 
 static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
 {
-    int s;
-    for (s = 0; s < ZGEC_NSYM_LIT; s++) dst->lit[(size_t)s] += src->lit[(size_t)s];
-    for (s = 0; s < ZGEC_NSYM_SEQ; s++) {
+    int s = 0;
+#if defined(__AVX2__)
+    for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+        __m256i vd = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s));
+        __m256i vs = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s), _mm256_add_epi32(vd, vs));
+    }
+#endif
+    for (; s < ZGEC_NSYM_LIT; s++) dst->lit[(size_t)s] += src->lit[(size_t)s];
+
+    s = 0;
+#if defined(__AVX2__)
+    for (; s + 8 <= ZGEC_NSYM_SEQ; s += 8) {
+        __m256i vdll = _mm256_loadu_si256((const __m256i *)(const void *)(dst->ll + s));
+        __m256i vsll = _mm256_loadu_si256((const __m256i *)(const void *)(src->ll + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->ll + s), _mm256_add_epi32(vdll, vsll));
+
+        __m256i x_vdml = _mm256_loadu_si256((const __m256i *)(const void *)(dst->ml + s));
+        __m256i x_vsml = _mm256_loadu_si256((const __m256i *)(const void *)(src->ml + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->ml + s), _mm256_add_epi32(x_vdml, x_vsml));
+
+        __m256i x_vdof = _mm256_loadu_si256((const __m256i *)(const void *)(dst->of + s));
+        __m256i x_vsof = _mm256_loadu_si256((const __m256i *)(const void *)(src->of + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->of + s), _mm256_add_epi32(x_vdof, x_vsof));
+    }
+#endif
+    for (; s < ZGEC_NSYM_SEQ; s++) {
         dst->ll[(size_t)s] += src->ll[(size_t)s];
         dst->ml[(size_t)s] += src->ml[(size_t)s];
         dst->of[(size_t)s] += src->of[(size_t)s];
@@ -1423,7 +1447,30 @@ static zgec_err zgec_select_coder(const zgec_params *params,
         hist = (uint32_t *)zgec_alloc(256 * sizeof(*hist), 64);
         if (!hist) return ZGEC_ERR_NOMEM;
         memset(hist, 0, 256 * sizeof(*hist));
-        for (i = 0; i < n_lit_slice; i++) hist[seg_lit[i]]++;
+        i = 0;
+#if defined(__AVX2__)
+        if (n_lit_slice >= 32) {
+            uint32_t c0[ZGEC_NSYM_LIT] = {0};
+            uint32_t c1[ZGEC_NSYM_LIT] = {0};
+            uint32_t c2[ZGEC_NSYM_LIT] = {0};
+            uint32_t c3[ZGEC_NSYM_LIT] = {0};
+            for (; i + 4 <= n_lit_slice; i += 4) {
+                c0[seg_lit[i]]++;
+                c1[seg_lit[i + 1]]++;
+                c2[seg_lit[i + 2]]++;
+                c3[seg_lit[i + 3]]++;
+            }
+            for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+                __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+                __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+                __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+                _mm256_storeu_si256((__m256i *)(hist + s), sum);
+            }
+        }
+#endif
+        for (; i < n_lit_slice; i++) hist[seg_lit[i]]++;
 
         /* Candidate: rANS order-0 on plain literals. The number of
          * literal tables is fixed per block by the block parameters
