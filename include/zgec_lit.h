@@ -29,7 +29,26 @@
 
 /* Classification functions (Annex C). Maps a byte to one
  * of 64 classes. */
-unsigned zgec_classify(int ctx_mode, uint8_t b);
+extern const uint8_t zgec_ctx_text_lut[256];
+extern const uint8_t zgec_ctx_signed_lut[256];
+
+static inline unsigned zgec_classify(int ctx_mode, uint8_t b)
+{
+    switch (ctx_mode) {
+    case ZGEC_CTX_NONE:
+        return 0;
+    case ZGEC_CTX_LSB6:
+        return (unsigned)(b & 63u);
+    case ZGEC_CTX_MSB6:
+        return (unsigned)(b >> 2u);
+    case ZGEC_CTX_TEXT:
+        return (unsigned)zgec_ctx_text_lut[b];
+    case ZGEC_CTX_SIGNED:
+        return (unsigned)zgec_ctx_signed_lut[b];
+    default:
+        return 0;
+    }
+}
 
 /* Build the class map (64 entries, 3 bits each) from the
  * block parameters. The map is packed least significant

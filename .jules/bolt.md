@@ -190,3 +190,14 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-15 - Inline Context Classification, Unrolled Histogram Accumulation, and SIMD Greedy Clustering
+
+**Learning:**
+1. In `include/zgec_lit.h`, exposing context tables `zgec_ctx_text_lut` and `zgec_ctx_signed_lut` and converting `zgec_classify` to a `static inline` function enables the compiler to eliminate switch dispatches entirely when `ctx_mode` is a compile-time constant.
+2. In `zgec_select_contexts` (`src/encode.c`), unrolling the 4-histogram accumulation loop 4-wide increases instruction-level parallelism and reduces loop counter overhead.
+3. In `zgec_ctx_body_bits` (`src/encode.c`), tracking lane boundaries with a monotonically advancing `next_lane_idx` pointer reduces per-byte lane check comparisons from 8 to 1, while checking `rs_is_empty` bypasses run-start bitmap reads.
+4. In `zgec_cluster_greedy` (`src/encode.c`), vectorizing 256-element histogram array additions with 256-bit AVX2 SIMD (`_mm256_add_epi32`) accelerates delta cache seeding and merge pair validations.
+
+**Action:**
+In context classification and histogram accumulation loops, inline lookup tables directly into headers, unroll multi-histogram updates 4-wide, and vectorize array additions with 256-bit AVX2 SIMD.

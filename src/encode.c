@@ -1,4 +1,6 @@
-#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#if defined(__AVX2__)
+#include <immintrin.h>
+#elif defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_encode.h"
@@ -891,10 +893,19 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         int bb;
         for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
             uint64_t mt = ctot[(size_t)c] + ctot[(size_t)bb];
-            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+            s = 0;
+#if defined(__AVX2__)
+            for (; s < ZGEC_NSYM_LIT; s += 8) {
+                __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)&work[(size_t)c][s]);
+                __m256i vb = _mm256_loadu_si256((const __m256i *)(const void *)&work[(size_t)bb][s]);
+                _mm256_storeu_si256((__m256i *)(void *)&merged[s], _mm256_add_epi32(va, vb));
+            }
+#else
+            for (; s < ZGEC_NSYM_LIT; s++) {
                 merged[(size_t)s] =
                     work[(size_t)c][(size_t)s] + work[(size_t)bb][(size_t)s];
             }
+#endif
             dlt[(size_t)c][(size_t)bb] =
                 zgec_class_entropy(merged, mt) - cent[(size_t)c] - cent[(size_t)bb];
         }
@@ -936,11 +947,20 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             int ver_a = -1;
             int ver_b = -1;
             double ver_delta = 0.0;
-            for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+            s = 0;
+#if defined(__AVX2__)
+            for (; s < ZGEC_NSYM_LIT; s += 8) {
+                __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)&work[(size_t)cand_a][s]);
+                __m256i vb = _mm256_loadu_si256((const __m256i *)(const void *)&work[(size_t)cand_b][s]);
+                _mm256_storeu_si256((__m256i *)(void *)&merged[s], _mm256_add_epi32(va, vb));
+            }
+#else
+            for (; s < ZGEC_NSYM_LIT; s++) {
                 merged[(size_t)s] =
                     work[(size_t)cand_a][(size_t)s] +
                     work[(size_t)cand_b][(size_t)s];
             }
+#endif
             cand_delta =
                 zgec_class_entropy(merged, ctot[(size_t)cand_a] +
                                            ctot[(size_t)cand_b]) -
@@ -1056,31 +1076,49 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         size_t j;
         memset(hist4, 0, 4u * hist_bytes);
         if (zgec_rs_is_empty(runstart, n_lit)) {
-            for (j = 1; j < n_lit; j++) {
+            for (j = 1; j + 4 <= n_lit; j += 4) {
+                uint8_t p0 = lit[j - 1], n0 = lit[j];
+                uint8_t p1 = lit[j],     n1 = lit[j + 1];
+                uint8_t p2 = lit[j + 1], n2 = lit[j + 2];
+                uint8_t p3 = lit[j + 2], n3 = lit[j + 3];
+
+                h0[(size_t)(p0 & 63u) * 256u + n0]++;
+                h1[(size_t)(p0 >> 2u) * 256u + n0]++;
+                h2[(size_t)zgec_ctx_text_lut[p0] * 256u + n0]++;
+                h3[(size_t)zgec_ctx_signed_lut[p0] * 256u + n0]++;
+
+                h0[(size_t)(p1 & 63u) * 256u + n1]++;
+                h1[(size_t)(p1 >> 2u) * 256u + n1]++;
+                h2[(size_t)zgec_ctx_text_lut[p1] * 256u + n1]++;
+                h3[(size_t)zgec_ctx_signed_lut[p1] * 256u + n1]++;
+
+                h0[(size_t)(p2 & 63u) * 256u + n2]++;
+                h1[(size_t)(p2 >> 2u) * 256u + n2]++;
+                h2[(size_t)zgec_ctx_text_lut[p2] * 256u + n2]++;
+                h3[(size_t)zgec_ctx_signed_lut[p2] * 256u + n2]++;
+
+                h0[(size_t)(p3 & 63u) * 256u + n3]++;
+                h1[(size_t)(p3 >> 2u) * 256u + n3]++;
+                h2[(size_t)zgec_ctx_text_lut[p3] * 256u + n3]++;
+                h3[(size_t)zgec_ctx_signed_lut[p3] * 256u + n3]++;
+            }
+            for (; j < n_lit; j++) {
                 uint8_t prev = lit[j - 1];
                 uint32_t nxt = (uint32_t)lit[j];
-                unsigned c0 = (unsigned)(prev & 63u);
-                unsigned c1 = (unsigned)(prev >> 2u);
-                unsigned c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
-                unsigned c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
-                h0[(size_t)c0 * 256u + nxt]++;
-                h1[(size_t)c1 * 256u + nxt]++;
-                h2[(size_t)c2 * 256u + nxt]++;
-                h3[(size_t)c3 * 256u + nxt]++;
+                h0[(size_t)(prev & 63u) * 256u + nxt]++;
+                h1[(size_t)(prev >> 2u) * 256u + nxt]++;
+                h2[(size_t)zgec_ctx_text_lut[prev] * 256u + nxt]++;
+                h3[(size_t)zgec_ctx_signed_lut[prev] * 256u + nxt]++;
             }
         } else {
             for (j = 1; j < n_lit; j++) {
                 if (zgec_rs_get(runstart, j)) continue; /* own table */
                 uint8_t prev = lit[j - 1];
                 uint32_t nxt = (uint32_t)lit[j];
-                unsigned c0 = (unsigned)(prev & 63u);
-                unsigned c1 = (unsigned)(prev >> 2u);
-                unsigned c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
-                unsigned c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
-                h0[(size_t)c0 * 256u + nxt]++;
-                h1[(size_t)c1 * 256u + nxt]++;
-                h2[(size_t)c2 * 256u + nxt]++;
-                h3[(size_t)c3 * 256u + nxt]++;
+                h0[(size_t)(prev & 63u) * 256u + nxt]++;
+                h1[(size_t)(prev >> 2u) * 256u + nxt]++;
+                h2[(size_t)zgec_ctx_text_lut[prev] * 256u + nxt]++;
+                h3[(size_t)zgec_ctx_signed_lut[prev] * 256u + nxt]++;
             }
         }
     }
@@ -1325,19 +1363,37 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        for (j = 0; j < n_z; j++) {
-            if (runstart && zgec_rs_get(runstart, j)) {
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
+        int rs_empty = zgec_rs_is_empty(runstart, n_z);
+        size_t next_lane_idx = 0;
+
+        if (rs_empty) {
+            for (j = 0; j < n_z; j++) {
+                if (next_lane_idx < 8u && j == start[next_lane_idx]) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    while (next_lane_idx < 8u && j == start[next_lane_idx]) next_lane_idx++;
+                    continue;
+                }
+                unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                grp_total[grp]++;
             }
-            if (j == start[0] || j == start[1] || j == start[2] || j == start[3] ||
-                j == start[4] || j == start[5] || j == start[6] || j == start[7]) {
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
-            }
-            {
+        } else {
+            for (j = 0; j < n_z; j++) {
+                if (zgec_rs_get(runstart, j)) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    if (next_lane_idx < 8u && j == start[next_lane_idx]) {
+                        while (next_lane_idx < 8u && j == start[next_lane_idx]) next_lane_idx++;
+                    }
+                    continue;
+                }
+                if (next_lane_idx < 8u && j == start[next_lane_idx]) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    while (next_lane_idx < 8u && j == start[next_lane_idx]) next_lane_idx++;
+                    continue;
+                }
                 unsigned grp = (unsigned)grp_lut[z[j - 1]];
                 cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
                 grp_total[grp]++;
