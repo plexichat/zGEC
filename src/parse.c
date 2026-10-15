@@ -49,14 +49,26 @@ void zgec_parse_free(zgec_parse *p)
 
 double zgec_seq_cost_bits(const uint32_t *hist)
 {
-    double total = 0.0;
-    for (int s = 0; s < ZGEC_NSYM_SEQ; s++) total += (double)hist[s];
-    if (total == 0) return 0.0;
+    uint64_t total64 = 0;
+    int s = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    for (; s + 8 <= ZGEC_NSYM_SEQ; s += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + s));
+        vsum = _mm256_add_epi32(vsum, v);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total64 = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+#endif
+    for (; s < ZGEC_NSYM_SEQ; s++) total64 += (uint64_t)hist[s];
+    if (total64 == 0) return 0.0;
+    double total = (double)total64;
     double bits = 0.0;
-    for (int s = 0; s < ZGEC_NSYM_SEQ; s++) bits += zgec_bits(total, (double)hist[s]);
-    /* zgec_bits() already returns a positive contribution, so negating
-     * the total made the "cost" negative and would invert every
-     * comparison the value feeds. */
+    for (int k = 0; k < ZGEC_NSYM_SEQ; k++) bits += zgec_bits(total, (double)hist[k]);
     return bits;
 }
 

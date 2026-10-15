@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Encode Path AVX2 SIMD Vectorization across Histograms, Granules, and Clustering
+
+**Learning:**
+1. In `zgec_granule_merge` and `zgec_cluster_greedy` (`src/encode.c`), merging granule and context class 256-element histogram arrays (`work[best_a][s] += work[best_b][s]`) previously used scalar loops. Vectorizing with 256-bit AVX2 SIMD intrinsics (`_mm256_loadu_si256` + `_mm256_add_epi32` + `_mm256_storeu_si256`) processes 8 uint32_t elements per instruction, significantly accelerating greedy granule merging and context clustering.
+2. In `zgec_select_coder` (`src/encode.c`), plain literal histogram counting previously suffered from store-forwarding stalls on repeating bytes. Using 4 parallel accumulators and summing them with AVX2 SIMD (`_mm256_add_epi32`) reduces symbol counting time.
+3. In `zgec_seq_cost_bits` (`src/parse.c`), vectorizing 66-symbol sequence histogram total summation with AVX2 SIMD speeds up cost estimation loops.
+
+**Action:**
+Vectorize 256-element histogram array additions and accumulators with 256-bit AVX2 SIMD across greedy segmentation, context clustering, and coder selection in the encode path.
