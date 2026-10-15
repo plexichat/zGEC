@@ -157,30 +157,11 @@ In LZ match parsers, stride intermediate match positions during insertion for lo
 ## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
 
 **Learning:**
-1. In  (), checking repeat offset candidates previously used a 32-bit compare followed by . Replacing with a single 64-bit load XOR  and branchless  for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
-2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (, ) and dual hash calculations (, ) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
-
-**Action:**
-In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and , and unroll match-interior table insertion loops for improved store pipelining.
-
-## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
-
-**Learning:**
 1. In fast_parse (src/parse.c), checking repeat offset candidates previously used a 32-bit compare followed by fast_match_len. Replacing with a single 64-bit load XOR zgec_rd64(vb + ip - r) ^ cur8 and branchless __builtin_ctzll(diff) >> 3 for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
 2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (iv0, iv1) and dual hash calculations (hs0/hl0, hs1/hl1) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
 
 **Action:**
 In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and ctzll, and unroll match-interior table insertion loops for improved store pipelining.
-## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
-
-**Learning:**
-1. In rANS encoding ( in ), precomputing  in  eliminates repeated 64-bit shifts () per symbol. Replacing 64-bit signed division () with 32-bit unsigned wraparound math () removes 64-bit integer conversion overhead in the inner encoding loop.
-2. In  () and  (), checking  before iterating over literals bypasses bitwise  queries whenever no run-starts exist.
-3. In  for single-context streams (), unrolling the 4-way loop to 16-way increases instruction-level parallelism and L1 cache throughput.
-
-**Action:**
-Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
-
 ## 2026-10-14 - Precomputed rANS xmax Thresholds, 32-bit Unsigned Remainder Math, and Runstart Fast-Paths
 
 **Learning:**
@@ -190,3 +171,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - End-Window 64-bit Match Candidate Filtering and Unrolled Short Match Scanning
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), probing candidate match targets where `target_len >= 8` previously called `mf_match_len_slow` after checking only `diff == 0` (first 8 bytes). Adding a 64-bit load comparison at `target_len - 8` (`zgec_rd64(vb + ip - d + target_len - 8) == zgec_rd64(vb + ip + target_len - 8)`) checks the end of the candidate window up front, eliminating ~89% of calls to `mf_match_len_slow` for candidates that cannot beat `best.length`.
+2. In `mf_match_len_slow` (`src/match.c`), adding direct 64-bit load XOR checks for bytes 8..15 and 16..23 before entering the 32-byte SIMD loop speeds up length determination for short-to-medium matches (8..23 bytes) by avoiding AVX2 loop setup overhead.
+
+**Action:**
+In LZ match finders, verify both the start and end 64-bit words of candidate match windows before calling full match length extension routines, and unroll short 64-bit word comparisons before entering SIMD loops.
