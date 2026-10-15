@@ -1306,8 +1306,10 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
+            uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
+            if (min_lazy_len < 4u) min_lazy_len = 4u;
             zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
+                                              reps.rep[0], reps.rep[1], reps.rep[2], min_lazy_len,
                                               (uint32_t)(end - (ip + (size_t)1)));
             uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
             uint32_t nis_rep = (nm.length >= 4u &&

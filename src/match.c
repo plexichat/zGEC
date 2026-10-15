@@ -192,8 +192,12 @@
 struct zgec_matcher {
     zgec_tier      tier;
     uint32_t       nbuckets;      /* short buckets */
+    uint32_t       nbuckets_mask; /* nbuckets - 1 */
     uint32_t       nlanes;
+    uint32_t       nlanes_mask;   /* nlanes - 1 */
+    uint32_t       nlanes_shift;  /* log2(nlanes) */
     uint32_t       long_buckets;  /* long buckets (one entry each) */
+    uint32_t       long_buckets_mask; /* long_buckets - 1 */
     uint32_t      *short_tab;   /* nbuckets * nlanes entries */
     uint8_t       *short_head;  /* per-bucket next write lane (ring) */
     uint32_t      *long_tab;    /* long_buckets entries */
@@ -357,14 +361,14 @@ static void mf_prefetch_bucket(const void *line)
  * than an nlanes-wide shift. Lookup walks the ring newest first. */
 static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
-    uint32_t *b = &m->short_tab[(size_t)bucket * (size_t)m->nlanes];
+    uint32_t *b = &m->short_tab[(size_t)bucket << m->nlanes_shift];
     uint32_t h = (uint32_t)m->short_head[bucket];
     /* No prefetch here. The store below needs the line immediately, so the
      * write-allocate fetch has to complete first and a hint issued one
      * instruction ahead cannot hide the latency; the lookup path keeps its
      * prefetch, where there is independent work to overlap. */
     b[h] = entry;
-    m->short_head[bucket] = (uint8_t)((h + 1u) & (m->nlanes - 1u));
+    m->short_head[bucket] = (uint8_t)((h + 1u) & m->nlanes_mask);
 }
 
 /* Insert pos into the long table: one entry per
@@ -408,7 +412,7 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int lo
         h = has_v8 ? mf_hash5_v(v8) : mf_hash5(vb, pos);
     }
 
-    bucket = h & (m->nbuckets - 1u);
+    bucket = h & m->nbuckets_mask;
     tag = (h >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
     mf_insert_short(m, bucket, mf_pack((uint32_t)pos, tag));
 
@@ -416,7 +420,7 @@ static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int lo
         uint32_t hl = (m->c_ip[pos & 1u] == pos && (m->c_flags[pos & 1u] & 2u))
                           ? m->c_hl[pos & 1u]
                           : mf_hash8_v(v8);
-        uint32_t lb = hl & (m->long_buckets - 1u);
+        uint32_t lb = hl & m->long_buckets_mask;
         uint32_t ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         mf_insert_long(m, lb, mf_pack((uint32_t)pos, ltag));
     }
@@ -666,6 +670,10 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
         zgec_free(m);
         return NULL;
     }
+    m->nbuckets_mask = m->nbuckets - 1u;
+    m->long_buckets_mask = m->long_buckets - 1u;
+    m->nlanes_mask = m->nlanes - 1u;
+    m->nlanes_shift = (uint32_t)__builtin_ctz(m->nlanes);
     /* Overflow-proof size products, for the short table and the long one. */
     if ((size_t)m->nlanes > SIZE_MAX / (size_t)m->nbuckets) {
         zgec_free(m);
@@ -938,7 +946,7 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
     int best_is_rep = 0;
     if (has_v8) {
         hl = mf_hash8_v(v8);
-        lb = hl & (m->long_buckets - 1u);
+        lb = hl & m->long_buckets_mask;
         ltag = (hl >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         le = &m->long_tab[(size_t)lb];
         mf_prefetch_bucket((const void *)le);
@@ -949,8 +957,8 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
         if (ip + need <= m->vb_size && hash_min <= cap) {
             hshort = m->is_binary ? mf_hash4_v((uint32_t)cur4)
                                   : (has_v8 ? mf_hash5_v(v8) : mf_hash_short(m, vb, ip));
-            sbucket = hshort & (m->nbuckets - 1u);
-            b = &m->short_tab[(size_t)sbucket * (size_t)m->nlanes];
+            sbucket = hshort & m->nbuckets_mask;
+            b = &m->short_tab[(size_t)sbucket << m->nlanes_shift];
             want_short = 1;
             mf_prefetch_bucket((const void *)b);
             mf_prefetch_bucket((const void *)&m->short_head[sbucket]);
@@ -1040,10 +1048,14 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
-                                len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
-                                if (len >= hash_min) {
-                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
-                                                   &best_is_rep);
+                                if (target_len_long <= 8u || target_len_long > cap ||
+                                    zgec_rd64(vb + ip - (size_t)d + (size_t)target_len_long - 8u) ==
+                                    zgec_rd64(vb + ip + (size_t)target_len_long - 8u)) {
+                                    len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                                    if (len >= hash_min) {
+                                        mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                       &best_is_rep);
+                                    }
                                 }
                             }
                         } else {
@@ -1093,7 +1105,10 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                                             : ZGEC_MF_PROBE_DEPTH;
         head = (uint32_t)m->short_head[sbucket];
         mask = mf_bucket_hits(b, tag, m->nlanes, want,
-                              (head - 1u) & (m->nlanes - 1u));
+                              (head - 1u) & m->nlanes_mask);
+        if (mask == 0u) {
+            return best;
+        }
         nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
         nhit = (nmatch < want) ? nmatch : want;
         /* The live entries walk backwards from the newest lane: the
@@ -1155,6 +1170,11 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
+                        if (target_len > 8u && target_len <= cap &&
+                            zgec_rd64(vb + ip - (size_t)d + (size_t)target_len - 8u) !=
+                            zgec_rd64(vb + ip + (size_t)target_len - 8u)) {
+                            continue;
+                        }
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
                         uint64_t diff_mask = (1ULL << (target_len * 8u)) - 1ULL;
@@ -1199,13 +1219,13 @@ void zgec_matcher_prefetch(zgec_matcher *m, const uint8_t *vb, size_t ip)
     }
     {
         uint32_t h = mf_hash_short(m, vb, ip);
-        uint32_t bucket = h & (m->nbuckets - 1u);
-        __builtin_prefetch((const void *)&m->short_tab[(size_t)bucket * (size_t)m->nlanes], 1, 3);
+        uint32_t bucket = h & m->nbuckets_mask;
+        __builtin_prefetch((const void *)&m->short_tab[(size_t)bucket << m->nlanes_shift], 1, 3);
         __builtin_prefetch((const void *)&m->short_head[bucket], 1, 3);
     }
     if (ip + (size_t)ZGEC_MF_LONG_BYTES <= m->vb_size) {
         uint32_t hl = mf_hash8(vb, ip);
-        __builtin_prefetch((const void *)&m->long_tab[(size_t)(hl & (m->long_buckets - 1u))], 1, 3);
+        __builtin_prefetch((const void *)&m->long_tab[(size_t)(hl & m->long_buckets_mask)], 1, 3);
     }
 }
 

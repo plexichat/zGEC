@@ -154,14 +154,16 @@ Vectorize sub-literal prediction subtraction with 256-bit AVX2 byte operations, 
 
 **Action:**
 In LZ match parsers, stride intermediate match positions during insertion for long matches, keep fast-tier hash tables within L2 cache bounds (<=1 MB), use thread-local scratch arrays for block tables, and filter candidates against `ip + best.length - 1` before fetching 64-bit match prefixes.
-## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
+## 2026-10-15 - Min-Lazy Lookahead Filtering, Precomputed Matcher Masks, and Tail Alignment Checking
 
 **Learning:**
-1. In  (), checking repeat offset candidates previously used a 32-bit compare followed by . Replacing with a single 64-bit load XOR  and branchless  for non-zero differences evaluates repeat offset match lengths without calling general match extension loops.
-2. Unrolling the inside-match table insertion loop 2x with dual 64-bit loads (, ) and dual hash calculations (, ) reduces loop control overhead and increases instruction-level parallelism when updating short and long match tables during match emission.
+1. In `zgec_parse_block_ex` (`src/parse.c`), lazy match lookahead probes at `ip + 1` previously searched for any match $\ge 4$ bytes using `zgec_matcher_find`, discarding candidate matches later if their price score failed to beat `cur_score`. Calculating `min_lazy_len = (uint32_t)(cur_score / lbar) + 1u` and passing it to `zgec_matcher_find` prevents probing and candidate scanning for matches too short to improve the score.
+2. In `zgec_matcher_find_lens` (`src/match.c`), precomputing `nbuckets_mask`, `long_buckets_mask`, `nlanes_mask`, and `nlanes_shift` inside `struct zgec_matcher` replaces repeated bucket table index multiplications (`bucket * m->nlanes`) with bitwise shifts (`bucket << m->nlanes_shift`) and mask operations during match searches and insertions.
+3. In `zgec_matcher_find_lens` (`src/match.c`), evaluating candidate matches where `target_len > 8` with a 64-bit end-window alignment check (`zgec_rd64` at `target_len - 8`) prior to `mf_match_len_slow` branchlessly skips candidates that cannot beat `best.length`.
+4. In `zgec_matcher_find_lens` (`src/match.c`), returning `best` immediately when `mask == 0u` skips mask rotation arithmetic and popcount calculations on empty buckets.
 
 **Action:**
-In fast-tier LZ parsers, evaluate candidate repeat matches directly via 64-bit XOR and , and unroll match-interior table insertion loops for improved store pipelining.
+Calculate dynamic score-driven minimum match lengths (`min_lazy_len`) during lazy lookahead parsing, precompute matcher bucket masks and shift constants, check 64-bit target tail alignment before calling slow match extension loops, and exit early on empty bucket hit masks.
 
 ## 2026-10-15 - Fast Tier Repeat Offset 64-Bit Length Bypassing and Dual-Unrolled Table Inserts
 
