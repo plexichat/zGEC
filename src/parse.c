@@ -789,10 +789,13 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 if (d != (size_t)best_off && (best_len == 0u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len]))) {
                     uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
                     if (diff == 0u) {
-                        uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
-                        if (len > best_len) {
-                            best_len = len;
-                            best_off = (uint32_t)d;
+                        if (best_len < 8u || ip + (size_t)best_len + 1u > end ||
+                            (zgec_rd64(vb + ip - d + (size_t)best_len - 7u) ^ zgec_rd64(vb + ip + (size_t)best_len - 7u)) == 0u) {
+                            uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                            if (len > best_len) {
+                                best_len = len;
+                                best_off = (uint32_t)d;
+                            }
                         }
                     } else {
                         uint32_t len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
@@ -811,10 +814,13 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
                     if (diff == 0u) {
                         if (best_len <= 8u || (best_len <= cap && vb[ip - d + best_len] == vb[ip + best_len])) {
-                            uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
-                            if (len > best_len) {
-                                best_len = len;
-                                best_off = (uint32_t)d;
+                            if (best_len < 8u || ip + (size_t)best_len + 1u > end ||
+                                (zgec_rd64(vb + ip - d + (size_t)best_len - 7u) ^ zgec_rd64(vb + ip + (size_t)best_len - 7u)) == 0u) {
+                                uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                                if (len > best_len) {
+                                    best_len = len;
+                                    best_off = (uint32_t)d;
+                                }
                             }
                         }
                     }
@@ -832,10 +838,13 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                             best_off = (uint32_t)d;
                         }
                     } else {
-                        uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
-                        if (len > best_len) {
-                            best_len = len;
-                            best_off = (uint32_t)d;
+                        if (best_len < 8u || ip + (size_t)best_len + 1u > end ||
+                            (zgec_rd64(vb + ip - d + (size_t)best_len - 7u) ^ zgec_rd64(vb + ip + (size_t)best_len - 7u)) == 0u) {
+                            uint32_t len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                            if (len > best_len) {
+                                best_len = len;
+                                best_off = (uint32_t)d;
+                            }
                         }
                     }
                 }

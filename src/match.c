@@ -1038,7 +1038,19 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         vb[ip + (size_t)best.length - 1u]) {
                         uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
                         uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
-                        if (target_len_long >= 8u) {
+                        if (target_len_long > 8u) {
+                            if (diff == 0u) {
+                                if (ip + (size_t)target_len_long <= m->vb_size &&
+                                    (zgec_rd64(vb + ip - (size_t)d + (size_t)target_len_long - 8u) ^
+                                     zgec_rd64(vb + ip + (size_t)target_len_long - 8u)) == 0u) {
+                                    len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                                    if (len >= hash_min) {
+                                        mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                       &best_is_rep);
+                                    }
+                                }
+                            }
+                        } else if (target_len_long == 8u) {
                             if (diff == 0u) {
                                 len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                                 if (len >= hash_min) {
@@ -1153,7 +1165,13 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 if (has_v8) {
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
                     uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
-                    if (target_len >= 8u) {
+                    if (target_len > 8u) {
+                        if (diff != 0u) continue;
+                        if (ip + (size_t)target_len <= m->vb_size &&
+                            (zgec_rd64(vb + ip - (size_t)d + (size_t)target_len - 8u) ^
+                             zgec_rd64(vb + ip + (size_t)target_len - 8u)) != 0u) continue;
+                        len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                    } else if (target_len == 8u) {
                         if (diff != 0u) continue;
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
