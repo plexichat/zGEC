@@ -190,3 +190,14 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Overlapping Unaligned Loads for Match Extension Tails and Zero Hit-Mask Bucket Bypassing
+
+**Learning:**
+1. In `mf_match_len_slow` (`src/match.c`) and `fast_match_len_tail` (`src/parse.c`), replacing scalar byte-by-byte comparison loops for remaining bytes (< 8 bytes) with a single overlapping 64-bit unaligned load XOR at `cap - 8u` (guarded with `if (cap >= 8u)`) and `__builtin_ctzll` branchlessly evaluates remaining match lengths without scalar loop overhead or pointer underflow.
+2. In `mf_match_len` (`src/match.c`), adding a 32-bit overlapping read for `4 <= cap < 8` using `zgec_rd32` branchlessly resolves short match extensions without scalar byte comparisons.
+3. In `zgec_matcher_find_lens` (`src/match.c`), checking `if (mask == 0u) return best;` immediately after `mf_bucket_hits` bypasses `__builtin_popcount`, wants clamping, and bit rotation math when no candidate tags match in the short bucket ring.
+4. Replacing variable shift calculation `(1ULL << (target_len * 8u)) - 1ULL` with static array lookup `zgec_mask_table[target_len]` eliminates dynamic shift instructions and avoids potential undefined behavior when `target_len == 8`.
+
+**Action:**
+Use overlapping 64-bit/32-bit unaligned load XORs with `ctzll`/`ctz` to resolve LZ match length tails branchlessly, and return early when vector tag hit masks evaluate to zero.
