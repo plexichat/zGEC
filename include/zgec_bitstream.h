@@ -169,9 +169,16 @@ static inline int zgec_br_done(const zgec_br *b)
 static inline __attribute__((always_inline))
 void zgec_bw_flush(uint8_t *dst, uint64_t acc, unsigned bytes)
 {
-    unsigned i;
-    for (i = 0; i < bytes; i++)
-        dst[i] = (uint8_t)(acc >> (8u * i));
+    if (bytes == 1u) {
+        dst[0] = (uint8_t)acc;
+    } else if (bytes == 2u) {
+        zgec_wr16(dst, (uint16_t)acc);
+    } else if (bytes == 4u) {
+        zgec_wr32(dst, (uint32_t)acc);
+    } else {
+        for (unsigned i = 0u; i < bytes; i++)
+            dst[i] = (uint8_t)(acc >> (8u * i));
+    }
 }
 
 static inline __attribute__((always_inline))

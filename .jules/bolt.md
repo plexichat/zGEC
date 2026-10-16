@@ -194,3 +194,13 @@ Pre-filter all candidate match positions against `target_len = max(best.length, 
 
 **Action:**
 Always cache bitwriter state in local registers during entropy encoding loops, and vectorize 256-element histogram array additions with 256-bit AVX2 SIMD.
+
+## 2026-10-15 - Register-Backed FSE Bitwriting and Specialised Bitstream Flushes
+
+**Learning:**
+1. In `zgec_fse_encode` (`src/fse.c`) and `zgec_seq_stream_encode_cond` (`src/seq.c`), maintaining bitwriter accumulator and pointer state in local register variables (`bw_acc`, `bw_nacc`, `bw_ptr`) and performing 32-bit threshold flushes (`zgec_wr32`) when `bw_nacc >= 32` removes struct pointer dereferences and function call overhead per symbol.
+2. In `zgec_bw_flush` (`include/zgec_bitstream.h`), specializing 1, 2, and 4 byte flushes with direct unaligned store primitives (`zgec_wr16`, `zgec_wr32`) avoids scalar byte loop iterations during bitstream flushes.
+3. Before finalizing backward bitstream encoding in `zgec_bw_finish`, all complete bytes (`rem_bytes = bw_nacc >> 3`) must be flushed so that `bw_nacc < 8` and `bw_acc` holds only remaining sub-byte bits, ensuring sentinel bit insertion in `zgec_bw_finish` functions correctly.
+
+**Action:**
+In entropy and bitstream encoding routines, localize bitwriter state into registers, flush 32-bit chunks via `zgec_wr32`, and ensure remaining full bytes are flushed down to `bw_nacc < 8` prior to calling `zgec_bw_finish`.
