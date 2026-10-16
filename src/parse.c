@@ -1317,8 +1317,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         /* Lazy evaluation at ip + 1, driven by the
          * same price score and selected with a
          * conditional move on the score. */
-        if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
-            cur_len <= PARSE_LAZY_MAX_LEN &&
+        uint32_t lazy_max = (tier == ZGEC_TIER_HIGH) ? 64u : PARSE_LAZY_MAX_LEN;
+        if (lazy_max > 0u && cur_len > 0u &&
+            cur_len <= lazy_max &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;

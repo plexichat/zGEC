@@ -1095,31 +1095,35 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 /* Retained explicit capacity check on the long-table path:
                  * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
-                    uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
+                    uint32_t target_len_long = (best.length > 8u) ? best.length : 8u;
                     /* A candidate can only beat `best` if it matches at
                      * target_len_long - 1 as well; one byte compare there skips
                      * the length scan for the candidates that cannot. */
                     if (target_len_long <= cap &&
                         vb[ip - (size_t)d + (size_t)target_len_long - 1u] ==
                         vb[ip + (size_t)target_len_long - 1u]) {
-                        uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                        if (target_len_long >= 8u) {
-                            if (diff == 0u) {
-                                len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
-                                if (len >= hash_min) {
-                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
-                                                   &best_is_rep);
+                        if (!(target_len_long >= 16u &&
+                              (zgec_rd64(vb + ip - (size_t)d + (size_t)target_len_long - 8u) ^
+                               zgec_rd64(vb + ip + (size_t)target_len_long - 8u)) != 0u)) {
+                            uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+                            if (target_len_long >= 8u) {
+                                if (diff == 0u) {
+                                    len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
+                                    if (len >= hash_min) {
+                                        mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                       &best_is_rep);
+                                    }
                                 }
-                            }
-                        } else {
-                            uint64_t diff_mask = zgec_mask_table[target_len_long];
-                            if ((diff & diff_mask) == 0u) {
-                                len = (diff == 0u)
-                                          ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
-                                          : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                                if (len >= hash_min) {
-                                    mf_update_best(d, len, &best, rep0, rep1, rep2,
-                                                   &best_is_rep);
+                            } else {
+                                uint64_t diff_mask = zgec_mask_table[target_len_long];
+                                if ((diff & diff_mask) == 0u) {
+                                    len = (diff == 0u)
+                                              ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                                              : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                                    if (len >= hash_min) {
+                                        mf_update_best(d, len, &best, rep0, rep1, rep2,
+                                                       &best_is_rep);
+                                    }
                                 }
                             }
                         }
@@ -1217,6 +1221,11 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 if (target_len <= cap &&
                     vb[ip - (size_t)d + (size_t)target_len - 1u] !=
                     vb[ip + (size_t)target_len - 1u]) {
+                    continue;
+                }
+                if (target_len >= 16u && target_len <= cap &&
+                    (zgec_rd64(vb + ip - (size_t)d + (size_t)target_len - 8u) ^
+                     zgec_rd64(vb + ip + (size_t)target_len - 8u)) != 0u) {
                     continue;
                 }
                 if (has_v8) {
@@ -1363,7 +1372,8 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
      * keeps 3 through ZGEC_MF_MATCH_SAMPLES_FAST. */
     if (m->tier == ZGEC_TIER_HIGH) {
         /* Every position in the range, sampled if the
-         * match is very long. */
+         * match is very long. Short table receives every position;
+         * long table (8-byte hash) is restricted to boundary positions. */
         size_t stride = (size_t)1;
         size_t pos;
         if (len > (size_t)ZGEC_MF_HIGH_SAMPLES) {
@@ -1375,7 +1385,8 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
             if (pos + need > m->vb_size) {
                 break;
             }
-            mf_insert_pos(m, vb, pos, 1);
+            int long_ok = (pos == start || pos == start + 1u || pos + 1u >= start + len) ? 1 : 0;
+            mf_insert_pos(m, vb, pos, long_ok);
         }
     } else {
         size_t nsamp = (m->tier == ZGEC_TIER_FAST)
