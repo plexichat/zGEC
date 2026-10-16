@@ -1415,14 +1415,16 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
+        size_t next_lane_idx = 0;
+        int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
         for (j = 0; j < n_z; j++) {
-            if (runstart && zgec_rs_get(runstart, j)) {
+            if (has_rs && zgec_rs_get(runstart, j)) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
             }
-            if (j == start[0] || j == start[1] || j == start[2] || j == start[3] ||
-                j == start[4] || j == start[5] || j == start[6] || j == start[7]) {
+            if (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) {
+                while (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) next_lane_idx++;
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
@@ -2013,14 +2015,12 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
     __m256i v1 = _mm256_set1_epi32(1);
     __m256i vzero = _mm256_setzero_si256();
     __m256i vml_sum_acc = _mm256_setzero_si256();
+    const __m256i v_offsets = _mm256_set_epi32(84, 72, 60, 48, 36, 24, 12, 0);
     for (; t + 8 <= n; t += 8) {
         const zgec_sequence *q = &parse->seq[s0 + t];
-        __m256i v_ll = _mm256_set_epi32((int)q[7].ll, (int)q[6].ll, (int)q[5].ll, (int)q[4].ll,
-                                        (int)q[3].ll, (int)q[2].ll, (int)q[1].ll, (int)q[0].ll);
-        __m256i v_ml = _mm256_set_epi32((int)q[7].ml, (int)q[6].ml, (int)q[5].ml, (int)q[4].ml,
-                                        (int)q[3].ml, (int)q[2].ml, (int)q[1].ml, (int)q[0].ml);
-        __m256i v_of = _mm256_set_epi32((int)q[7].offbase, (int)q[6].offbase, (int)q[5].offbase, (int)q[4].offbase,
-                                        (int)q[3].offbase, (int)q[2].offbase, (int)q[1].offbase, (int)q[0].offbase);
+        __m256i v_ll = _mm256_i32gather_epi32((const int *)(const void *)&q->ll, v_offsets, 1);
+        __m256i v_ml = _mm256_i32gather_epi32((const int *)(const void *)&q->ml, v_offsets, 1);
+        __m256i v_of = _mm256_i32gather_epi32((const int *)(const void *)&q->offbase, v_offsets, 1);
 
         __m256i v_mlv = _mm256_max_epi32(_mm256_sub_epi32(v_ml, v3), vzero);
         __m256i v_ofv = _mm256_max_epi32(_mm256_sub_epi32(v_of, v1), vzero);

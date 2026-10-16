@@ -429,8 +429,16 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
      * therefore enough; the bound test in the loop still refuses to write
      * past the end if that reasoning is ever broken. */
     size_t words_cap = n_lit;
-    uint16_t *words = (uint16_t *)zgec_alloc(words_cap * sizeof(uint16_t), 64);
-    if (!words) return 0;
+    uint16_t stack_words[2048];
+    uint16_t *words = NULL;
+    int words_allocated = 0;
+    if (words_cap <= 2048) {
+        words = stack_words;
+    } else {
+        words = (uint16_t *)zgec_alloc(words_cap * sizeof(uint16_t), 64);
+        if (!words) return 0;
+        words_allocated = 1;
+    }
     size_t nwords = 0;
 
     uint32_t state[8];
@@ -463,7 +471,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
                     zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
                     zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
-                    zgec_free(words);
+                    if (words_allocated) zgec_free(words);
                     return 0;
                 }
             } else {
@@ -473,7 +481,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     j = start[lane] + round;
                     uint8_t s = Z[j];
                     if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                        zgec_free(words);
+                        if (words_allocated) zgec_free(words);
                         return 0;
                     }
                 }
@@ -487,19 +495,19 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 size_t j;
                 if (round >= len[lane]) continue;
                 j = start[lane] + round;
-                if (j >= n_lit) { zgec_free(words); return 0; }
+                if (j >= n_lit) { if (words_allocated) zgec_free(words); return 0; }
                 if (j == start[lane] || zgec_rs_get(runstart, j)) {
                     table_idx = k;
                 } else {
                     uint8_t pidx = idx_lut[Z[j - 1]];
-                    if (pidx == 0xFFu) { zgec_free(words); return 0; }
+                    if (pidx == 0xFFu) { if (words_allocated) zgec_free(words); return 0; }
                     table_idx = (int)pidx;
                 }
-                if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
+                if (table_idx < 0 || table_idx > k) { if (words_allocated) zgec_free(words); return 0; }
                 const zgec_rans_enc_table *tab = &tables[table_idx];
                 uint8_t s = Z[j];
                 if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                    zgec_free(words);
+                    if (words_allocated) zgec_free(words);
                     return 0;
                 }
             }
@@ -509,9 +517,9 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     /* Size the whole result -- header plus words -- before writing any of
      * it, so a capacity failure leaves the caller's buffer untouched. The
      * header used to be written first, which modified stream on failure. */
-    if (nwords > (SIZE_MAX - 32u) / 2u) { zgec_free(words); return 0; }
+    if (nwords > (SIZE_MAX - 32u) / 2u) { if (words_allocated) zgec_free(words); return 0; }
     size_t needed = 32 + nwords * 2;
-    if (needed > stream_cap) { zgec_free(words); return 0; }
+    if (needed > stream_cap) { if (words_allocated) zgec_free(words); return 0; }
 
     for (unsigned lane = 0; lane < 8; lane++) {
         zgec_wr32(stream + 4 * lane, state[lane]);
@@ -519,7 +527,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     for (size_t i = 0; i < nwords; i++) {
         zgec_wr16(stream + 32 + 2 * i, words[nwords - 1 - i]);
     }
-    zgec_free(words);
+    if (words_allocated) zgec_free(words);
     return needed;
 }
 
@@ -552,18 +560,26 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     }
 
     if (n_tables == 1) {
-        /* Single table: multi-accumulator histogram unrolled 4-wide to break
+        /* Single table: multi-accumulator histogram unrolled 8-wide to break
          * store-forwarding dependencies on consecutive repeating bytes. */
         size_t i = 0;
         uint32_t c0[ZGEC_NSYM_LIT] = {0};
         uint32_t c1[ZGEC_NSYM_LIT] = {0};
         uint32_t c2[ZGEC_NSYM_LIT] = {0};
         uint32_t c3[ZGEC_NSYM_LIT] = {0};
-        for (; i + 4 <= n_lit; i += 4) {
+        uint32_t c4[ZGEC_NSYM_LIT] = {0};
+        uint32_t c5[ZGEC_NSYM_LIT] = {0};
+        uint32_t c6[ZGEC_NSYM_LIT] = {0};
+        uint32_t c7[ZGEC_NSYM_LIT] = {0};
+        for (; i + 8 <= n_lit; i += 8) {
             c0[Z[i]]++;
             c1[Z[i + 1]]++;
             c2[Z[i + 2]]++;
             c3[Z[i + 3]]++;
+            c4[Z[i + 4]]++;
+            c5[Z[i + 5]]++;
+            c6[Z[i + 6]]++;
+            c7[Z[i + 7]]++;
         }
         for (; i < n_lit; i++) {
             c0[Z[i]]++;
@@ -574,12 +590,20 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
             __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
             __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
             __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
-            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+            __m256i v4 = _mm256_loadu_si256((const __m256i *)(const void *)(c4 + s));
+            __m256i v5 = _mm256_loadu_si256((const __m256i *)(const void *)(c5 + s));
+            __m256i v6 = _mm256_loadu_si256((const __m256i *)(const void *)(c6 + s));
+            __m256i v7 = _mm256_loadu_si256((const __m256i *)(const void *)(c7 + s));
+            __m256i sum01 = _mm256_add_epi32(v0, v1);
+            __m256i sum23 = _mm256_add_epi32(v2, v3);
+            __m256i sum45 = _mm256_add_epi32(v4, v5);
+            __m256i sum67 = _mm256_add_epi32(v6, v7);
+            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(sum01, sum23), _mm256_add_epi32(sum45, sum67));
             _mm256_storeu_si256((__m256i *)(tables_counts + s), sum);
         }
 #else
         for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
-            tables_counts[s] = c0[s] + c1[s] + c2[s] + c3[s];
+            tables_counts[s] = c0[s] + c1[s] + c2[s] + c3[s] + c4[s] + c5[s] + c6[s] + c7[s];
         }
 #endif
         return;
