@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <string.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -165,13 +166,36 @@ zgec_err zgec_filter_apply(uint8_t *dst, const uint8_t *src, size_t n,
 zgec_err zgec_filter_inverse(uint8_t *buf, size_t n,
                              unsigned mode, unsigned param);
 
-/* ---- little-endian helpers ----
- * The shifts are done in a type the integer promotions leave alone, and
- * the result is narrowed explicitly, because | promotes the two uint16_t
- * halves to int: without the outer cast clang's -Wconversion reads the
- * return as an int-to-uint16_t narrowing and fails a -Werror build. gcc
- * happens not to warn there (it range-checks the expression), so this is
- * the portable spelling. */
+/* ---- little-endian unaligned helpers ---- */
+#if (defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__) || \
+    (defined(__LITTLE_ENDIAN__) && __LITTLE_ENDIAN__ == 1) || \
+    defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86) || \
+    defined(__aarch64__) || defined(_M_ARM64)
+static inline uint16_t zgec_rd16(const uint8_t *p) {
+    uint16_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline uint32_t zgec_rd32(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline uint64_t zgec_rd64(const uint8_t *p) {
+    uint64_t v;
+    memcpy(&v, p, sizeof(v));
+    return v;
+}
+static inline void zgec_wr16(uint8_t *p, uint16_t v) {
+    memcpy(p, &v, sizeof(v));
+}
+static inline void zgec_wr32(uint8_t *p, uint32_t v) {
+    memcpy(p, &v, sizeof(v));
+}
+static inline void zgec_wr64(uint8_t *p, uint64_t v) {
+    memcpy(p, &v, sizeof(v));
+}
+#else
 static inline uint16_t zgec_rd16(const uint8_t *p) {
     return (uint16_t)((uint32_t)p[0] | ((uint32_t)p[1] << 8));
 }
@@ -190,6 +214,7 @@ static inline void zgec_wr32(uint8_t *p, uint32_t v) {
 static inline void zgec_wr64(uint8_t *p, uint64_t v) {
     zgec_wr32(p, (uint32_t)v); zgec_wr32(p + 4, (uint32_t)(v >> 32));
 }
+#endif
 
 /* ---- bit helpers ---- */
 /* floor(log2(v)), defined as 0 for v == 0.

@@ -70,6 +70,8 @@
 #include <assert.h>
 #if defined(__AVX2__)
 #include <immintrin.h>
+#elif defined(__SSE2__)
+#include <emmintrin.h>
 #endif
 
 static const uint64_t zgec_mask_table[9] = {
@@ -500,6 +502,17 @@ uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32_t cap)
                       (uint64_t)zgec_rd64(dst + (size_t)len + 24u);
         if (d3 != 0u) return len + 24u + ((uint32_t)__builtin_ctzll(d3) >> 3);
         len += 32u;
+    }
+#endif
+#if defined(__AVX2__) || defined(__SSE2__)
+    while (len + 16u <= cap) {
+        __m128i a16 = _mm_loadu_si128((const __m128i *)(const void *)(src + len));
+        __m128i b16 = _mm_loadu_si128((const __m128i *)(const void *)(dst + len));
+        unsigned m16 = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(a16, b16));
+        if (m16 != 0xFFFFu) {
+            return len + (uint32_t)__builtin_ctz(~m16);
+        }
+        len += 16u;
     }
 #endif
     while (len + 8u <= cap) {
