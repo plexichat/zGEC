@@ -438,7 +438,8 @@ static inline __attribute__((always_inline)) uint32_t mf_len8(const uint8_t *src
  * cap. The caller guarantees d <= ip and
  * cap <= vb_size - ip, so neither side reads past the
  * virtual buffer. */
-static uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32_t cap)
+static inline __attribute__((always_inline))
+uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32_t cap)
 {
     uint32_t len = 8u;
 #if defined(__AVX2__)
@@ -1030,14 +1031,14 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 /* Retained explicit capacity check on the long-table path:
                  * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
+                    uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                     /* A candidate can only beat `best` if it matches at
-                     * best.length - 1 as well; one byte compare there skips
+                     * target_len_long - 1 as well; one byte compare there skips
                      * the length scan for the candidates that cannot. */
-                    if (best.length == 0u || best.length > cap ||
-                        vb[ip - (size_t)d + (size_t)best.length - 1u] ==
-                        vb[ip + (size_t)best.length - 1u]) {
+                    if (target_len_long <= cap &&
+                        vb[ip - (size_t)d + (size_t)target_len_long - 1u] ==
+                        vb[ip + (size_t)target_len_long - 1u]) {
                         uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                        uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
                         if (target_len_long >= 8u) {
                             if (diff == 0u) {
                                 len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
@@ -1094,6 +1095,9 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
         head = (uint32_t)m->short_head[sbucket];
         mask = mf_bucket_hits(b, tag, m->nlanes, want,
                               (head - 1u) & (m->nlanes - 1u));
+        if (mask == 0u) {
+            return best;
+        }
         nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
         nhit = (nmatch < want) ? nmatch : want;
         /* The live entries walk backwards from the newest lane: the
@@ -1142,17 +1146,17 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                  * pos < ip keeps the 8-byte read inside the buffer, so
                  * dropping the screen removes a load without adding a
                  * candidate. */
+                uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                 /* A candidate can only beat `best` if it matches at
-                 * best.length - 1 as well; one byte compare there skips
+                 * target_len - 1 as well; one byte compare there skips
                  * the length scan for the candidates that cannot. */
-                if (best.length != 0u && best.length <= cap &&
-                    vb[ip - (size_t)d + (size_t)best.length - 1u] !=
-                    vb[ip + (size_t)best.length - 1u]) {
+                if (target_len <= cap &&
+                    vb[ip - (size_t)d + (size_t)target_len - 1u] !=
+                    vb[ip + (size_t)target_len - 1u]) {
                     continue;
                 }
                 if (has_v8) {
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                    uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);

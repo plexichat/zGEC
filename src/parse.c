@@ -575,7 +575,8 @@ static inline size_t fast_pos_of(uint32_t e)
 
 
 
-static inline uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
+static inline __attribute__((always_inline))
+uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
 {
     size_t len = 0;
 #if defined(__AVX2__)
@@ -1306,9 +1307,13 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
-            zgec_match nm = zgec_matcher_find(m, vb, ip + (size_t)1,
-                                              reps.rep[0], reps.rep[1], reps.rep[2], 4u,
-                                              (uint32_t)(end - (ip + (size_t)1)));
+            uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
+            if (min_lazy_len < 4u) min_lazy_len = 4u;
+            zgec_match nm = zgec_matcher_find_lens(m, vb, ip + (size_t)1,
+                                                   reps.rep[0], reps.rep[1], reps.rep[2],
+                                                   min_lazy_len,
+                                                   (uint32_t)(end - (ip + (size_t)1)),
+                                                   NULL);
             uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
             uint32_t nis_rep = (nm.length >= 4u &&
                                 (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||

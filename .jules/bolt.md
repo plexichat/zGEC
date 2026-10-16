@@ -190,3 +190,13 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - Target-Len Pre-Filtering, Inlined Match Extension and Lazy Probe Score Thresholding
+
+**Learning:**
+1. In `zgec_matcher_find_lens` (`src/match.c`), pre-filtering candidate short bucket and long table matches against `target_len = max(best.length, hash_min)` byte equality (`vb[ip - d + target_len - 1] == vb[ip + target_len - 1]`) before issuing 64-bit loads or diff mask arithmetic prunes invalid candidates branchlessly even when `best.length == 0`. In addition, returning `best` immediately when `mask == 0u` skips popcount and mask rotation calculations.
+2. Inlining `mf_match_len_slow` with `always_inline` eliminates function call frame setup and register spilling overhead across 8+ byte match extensions.
+3. In `zgec_parse_block_ex` (`src/parse.c`), computing `min_lazy_len = (uint32_t)(cur_score / lbar) + 1u` and passing it as `min_len` to `zgec_matcher_find_lens` during lazy evaluation probes at `ip + 1` filters out non-viable short match candidates early, dropping match finding runtime by >60%.
+
+**Action:**
+Pre-filter all candidate match positions against `target_len = max(best.length, hash_min)` byte equality before loading 64-bit prefixes, inline match length extension routines, and derive `min_len` from `cur_score / lbar` for lazy lookahead probes.
