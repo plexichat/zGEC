@@ -856,7 +856,21 @@ zgec_err zgec_fse_symbol_extra(unsigned sym, uint32_t value,
  * local CPU registers during FSE sequence encoding to eliminate struct pointer
  * dereferences on every written symbol bit. Flushes 32-bit words when accumulator
  * reaches >= 32 bits. */
-static inline void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
+/* clang's inline cost model declines to inline this helper (its arguments
+ * are addresses of the caller's locals, which it misprices), leaving an
+ * out-of-line call with five pointer dereferences per emitted field --
+ * measured ~+4% encode at -l4/-l6. GCC inlines it unaided and emits
+ * marginally better code without a forced hint, so the attribute is only
+ * applied for clang. (Found via llvm-nm symbol presence; see
+ * .bench-cache/branch-eval/merged-stack-results.md.) */
+#if defined(__clang__)
+#define ZGEC_FSE_BW_INLINE __attribute__((always_inline))
+#else
+#define ZGEC_FSE_BW_INLINE
+#endif
+
+static inline ZGEC_FSE_BW_INLINE
+void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
                                            uint8_t **bw_ptr, const uint8_t *bw_end,
                                            int *overflow, uint32_t val, unsigned n)
 {
