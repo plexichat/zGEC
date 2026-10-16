@@ -1,3 +1,6 @@
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include "zgec_fse.h"
 
 #include <stdlib.h>
@@ -63,9 +66,31 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
     if (nsym <= 0 || nsym > 256) return ZGEC_ERR_INVAL;
     int S = 1 << al;
     int effective_sum = 0;
-    for (int s = 0; s < nsym; s++) {
-        if (counts[s] < -1) return ZGEC_ERR_FSE_COUNTS;
-        int eff = counts[s] < 0 ? 1 : counts[s];
+    int s_eff = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    __m256i vone = _mm256_set1_epi32(1);
+    __m256i vzero = _mm256_setzero_si256();
+    __m256i vneg1 = _mm256_set1_epi32(-1);
+    for (; s_eff + 8 <= nsym; s_eff += 8) {
+        __m128i raw16 = _mm_loadu_si128((const __m128i *)(const void *)(counts + s_eff));
+        __m256i vc = _mm256_cvtepi16_epi32(raw16);
+        __m256i vinvalid = _mm256_cmpgt_epi32(vneg1, vc);
+        if (!_mm256_testz_si256(vinvalid, vinvalid)) return ZGEC_ERR_FSE_COUNTS;
+        __m256i vneg = _mm256_cmpgt_epi32(vzero, vc);
+        __m256i veff = _mm256_blendv_epi8(vc, vone, vneg);
+        vsum = _mm256_add_epi32(vsum, veff);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    effective_sum += _mm_cvtsi128_si32(vlow);
+#endif
+    for (; s_eff < nsym; s_eff++) {
+        if (counts[s_eff] < -1) return ZGEC_ERR_FSE_COUNTS;
+        int eff = counts[s_eff] < 0 ? 1 : counts[s_eff];
         effective_sum += eff;
     }
     if (effective_sum != S) return ZGEC_ERR_FSE_SUM;
@@ -85,17 +110,17 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
     unsigned char table[1u << ZGEC_MAX_AL];   /* S <= 2048 */
     memset(table, 0, (size_t)S);
     int high = S - 1;
-    for (int s = 0; s < nsym; s++) {
-        if (counts[s] < 0) table[high--] = (unsigned char)s;
+    for (int s_idx = 0; s_idx < nsym; s_idx++) {
+        if (counts[s_idx] < 0) table[high--] = (unsigned char)s_idx;
     }
     unsigned step = (unsigned)((S >> 1) + (S >> 3) + 3);
     unsigned mask = (unsigned)(S - 1);
     unsigned pos = 0;
-    for (int s = 0; s < nsym; s++) {
-        int n = counts[s];
+    for (int s_idx = 0; s_idx < nsym; s_idx++) {
+        int n = counts[s_idx];
         if (n <= 0) continue;
         for (int i = 0; i < n; i++) {
-            table[pos] = (unsigned char)s;
+            table[pos] = (unsigned char)s_idx;
             do { pos = (pos + step) & mask; } while ((int)pos > high);
         }
     }
@@ -103,7 +128,19 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
 
     int next[256];
     memset(next, 0, sizeof(next));
-    for (int s = 0; s < nsym; s++) next[s] = counts[s] < 0 ? 1 : counts[s];
+    int s_next = 0;
+#if defined(__AVX2__)
+    __m256i vone_nxt = _mm256_set1_epi32(1);
+    __m256i vzero_nxt = _mm256_setzero_si256();
+    for (; s_next + 8 <= nsym; s_next += 8) {
+        __m128i raw16 = _mm_loadu_si128((const __m128i *)(const void *)(counts + s_next));
+        __m256i vc = _mm256_cvtepi16_epi32(raw16);
+        __m256i vneg = _mm256_cmpgt_epi32(vzero_nxt, vc);
+        __m256i veff = _mm256_blendv_epi8(vc, vone_nxt, vneg);
+        _mm256_storeu_si256((__m256i *)(void *)(next + s_next), veff);
+    }
+#endif
+    for (; s_next < nsym; s_next++) next[s_next] = counts[s_next] < 0 ? 1 : counts[s_next];
     for (int i = 0; i < S; i++) {
         int s = table[i];
         if (s < 0 || s >= nsym) { zgec_free(t); return ZGEC_ERR_FSE_COUNTS; }

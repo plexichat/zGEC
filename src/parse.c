@@ -1,5 +1,5 @@
 #include <stdint.h>
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_parse.h"
@@ -319,12 +319,25 @@ static float parse_lbar(const uint32_t *lit_hist, size_t total)
     float t;
     float bits = 0.0f;
     float per;
-    int s;
+    int s = 0;
     if (total < 64) return 6.0f;
     t = (float)total + PARSE_LBAR_PRIOR * 256.0f;
-    for (s = 0; s < 256; s++) {
+    float log2_t = log2f(t);
+#if defined(__AVX2__)
+    __m256 vprior = _mm256_set1_ps(PARSE_LBAR_PRIOR);
+    for (; s + 8 <= 256; s += 8) {
+        __m256i vhist = _mm256_loadu_si256((const __m256i *)(const void *)(lit_hist + s));
+        __m256 vc = _mm256_add_ps(_mm256_cvtepi32_ps(vhist), vprior);
+        float c_arr[8];
+        _mm256_storeu_ps(c_arr, vc);
+        for (int k = 0; k < 8; k++) {
+            bits += c_arr[k] * (log2_t - log2f(c_arr[k]));
+        }
+    }
+#endif
+    for (; s < 256; s++) {
         float c = (float)lit_hist[s] + PARSE_LBAR_PRIOR;
-        bits += c * (log2f(t) - log2f(c));
+        bits += c * (log2_t - log2f(c));
     }
     per = bits / (float)total;
     if (per < 2.0f) per = 2.0f;
