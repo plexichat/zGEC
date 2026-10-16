@@ -1312,11 +1312,12 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;
+            uint32_t nrep_len[3] = { 0u, 0u, 0u };
             zgec_match nm = zgec_matcher_find_lens(m, vb, ip + (size_t)1,
                                                    reps.rep[0], reps.rep[1], reps.rep[2],
                                                    min_lazy_len,
                                                    (uint32_t)(end - (ip + (size_t)1)),
-                                                   NULL);
+                                                   nrep_len);
             uint32_t nll = (uint32_t)((ip + (size_t)1) - anchor);
             uint32_t nis_rep = (nm.length >= 4u &&
                                 (nm.offset == reps.rep[0] || nm.offset == reps.rep[1] ||
@@ -1332,12 +1333,34 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
              * the branch below only runs when cur_len > 0, and only then
              * is base > 0, so the -1.0 sentinel loses the same comparison
              * the real score would. */
+            float nll_cost = parse_ll_cost(nll, l2tot[0], ll_base);
             if (nm.length >= nneed && (float)nm.length * lbar > base) {
                 uint32_t noffbase = parse_offbase(nm.offset, &reps);
-                float nll_cost = parse_ll_cost(nll, l2tot[0], ll_base);
                 nscore = parse_score_fast(nm.length, nll_cost, noffbase,
                                           l2tot, ml_base, of_base,
                                           lbar, lscale);
+            }
+            {
+                size_t nip = ip + 1u;
+                size_t ncap = end - nip;
+                unsigned nreps = (tier == ZGEC_TIER_FAST) ? 1u : 3u;
+                for (unsigned ri = 0u; ri < nreps; ri++) {
+                    uint32_t roff = reps.rep[ri];
+                    if (roff != 0u && (size_t)roff <= nip && (size_t)roff <= (1u << 24)) {
+                        if (ncap >= 4u && nrep_len[ri] >= 4u) {
+                            if ((float)nrep_len[ri] * lbar > base) {
+                                uint32_t rlen = nrep_len[ri];
+                                uint32_t roffbase = parse_offbase(roff, &reps);
+                                float rscore = parse_score_fast(rlen, nll_cost, roffbase,
+                                                                l2tot, ml_base, of_base,
+                                                                lbar, lscale);
+                                if (rscore > nscore) {
+                                    nscore = rscore;
+                                }
+                            }
+                        }
+                    }
+                }
             }
             /* cmov-style: the score comparison feeds a
              * 0/1 select, not a length branch. */

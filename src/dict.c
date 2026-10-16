@@ -511,16 +511,16 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
     seg->raw_len = 0;
 
     if (seg->n_seq > 0) {
-        if (seg->n_seq > SIZE_MAX / (4 * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
-        uint32_t *seq_buf = (uint32_t *)zgec_alloc(4 * seg->n_seq * sizeof(uint32_t), 64);
-        if (!seq_buf) {
+        size_t aligned_seqs = (seg->n_seq + 15u) & ~(size_t)15u;
+        if (aligned_seqs > SIZE_MAX / (4u * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
+        seg->ll = (uint32_t *)zgec_alloc(4u * aligned_seqs * sizeof(uint32_t), 64);
+        if (!seg->ll) {
             zgec_dict_seg_release(seg);
             return ZGEC_ERR_NOMEM;
         }
-        seg->ll = seq_buf;
-        seg->ml = seq_buf + seg->n_seq;
-        seg->of = seq_buf + 2 * seg->n_seq;
-        seg->rep0_before = seq_buf + 3 * seg->n_seq;
+        seg->ml = seg->ll + aligned_seqs;
+        seg->of = seg->ml + aligned_seqs;
+        seg->rep0_before = seg->of + aligned_seqs;
     }
     if (seg->n_lit > 0) {
         if ((uint64_t)seg->n_lit + ZGEC_LIT_SLACK > (uint64_t)SIZE_MAX / 2) {

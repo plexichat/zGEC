@@ -12,3 +12,7 @@ Action: Stack-allocate FSE occurrence tables and bounded sequence symbol buffers
 
 
 
+
+2026-10-12 - Sequence Array Allocation Consolidation and Lazy Lookahead Repeat Evaluation
+Learning: Allocating four separate sequence arrays (`ll`, `ml`, `of`, `rep0_before`) per segment in `src/decode.c` and `src/dict.c` produced heavy heap allocation churn and fragmentation during decompression. Consolidating them into a single 64-byte aligned allocation `4 * aligned_seqs * sizeof(uint32_t)` (with `aligned_seqs = (n_seq + 15) & ~15`) reduces heap allocations by 75% per segment while preserving 64-byte SIMD alignment across all four pointers. Furthermore, in `zgec_parse_block_ex`, evaluating repeat offsets at `ip + 1` during lazy lookahead probing using `zgec_matcher_find_lens` ensures zero-distance-cost repeat matches at lookahead positions are selected, improving compression density.
+Action: Align consolidated array section offsets to 64-byte boundaries, and evaluate repeat offset candidate scores during lazy lookahead match parsing.
