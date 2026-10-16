@@ -190,3 +190,12 @@ Precompute rANS normalization thresholds (), use 32-bit unsigned wraparound rema
 
 **Action:**
 Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparound remainder logic in rANS symbol encoding, and bypass bit-level runstart lookups when the runstart bitmap is empty.
+
+## 2026-10-16 - FSE Table Pointer Hoisting and 4-Byte Chunked Match Reconstruction
+
+**Learning:**
+1. In `seq_decode_cond` (`src/decode.c`) and `zgec_fse_decode` (`src/fse.c`), hoisting table entry pointers (`t[0]->e`, `t[1]->e`, `t[2]->e` and `t->e`) into local pointers outside the main sequence decoding loop avoids repeated table struct pointer dereferences on every sequence symbol.
+2. In `exec_block` (`src/decode.c`), handling small match offsets (`moff == 3`) with a tight 3-byte pattern loop and using `exec_match_wide(d, msrc, mlen, 4)` for all offsets `moff >= 4` and lengths `mlen >= 4` eliminates scalar byte-by-byte fallback copy loops in Phase B match reconstruction.
+
+**Action:**
+Hoist FSE table entry pointers outside sequence decoding loops, and handle small offsets (`moff == 3`) with pattern loops and `moff >= 4` with 4-byte chunked wide copies in Phase B match reconstruction.

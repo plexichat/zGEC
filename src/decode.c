@@ -1056,6 +1056,11 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
      * checks branch, never taken on a valid stream. nacc is at most 59
      * on entry and never exceeds 63 after, so `w >> nacc` never shifts
      * by 64. Hands over with reader state fully up to date. */
+    const zgec_fse_dec_entry *e0 = t[0]->e;
+    const zgec_fse_dec_entry *e1 = t[1]->e;
+    const zgec_fse_dec_entry *e2 = t[2]->e;
+    const zgec_fse_dec_entry *et[3] = { e0, e1, e2 };
+
     while (i + 1 < n && left > 16u) {
         unsigned cls = clsbuf[i];
         const zgec_fse_dec_entry *en;
@@ -1068,11 +1073,9 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         unsigned nb;
         uint64_t w;
         if (cls > 2u) goto bad_internal;
-        en = &t[cls]->e[state];
-        if (en->symbol < 0 || en->symbol >= ZGEC_NSYM_SEQ) goto bad_symbol;
+        en = &et[cls][state];
         sym = (unsigned)en->symbol;
         xb = (unsigned)zgec_seq_nbits[sym];
-        if (xb > 32u) goto bad_symbol;
         if (nacc < 56u) {
             nb = (63u - nacc) >> 3;
             w = zgec_rd64(ptr - 7);
@@ -1092,7 +1095,7 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         acc <<= nbq;
         nacc -= nbq;
         next = en->baseline + (int32_t)bits;
-        if (next < 0 || (unsigned)next >= S) goto bad_stream;
+        if ((unsigned)next >= S) goto bad_stream;
         state = (unsigned)next;
         i++;
     }
@@ -1136,13 +1139,6 @@ bad_internal:
     br.left = left;
     if (clsbuf_allocated) zgec_free(clsbuf);
     return ZGEC_ERR_INTERNAL;
-bad_symbol:
-    br.acc = acc;
-    br.nacc = nacc;
-    br.ptr = ptr;
-    br.left = left;
-    if (clsbuf_allocated) zgec_free(clsbuf);
-    return ZGEC_ERR_FSE_SYMBOL;
 bad_stream:
     br.acc = acc;
     br.nacc = nacc;
@@ -1849,6 +1845,17 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                     }
                     _mm_storeu_si128((__m128i *)(d + mlen - 16), _mm_loadu_si128((const __m128i *)(msrc + ((mlen - 16) % 16))));
 #endif
+                } else if (moff == 3) {
+                    uint8_t s0 = msrc[0], s1 = msrc[1], s2 = msrc[2];
+                    size_t i = 0;
+                    while (i + 3 <= mlen) {
+                        d[i] = s0; d[i + 1] = s1; d[i + 2] = s2;
+                        i += 3;
+                    }
+                    if (i < mlen) {
+                        d[i] = s0;
+                        if (i + 1 < mlen) d[i + 1] = s1;
+                    }
                 } else if (moff >= 32 && mlen >= 32) {
                     exec_match_wide(d, msrc, mlen, 32);
                 } else if (moff >= 16 && mlen >= 16) {
@@ -1857,9 +1864,10 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                     exec_match_wide(d, msrc, mlen, 8);
                 } else if (moff >= 8 && mlen == 8) {
                     zgec_wr64(d, zgec_rd64(msrc));
-                } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
-                    memcpy(d, msrc, 4);
-                    memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                } else if (moff >= 4 && mlen >= 4) {
+                    exec_match_wide(d, msrc, mlen, 4);
+                } else if (mlen == 3) {
+                    d[0] = msrc[0]; d[1] = msrc[1]; d[2] = msrc[2];
                 } else {
                     for (k = 0; k < mlen; k++) d[k] = msrc[k];
                 }
