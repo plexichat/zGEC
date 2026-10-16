@@ -871,23 +871,22 @@ zgec_err zgec_fse_symbol_extra(unsigned sym, uint32_t value,
 
 static inline ZGEC_FSE_BW_INLINE
 void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
-                                           uint8_t **bw_ptr, const uint8_t *bw_end,
-                                           int *overflow, uint32_t val, unsigned n)
+                             uint8_t **bw_ptr, const uint8_t *bw_end,
+                             int *overflow, uint32_t val, unsigned n)
 {
     if (n == 0) return;
     uint64_t mask = (n == 32u) ? 0xFFFFFFFFu : ((1ull << n) - 1ull);
     *bw_acc |= (uint64_t)(val & mask) << *bw_nacc;
     *bw_nacc += n;
     if (*bw_nacc >= 32u) {
-        unsigned bytes = *bw_nacc >> 3;
-        *bw_nacc &= 7u;
-        if ((size_t)(bw_end - *bw_ptr) < (size_t)bytes) {
+        if (*bw_ptr + 4 > bw_end) {
             *overflow = 1;
             return;
         }
-        zgec_bw_flush(*bw_ptr, *bw_acc, bytes);
-        *bw_ptr += bytes;
-        *bw_acc >>= (bytes * 8u);
+        zgec_wr32(*bw_ptr, (uint32_t)*bw_acc);
+        *bw_ptr += 4;
+        *bw_acc >>= 32;
+        *bw_nacc -= 32;
     }
 }
 
