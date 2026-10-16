@@ -168,9 +168,6 @@ static void zgec_dict_seg_release(zgec_dict_seg *s)
 {
     if (!s) return;
     zgec_free(s->ll);
-    zgec_free(s->ml);
-    zgec_free(s->of);
-    zgec_free(s->rep0_before);
     zgec_free(s->lit);
     memset(s, 0, sizeof(*s));
 }
@@ -514,16 +511,16 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
     seg->raw_len = 0;
 
     if (seg->n_seq > 0) {
-        if (seg->n_seq > SIZE_MAX / sizeof(uint32_t)) return ZGEC_ERR_NOMEM;
-        seg->ll = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->ml = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->of = (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        seg->rep0_before =
-            (uint32_t *)zgec_alloc(seg->n_seq * sizeof(uint32_t), 64);
-        if (!seg->ll || !seg->ml || !seg->of || !seg->rep0_before) {
+        size_t aligned_seqs = (seg->n_seq + 15u) & ~(size_t)15u;
+        if (aligned_seqs > SIZE_MAX / (4u * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
+        seg->ll = (uint32_t *)zgec_alloc(4u * aligned_seqs * sizeof(uint32_t), 64);
+        if (!seg->ll) {
             zgec_dict_seg_release(seg);
             return ZGEC_ERR_NOMEM;
         }
+        seg->ml = seg->ll + aligned_seqs;
+        seg->of = seg->ml + aligned_seqs;
+        seg->rep0_before = seg->of + aligned_seqs;
     }
     if (seg->n_lit > 0) {
         if ((uint64_t)seg->n_lit + ZGEC_LIT_SLACK > (uint64_t)SIZE_MAX / 2) {
