@@ -596,8 +596,17 @@ static inline uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, s
         }
         len += 8u;
     }
-    while (len < cap && a[len] == b[len]) {
-        len++;
+    if (len < cap) {
+        if (cap >= 8u) {
+            uint64_t x = zgec_rd64(a + cap - 8u) ^ zgec_rd64(b + cap - 8u);
+            if (x != 0u) {
+                return (uint32_t)(cap - 8u + ((unsigned)__builtin_ctzll(x) >> 3));
+            }
+            return (uint32_t)cap;
+        }
+        while (len < cap && a[len] == b[len]) {
+            len++;
+        }
     }
     return (uint32_t)len;
 }

@@ -175,6 +175,19 @@
 #define ZGEC_MF_MATCH_SAMPLES_FAST 3u
 #endif
 
+/* Static diff mask table for target_len 0..8 bytes */
+static const uint64_t zgec_mask_table[9] = {
+    0ULL,
+    0xFFULL,
+    0xFFFFULL,
+    0xFFFFFFULL,
+    0xFFFFFFFFULL,
+    0xFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFULL,
+    0xFFFFFFFFFFFFFFFFULL
+};
+
 /* Minimum non-repeat match is 5; 4 is permitted for
  * repeat offsets (section 11.2). */
 #define ZGEC_MF_MIN_HASH_MATCH 5u
@@ -480,8 +493,18 @@ static uint32_t mf_match_len_slow(const uint8_t *src, const uint8_t *dst, uint32
         }
         len += 8u;
     }
-    while (len < cap && src[len] == dst[len]) {
-        len++;
+    if (len < cap) {
+        if (cap >= 8u) {
+            uint64_t diff = (uint64_t)zgec_rd64(src + (size_t)cap - 8u) ^
+                            (uint64_t)zgec_rd64(dst + (size_t)cap - 8u);
+            if (diff != 0u) {
+                return cap - 8u + ((uint32_t)__builtin_ctzll(diff) >> 3);
+            }
+            return cap;
+        }
+        while (len < cap && src[len] == dst[len]) {
+            len++;
+        }
     }
     return len;
 }
@@ -502,6 +525,17 @@ uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
             return first;
         }
         return mf_match_len_slow(src, dst, cap);
+    }
+    if (cap >= 4u) {
+        uint32_t diff = zgec_rd32(src) ^ zgec_rd32(dst);
+        if (diff != 0u) {
+            return (uint32_t)((unsigned)__builtin_ctz(diff) >> 3);
+        }
+        uint32_t diff_tail = zgec_rd32(src + cap - 4u) ^ zgec_rd32(dst + cap - 4u);
+        if (diff_tail != 0u) {
+            return cap - 4u + ((uint32_t)((unsigned)__builtin_ctz(diff_tail)) >> 3);
+        }
+        return cap;
     }
     uint32_t len = 0;
     while (len < cap && src[len] == dst[len]) {
@@ -1047,7 +1081,7 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                                 }
                             }
                         } else {
-                            uint64_t diff_mask = (1ULL << (target_len_long * 8u)) - 1ULL;
+                            uint64_t diff_mask = zgec_mask_table[target_len_long];
                             if ((diff & diff_mask) == 0u) {
                                 len = (diff == 0u)
                                           ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
@@ -1094,6 +1128,9 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
         head = (uint32_t)m->short_head[sbucket];
         mask = mf_bucket_hits(b, tag, m->nlanes, want,
                               (head - 1u) & (m->nlanes - 1u));
+        if (mask == 0u) {
+            return best;
+        }
         nmatch = (uint32_t)__builtin_popcount((unsigned)mask);
         nhit = (nmatch < want) ? nmatch : want;
         /* The live entries walk backwards from the newest lane: the
@@ -1157,7 +1194,7 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                         if (diff != 0u) continue;
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
-                        uint64_t diff_mask = (1ULL << (target_len * 8u)) - 1ULL;
+                        uint64_t diff_mask = zgec_mask_table[target_len];
                         if ((diff & diff_mask) != 0u) continue;
                         len = (diff == 0u)
                                   ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
