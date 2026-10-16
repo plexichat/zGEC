@@ -218,6 +218,13 @@ static inline double zgec_fast_log2_u32(uint32_t x) {
     shift = (e >= 8u) ? (e - 8u) : 0u;
     return (double)e + (double)((x >> shift) & 0xFFu) * (1.0 / 256.0);
 }
+static inline float zgec_fast_log2_u32_f(uint32_t x) {
+    unsigned e, shift;
+    if (x < 2u) return 0.0f;
+    e = 31u - (unsigned)__builtin_clz(x);
+    shift = (e >= 8u) ? (e - 8u) : 0u;
+    return (float)e + (float)((x >> shift) & 0xFFu) * (1.0f / 256.0f);
+}
 static inline double zgec_fast_log2_u64(uint64_t x) {
     unsigned e, shift;
     if (x < 2u) return 0.0;
