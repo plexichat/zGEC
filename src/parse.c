@@ -729,54 +729,48 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
          * source data, where a single long-distance match repeats its offset
          * many times. The move-to-front update below keeps the chain in step
          * with the decoder exactly as the main tier's matcher does. */
-        {
-            uint32_t r0 = reps.rep[0];
-            uint32_t r1 = reps.rep[1];
-            uint32_t r2 = reps.rep[2];
-            (void)r1;
-            (void)r2;
+        uint32_t r0 = reps.rep[0];
+        uint32_t r1 = reps.rep[1];
+        uint32_t r2 = reps.rep[2];
 
-            if (r0 != 0u && (size_t)r0 <= ip) {
-                uint64_t diff = zgec_rd64(vb + ip - r0) ^ cur8;
-                uint32_t len;
-                if (diff != 0u) {
-                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                } else {
-                    len = 8u + fast_match_len_tail(vb + ip - r0 + 8u, vb + ip + 8u, cap - 8u);
-                }
-                if (len >= 4u && len > best_len) {
-                    best_len = len;
-                    best_off = r0;
-                }
+        if (r0 != 0u && (size_t)r0 <= ip) {
+            uint64_t diff = zgec_rd64(vb + ip - r0) ^ cur8;
+            uint32_t len;
+            if (diff != 0u) {
+                len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+            } else {
+                len = 8u + fast_match_len_tail(vb + ip - r0 + 8u, vb + ip + 8u, cap - 8u);
             }
-#if !ZGEC_FAST_ONEREP
-            if (r1 != 0u && r1 != r0 && (size_t)r1 <= ip) {
-                uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
-                uint32_t len;
-                if (diff != 0u) {
-                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                } else {
-                    len = 8u + fast_match_len_tail(vb + ip - r1 + 8u, vb + ip + 8u, cap - 8u);
-                }
-                if (len >= 4u && len > best_len) {
-                    best_len = len;
-                    best_off = r1;
-                }
+            if (len >= 4u && len > best_len) {
+                best_len = len;
+                best_off = r0;
             }
-            if (r2 != 0u && r2 != r0 && r2 != r1 && (size_t)r2 <= ip) {
-                uint64_t diff = zgec_rd64(vb + ip - r2) ^ cur8;
-                uint32_t len;
-                if (diff != 0u) {
-                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                } else {
-                    len = 8u + fast_match_len_tail(vb + ip - r2 + 8u, vb + ip + 8u, cap - 8u);
-                }
-                if (len >= 4u && len > best_len) {
-                    best_len = len;
-                    best_off = r2;
-                }
+        }
+        if (r1 != 0u && r1 != r0 && (size_t)r1 <= ip) {
+            uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
+            uint32_t len;
+            if (diff != 0u) {
+                len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+            } else {
+                len = 8u + fast_match_len_tail(vb + ip - r1 + 8u, vb + ip + 8u, cap - 8u);
             }
-#endif
+            if (len >= 4u && len > best_len) {
+                best_len = len;
+                best_off = r1;
+            }
+        }
+        if (r2 != 0u && r2 != r0 && r2 != r1 && (size_t)r2 <= ip) {
+            uint64_t diff = zgec_rd64(vb + ip - r2) ^ cur8;
+            uint32_t len;
+            if (diff != 0u) {
+                len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+            } else {
+                len = 8u + fast_match_len_tail(vb + ip - r2 + 8u, vb + ip + 8u, cap - 8u);
+            }
+            if (len >= 4u && len > best_len) {
+                best_len = len;
+                best_off = r2;
+            }
         }
 
         /* 2 & 3. Table probes (short table cs and long table cl).

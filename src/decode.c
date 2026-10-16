@@ -69,6 +69,7 @@ static void zgec_block_arrays_free(zgec_block_arrays *a)
         for (size_t i = 0; i < a->n_seg; i++) {
             zgec_free(a->segs[i].ll);
             zgec_free(a->segs[i].lit);
+            a->segs[i].lit = NULL;
         }
         zgec_free(a->segs);
     }
