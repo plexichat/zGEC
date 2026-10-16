@@ -429,8 +429,16 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
      * therefore enough; the bound test in the loop still refuses to write
      * past the end if that reasoning is ever broken. */
     size_t words_cap = n_lit;
-    uint16_t *words = (uint16_t *)zgec_alloc(words_cap * sizeof(uint16_t), 64);
-    if (!words) return 0;
+    uint16_t stack_words[2048];
+    uint16_t *words;
+    int words_allocated = 0;
+    if (words_cap <= 2048) {
+        words = stack_words;
+    } else {
+        words = (uint16_t *)zgec_alloc(words_cap * sizeof(uint16_t), 64);
+        if (!words) return 0;
+        words_allocated = 1;
+    }
     size_t nwords = 0;
 
     uint32_t state[8];
@@ -463,7 +471,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
                     zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
                     zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
-                    zgec_free(words);
+                    if (words_allocated) zgec_free(words);
                     return 0;
                 }
             } else {
@@ -473,7 +481,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                     j = start[lane] + round;
                     uint8_t s = Z[j];
                     if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                        zgec_free(words);
+                        if (words_allocated) zgec_free(words);
                         return 0;
                     }
                 }
@@ -487,19 +495,19 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
                 size_t j;
                 if (round >= len[lane]) continue;
                 j = start[lane] + round;
-                if (j >= n_lit) { zgec_free(words); return 0; }
+                if (j >= n_lit) { if (words_allocated) zgec_free(words); return 0; }
                 if (j == start[lane] || zgec_rs_get(runstart, j)) {
                     table_idx = k;
                 } else {
                     uint8_t pidx = idx_lut[Z[j - 1]];
-                    if (pidx == 0xFFu) { zgec_free(words); return 0; }
+                    if (pidx == 0xFFu) { if (words_allocated) zgec_free(words); return 0; }
                     table_idx = (int)pidx;
                 }
-                if (table_idx < 0 || table_idx > k) { zgec_free(words); return 0; }
+                if (table_idx < 0 || table_idx > k) { if (words_allocated) zgec_free(words); return 0; }
                 const zgec_rans_enc_table *tab = &tables[table_idx];
                 uint8_t s = Z[j];
                 if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                    zgec_free(words);
+                    if (words_allocated) zgec_free(words);
                     return 0;
                 }
             }
@@ -509,9 +517,9 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     /* Size the whole result -- header plus words -- before writing any of
      * it, so a capacity failure leaves the caller's buffer untouched. The
      * header used to be written first, which modified stream on failure. */
-    if (nwords > (SIZE_MAX - 32u) / 2u) { zgec_free(words); return 0; }
+    if (nwords > (SIZE_MAX - 32u) / 2u) { if (words_allocated) zgec_free(words); return 0; }
     size_t needed = 32 + nwords * 2;
-    if (needed > stream_cap) { zgec_free(words); return 0; }
+    if (needed > stream_cap) { if (words_allocated) zgec_free(words); return 0; }
 
     for (unsigned lane = 0; lane < 8; lane++) {
         zgec_wr32(stream + 4 * lane, state[lane]);
@@ -519,7 +527,7 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     for (size_t i = 0; i < nwords; i++) {
         zgec_wr16(stream + 32 + 2 * i, words[nwords - 1 - i]);
     }
-    zgec_free(words);
+    if (words_allocated) zgec_free(words);
     return needed;
 }
 

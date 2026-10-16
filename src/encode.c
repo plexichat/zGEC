@@ -1325,16 +1325,19 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
+        size_t next_lane_idx = 0u;
         for (j = 0; j < n_z; j++) {
             if (runstart && zgec_rs_get(runstart, j)) {
                 rs_hist[z[j]]++;
                 rs_total++;
                 continue;
             }
-            if (j == start[0] || j == start[1] || j == start[2] || j == start[3] ||
-                j == start[4] || j == start[5] || j == start[6] || j == start[7]) {
+            if (next_lane_idx < (size_t)ZGEC_NLANES && j == start[next_lane_idx]) {
                 rs_hist[z[j]]++;
                 rs_total++;
+                while (next_lane_idx < (size_t)ZGEC_NLANES && j == start[next_lane_idx]) {
+                    next_lane_idx++;
+                }
                 continue;
             }
             {
