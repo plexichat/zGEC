@@ -185,3 +185,12 @@ Precompute rANS normalization thresholds (`xmax`), use 32-bit unsigned wraparoun
 
 **Action:**
 Pre-filter all candidate match positions against `target_len = max(best.length, hash_min)` byte equality before loading 64-bit prefixes, inline match length extension routines, and derive `min_len` from `cur_score / lbar` for lazy lookahead probes.
+
+## 2026-10-16 - FSE Local Bitwriter Register State and SIMD Histogram Additions
+
+**Learning:**
+1. In `zgec_fse_encode` (`src/fse.c`), maintaining bitwriter accumulators and pointers (`bw_acc`, `bw_nacc`, `bw_ptr`) in local scalar registers with 32-bit threshold flushes (`zgec_bw_flush`) eliminates struct pointer dereference overhead, reducing `zgec_fse_encode` runtime from 0.48s (8.07%) to 0.20s (3.44%) in gprof profiling.
+2. In `zgec_granule_merge` and `zgec_cluster_greedy` (`src/encode.c`), vectorizing 256-element uint32_t histogram array additions with 256-bit AVX2 SIMD (`_mm256_loadu_si256`, `_mm256_add_epi32`, `_mm256_storeu_si256`) speeds up granule merging and greedy context clustering.
+
+**Action:**
+Always cache bitwriter state in local registers during entropy encoding loops, and vectorize 256-element histogram array additions with 256-bit AVX2 SIMD.

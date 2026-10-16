@@ -852,6 +852,31 @@ zgec_err zgec_fse_symbol_extra(unsigned sym, uint32_t value,
     }
 }
 
+/* Local register bitwriter helper: caches bitstream accumulator and pointer in
+ * local CPU registers during FSE sequence encoding to eliminate struct pointer
+ * dereferences on every written symbol bit. Flushes 32-bit words when accumulator
+ * reaches >= 32 bits. */
+static inline void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
+                                           uint8_t **bw_ptr, const uint8_t *bw_end,
+                                           int *overflow, uint32_t val, unsigned n)
+{
+    if (n == 0) return;
+    uint64_t mask = (n == 32u) ? 0xFFFFFFFFu : ((1ull << n) - 1ull);
+    *bw_acc |= (uint64_t)(val & mask) << *bw_nacc;
+    *bw_nacc += n;
+    if (*bw_nacc >= 32u) {
+        unsigned bytes = *bw_nacc >> 3;
+        *bw_nacc &= 7u;
+        if ((size_t)(bw_end - *bw_ptr) < (size_t)bytes) {
+            *overflow = 1;
+            return;
+        }
+        zgec_bw_flush(*bw_ptr, *bw_acc, bytes);
+        *bw_ptr += bytes;
+        *bw_acc >>= (bytes * 8u);
+    }
+}
+
 zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
                           const uint32_t *values, const uint8_t *syms, size_t n,
                           const uint32_t *base, const uint8_t *nbits)
@@ -867,30 +892,28 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     if (t->e == NULL) return ZGEC_ERR_FSE_COUNTS;
     if (n == 0) return ZGEC_OK;
     if (!values || !syms) return ZGEC_ERR_INVAL;
+    if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
+
+    uint64_t bw_acc = bw->acc;
+    unsigned bw_nacc = bw->nacc;
+    uint8_t *bw_ptr = bw->ptr;
+    const uint8_t *bw_end = bw->end;
+    int overflow = 0;
 
     last_s = syms[n - 1];
     if ((int)last_s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-    /* Rows are 2^al entries and every new_state is an occurrence index below
-     * 2^al (see zgec_fse_build_enc, which now proves that while filling), so
-     * `state` stays inside its row. */
-    /* A symbol absent from the table's histogram owns an all-zero row, so
-     * encoding it would write a transition nobody chose and still report
-     * success -- the decoder would then read whichever symbol owns state 0.
-     * zgec_fse_build_enc marks every cell of a symbol that does occur, so an
-     * unmarked cell proves absence (review finding 1). */
     if ((t->e + ((size_t)last_s << t->al))[0].pad == 0)
         return ZGEC_ERR_FSE_SYMBOL;
     state = (t->e + ((size_t)last_s << t->al))[0].new_state;
 
     {
-        uint32_t extra = 0u;    /* written through the pointer; the
-                                   initialisers keep -Wmaybe-uninitialized
-                                   quiet in a -Werror build */
+        uint32_t extra = 0u;
         unsigned nb = 0u;
         err = zgec_fse_symbol_extra(last_s, values[n - 1], base, nbits,
                                     &extra, &nb);
         if (err != ZGEC_OK) return err;
-        if (nb > 0u) zgec_bw_write(bw, extra, nb);
+        zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, extra, nb);
+        if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
     }
 
     if (base != NULL && nbits != NULL) {
@@ -909,14 +932,16 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             bits = (state >= (uint32_t)entry.baseline)
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
-            zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
+
+            zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, bits, (unsigned)entry.nb_bits);
             if (nb > 0u) {
                 uint32_t lo = base[s];
                 if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
                 uint32_t extra = val - lo;
                 if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-                zgec_bw_write(bw, extra, nb);
+                zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, extra, nb);
             }
+            if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
             state = entry.new_state;
         }
     } else {
@@ -935,20 +960,34 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             bits = (state >= (uint32_t)entry.baseline)
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
-            zgec_bw_write(bw, bits, (unsigned)entry.nb_bits);
+
+            zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, bits, (unsigned)entry.nb_bits);
             err = zgec_fse_symbol_extra(s, values[i - 1], base, nbits, &extra, &nb);
             if (err != ZGEC_OK) return err;
-            if (nb > 0u) zgec_bw_write(bw, extra, nb);
+            zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, extra, nb);
+            if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
             state = entry.new_state;
         }
     }
 
-    /* The writer records an overflow in its own struct instead of returning
-     * it, so a stream that did not fit used to be reported as encoded
-     * (fix.md entry 14). The flag is sticky, so one test after the loop
-     * covers every write above, and one more covers the state field below. */
-    if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
-    zgec_bw_write(bw, state, (unsigned)t->al);
-    if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
+    zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, state, (unsigned)t->al);
+    if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
+
+    unsigned bytes = bw_nacc >> 3;
+    bw_nacc &= 7u;
+    if (bytes > 0) {
+        if ((size_t)(bw_end - bw_ptr) < (size_t)bytes) {
+            bw->overflow = 1;
+            return ZGEC_ERR_BITSTREAM_OVERFLOW;
+        }
+        zgec_bw_flush(bw_ptr, bw_acc, bytes);
+        bw_ptr += bytes;
+        bw_acc >>= (bytes * 8u);
+    }
+
+    bw->acc = bw_acc;
+    bw->nacc = bw_nacc;
+    bw->ptr = bw_ptr;
+
     return ZGEC_OK;
 }
