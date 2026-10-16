@@ -270,10 +270,10 @@ typedef struct {
  *
  * One ordering matters: a literal-reference level keeps its predecessor
  * block's literals plain and free of LL conditioning so the 6.3 chain stays
- * alive, which is why sub-literals (9.6) are added only at level 10, above
- * every literal-reference level. OF conditioning does not break the chain
- * (D6), so level 9 adds conditioning on top of level 8's literal references:
- * the level that adds it re-states the flag rather than dropping one.
+ * alive, so sub-literals (9.6) and conditioning (8.6) sit on the levels
+ * without literal references (6-9), and every literal-reference rung (10
+ * and up) re-states all of them rather than dropping one; litref replaces
+ * sub-literals on its own level regardless (D6, 11.6).
  *
  * Every preset uses the 2 MiB block of section 12.3 (block_log2 21). A
  * larger block is not free: blocks are the unit of parallelism (10.6), so a
@@ -285,8 +285,8 @@ typedef struct {
  * literal-reference region shares the 16 MiB virtual buffer with the block,
  * and the encoder shrinks the prefix to fit rather than the block.
  *
- * Level 10 adds sub-literals; level 12 adds the per-block CRC-32C, which is a
- * fixed-width field and so does not move the size.
+ * Level 10 adds literal references; level 12 adds the per-block CRC-32C,
+ * which is a fixed-width field and so does not move the size.
  *
  * Two features are deliberately in no preset: the sampled pre-filter and
  * epoch dictionaries. The preset rule is measured, so a feature keeps a
@@ -309,17 +309,27 @@ typedef struct {
  * old levels 7 and 8 (which produced byte-identical output on the reference
  * corpus) collapse into level 10, leaving slot 11 free for a ratio rung that
  * does not exist yet and level 12 as today's best (old level 9, with the
- * per-block CRC-32C). */
+ * per-block CRC-32C).
+ *
+ * Rungs 6-9 were re-measured after the fast tier gained its dense schedule
+ * and repeat probing: the main tier became dominated on the reference corpus
+ * (main+ctx: 64,135,979 B at 6.3 s against fast+ctx+sub+cond: 63,055,806 B
+ * at 4.7 s), so 6-9 run fast and high directly. Level 6 = fast+ctx+sub
+ * (63,199,065 B, 4.5 s), level 7 = +conditioning (63,055,806 B, 4.7 s),
+ * level 8 = high+ctx (61,791,618 B, 10.3 s), level 9 = high+ctx+sub+cond
+ * (61,299,800 B, 11.8 s): every rung is smaller than the one below and no
+ * slower. The main tier keeps its own presets nowhere, but stays reachable
+ * with --tier main for the inputs (mozilla, nci) where it still wins. */
 static const cli_level cli_levels[CLI_LEVEL_MAX] = {
     /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
     /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
     /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
     /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  6 */ { ZGEC_TIER_MAIN, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  7 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  8 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 0, 1, 0, 0, 0, 21, 1 },
-    /*  9 */ { ZGEC_TIER_MAIN, 0.0, 1, 0, 1, 1, 0, 0, 0, 21, 1 },
+    /*  6 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 0, 0, 0, 0, 0, 21, 1 },
+    /*  7 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
+    /*  8 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
     /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 1 },
     /* 11 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
     /* 12 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21, 1 },
