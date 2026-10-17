@@ -1088,6 +1088,20 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
         }
     }
 
+    if (best.length >= cap && (best_is_rep || best.length > cap || best.offset <= 1u)) {
+        m->c_ip[ip & 1u] = ip;
+        m->c_flags[ip & 1u] = 0u;
+        if (has_v8) {
+            m->c_hl[ip & 1u] = hl;
+            m->c_flags[ip & 1u] |= 2u;
+        }
+        if (want_short) {
+            m->c_hs[ip & 1u] = hshort;
+            m->c_flags[ip & 1u] |= 1u;
+        }
+        return best;
+    }
+
     /* The hashes this find computes for ip are the ones an insert of ip
      * needs, so leave them behind for mf_insert_pos. The slot is parity
      * indexed, so the lazy probe at ip + 1 lands in the other slot and
