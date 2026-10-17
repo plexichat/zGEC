@@ -224,16 +224,18 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
      * f == 0 marks an invalid slot, rejected lazily below). REPEAT/cloned
      * segments memcpy the whole table, so the pack is reused, not rebuilt. */
 
-    /* Context of each byte, resolved once. 0xFF marks a byte whose class
-     * maps outside the table set; it is rejected when a literal follows it,
-     * which is the behaviour of the reference form. k <= 8, so a real class
-     * never maps to 0xFF. */
-    uint8_t idx_lut[256];
+    /* Context of each byte, resolved to the table itself, once: the steady
+     * loops used to pay two dependent loads per symbol (output byte ->
+     * class index -> packed pointer). NULL marks a byte whose class maps
+     * outside the table set; it is rejected when a literal follows it,
+     * which is the behaviour of the reference form. k <= 8, so a real
+     * class never maps to a NULL table. */
+    const uint32_t *ctx_tab[256];
     if (k > 1) {
         for (unsigned b = 0; b < 256u; b++) {
             unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
-            if (cls >= 64u || (int)class_map[cls] >= k) idx_lut[b] = 0xFFu;
-            else idx_lut[b] = class_map[cls];
+            if (cls >= 64u || (int)class_map[cls] >= k) ctx_tab[b] = NULL;
+            else ctx_tab[b] = tables[class_map[cls]].packed;
         }
     }
 
@@ -253,6 +255,7 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
          * against the old eight-lane AVX2 gather loop, this is ~40%
          * faster, because the gather plus the per-lane renorm branches
          * cost more than the branchless scalar lane update. */
+        const uint32_t *packed0 = tables[0].packed;
         size_t round = 0;
         /* Unguarded rounds: while more than 15 bytes remain at the top of
          * a full round, every lane's branchless 2-byte renorm load is in
@@ -263,7 +266,7 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
             for (unsigned lane = 0; lane < 8; lane++) {
                 size_t j = start[lane] + round;
                 uint32_t x = state[lane];
-                uint32_t e = tables[0].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                uint32_t e = packed0[x & (uint32_t)(ZGEC_RANS_M - 1)];
                 uint32_t f = (e >> 8) & 0xFFFu;
                 if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                 Z[j] = (uint8_t)e;
@@ -278,7 +281,7 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
             for (unsigned lane = 0; lane < m; lane++) {
                 size_t j = start[lane] + round;
                 uint32_t x = state[lane];
-                uint32_t e = tables[0].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                uint32_t e = packed0[x & (uint32_t)(ZGEC_RANS_M - 1)];
                 uint32_t f = (e >> 8) & 0xFFFu;
                 if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                 Z[j] = (uint8_t)e;
@@ -299,11 +302,12 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
         for (size_t i = 0; i < n_lit; i++) {
             if (zgec_rs_get(runstart, i)) { has_rs = 1; break; }
         }
+        const uint32_t *rst = tables[(unsigned)k].packed;
         unsigned m0 = (0 < full) ? 8u : rem;
         for (unsigned lane = 0; lane < m0 && err == ZGEC_OK; lane++) {
             size_t j = start[lane];
             uint32_t x = state[lane];
-            uint32_t e = tables[(unsigned)k].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t e = rst[x & (uint32_t)(ZGEC_RANS_M - 1)];
             uint32_t f = (e >> 8) & 0xFFFu;
             if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
             Z[j] = (uint8_t)e;
@@ -322,19 +326,18 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                 for (; round < full && remaining > 15u; round++) {
                     for (unsigned lane = 0; lane < 8; lane++) {
                         size_t j = start[lane] + round;
-                        unsigned ti;
+                        const uint32_t *tp;
                         uint32_t x;
                         uint32_t e;
                         uint32_t f;
                         if (zgec_rs_get(runstart, j)) {
-                            ti = (unsigned)k;
+                            tp = rst;
                         } else {
-                            uint8_t pidx = idx_lut[Z[j - 1]];
-                            if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
-                            ti = pidx;
+                            tp = ctx_tab[Z[j - 1]];
+                            if (tp == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
                         }
                         x = state[lane];
-                        e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                        e = tp[x & (uint32_t)(ZGEC_RANS_M - 1)];
                         f = (e >> 8) & 0xFFFu;
                         if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                         Z[j] = (uint8_t)e;
@@ -348,16 +351,15 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {
                         size_t j = start[lane] + round;
-                        unsigned ti;
+                        const uint32_t *tp;
                         if (zgec_rs_get(runstart, j)) {
-                            ti = (unsigned)k;
+                            tp = rst;
                         } else {
-                            uint8_t pidx = idx_lut[Z[j - 1]];
-                            if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
-                            ti = pidx;
+                            tp = ctx_tab[Z[j - 1]];
+                            if (tp == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
                         }
                         uint32_t x = state[lane];
-                        uint32_t e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                        uint32_t e = tp[x & (uint32_t)(ZGEC_RANS_M - 1)];
                         uint32_t f = (e >> 8) & 0xFFFu;
                         if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                         Z[j] = (uint8_t)e;
@@ -374,13 +376,13 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                 for (; round < full && remaining > 15u; round++) {
                     for (unsigned lane = 0; lane < 8; lane++) {
                         size_t j = start[lane] + round;
-                        uint8_t pidx = idx_lut[Z[j - 1]];
+                        const uint32_t *tp = ctx_tab[Z[j - 1]];
                         uint32_t x;
                         uint32_t e;
                         uint32_t f;
-                        if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
+                        if (tp == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
                         x = state[lane];
-                        e = tables[pidx].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                        e = tp[x & (uint32_t)(ZGEC_RANS_M - 1)];
                         f = (e >> 8) & 0xFFFu;
                         if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                         Z[j] = (uint8_t)e;
@@ -394,11 +396,10 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {
                         size_t j = start[lane] + round;
-                        uint8_t pidx = idx_lut[Z[j - 1]];
-                        if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
-                        unsigned ti = pidx;
+                        const uint32_t *tp = ctx_tab[Z[j - 1]];
+                        if (tp == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
                         uint32_t x = state[lane];
-                        uint32_t e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                        uint32_t e = tp[x & (uint32_t)(ZGEC_RANS_M - 1)];
                         uint32_t f = (e >> 8) & 0xFFFu;
                         if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                         Z[j] = (uint8_t)e;
