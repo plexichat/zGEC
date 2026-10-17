@@ -225,3 +225,12 @@ Use precomputed 512-entry LUTs for small sequence symbol lookups, compute LZ par
 
 **Action:**
 Use `memcpy` for unaligned little-endian memory access helpers, hoist per-position literal length sequence costs in optimal parser price gates, and use 16-byte SSE2 SIMD steps for short-to-medium match extension loops.
+
+## 2026-10-17 - rANS Decompression AVX2 Symbol Extraction and Multi-Context 8-Lane Loop Unrolling
+
+**Learning:**
+1. In `zgec_rans_decode` (`src/rans.c`), extracting 8 symbol bytes from a 256-bit SIMD packed entry register `v_e` using individual `_mm256_extract_epi32` calls emitted costly `vextracti128` + `vpextrd` SIMD-to-GPR instructions. Replacing with 256-bit SIMD byte shuffle `_mm256_shuffle_epi8` and 64-bit GPR load (`_mm_cvtsi128_si32`) converts 8 extraction instructions into 3 vector instructions followed by 8 fast ALU register shifts.
+2. In multi-context streams (`k > 1`), `zgec_rans_decode` previously processed symbols sequentially through an 8-iteration inner lane loop. Explicitly unrolling the 8 independent lanes into scalar variables (`x0..x7` and `prev0..prev7`) during full rounds (`round < full`) allows the CPU out-of-order execution engine to pipeline state transitions across all 8 independent rANS lanes in parallel.
+
+**Action:**
+Extract vector dword lower bytes into a 64-bit integer using `_mm256_shuffle_epi8`, and explicitly unroll independent multi-lane states into scalar variables during full rounds to maximize CPU instruction-level parallelism.

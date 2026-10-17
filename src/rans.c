@@ -220,14 +220,20 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
             __m256i v_zero_f = _mm256_cmpeq_epi32(v_f, _mm256_setzero_si256());
             if (!_mm256_testz_si256(v_zero_f, v_zero_f)) { err = ZGEC_ERR_RANS_STATE; break; }
 
-            Z[start[0] + round] = (uint8_t)_mm256_extract_epi32(v_e, 0);
-            Z[start[1] + round] = (uint8_t)_mm256_extract_epi32(v_e, 1);
-            Z[start[2] + round] = (uint8_t)_mm256_extract_epi32(v_e, 2);
-            Z[start[3] + round] = (uint8_t)_mm256_extract_epi32(v_e, 3);
-            Z[start[4] + round] = (uint8_t)_mm256_extract_epi32(v_e, 4);
-            Z[start[5] + round] = (uint8_t)_mm256_extract_epi32(v_e, 5);
-            Z[start[6] + round] = (uint8_t)_mm256_extract_epi32(v_e, 6);
-            Z[start[7] + round] = (uint8_t)_mm256_extract_epi32(v_e, 7);
+            __m256i v_mask_bytes = _mm256_set_epi8(-1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, 12, 8, 4, 0, -1,-1,-1,-1, -1,-1,-1,-1, -1,-1,-1,-1, 12, 8, 4, 0);
+            __m256i v_shuf = _mm256_shuffle_epi8(v_e, v_mask_bytes);
+            uint32_t s_lo = (uint32_t)_mm_cvtsi128_si32(_mm256_castsi256_si128(v_shuf));
+            uint32_t s_hi = (uint32_t)_mm_cvtsi128_si32(_mm256_extracti128_si256(v_shuf, 1));
+            uint64_t syms = ((uint64_t)s_hi << 32) | s_lo;
+
+            Z[start[0] + round] = (uint8_t)syms;
+            Z[start[1] + round] = (uint8_t)(syms >> 8);
+            Z[start[2] + round] = (uint8_t)(syms >> 16);
+            Z[start[3] + round] = (uint8_t)(syms >> 24);
+            Z[start[4] + round] = (uint8_t)(syms >> 32);
+            Z[start[5] + round] = (uint8_t)(syms >> 40);
+            Z[start[6] + round] = (uint8_t)(syms >> 48);
+            Z[start[7] + round] = (uint8_t)(syms >> 56);
 
             __m256i v_x_hi = _mm256_srli_epi32(v_x, ZGEC_RANS_L);
             __m256i v_bias = _mm256_srli_epi32(v_e, 20);
@@ -294,56 +300,211 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
             state[lane] = x;
         }
         if (err == ZGEC_OK) {
+            size_t round = 1;
+            uint8_t prev0 = Z[start[0]];
+            uint8_t prev1 = Z[start[1]];
+            uint8_t prev2 = Z[start[2]];
+            uint8_t prev3 = Z[start[3]];
+            uint8_t prev4 = Z[start[4]];
+            uint8_t prev5 = Z[start[5]];
+            uint8_t prev6 = Z[start[6]];
+            uint8_t prev7 = Z[start[7]];
+
+            uint32_t x0 = state[0];
+            uint32_t x1 = state[1];
+            uint32_t x2 = state[2];
+            uint32_t x3 = state[3];
+            uint32_t x4 = state[4];
+            uint32_t x5 = state[5];
+            uint32_t x6 = state[6];
+            uint32_t x7 = state[7];
+
             if (has_rs) {
-                for (size_t round = 1; round < max_rounds && err == ZGEC_OK; round++) {
-                    unsigned m = (round < full) ? 8u : rem;
-                    for (unsigned lane = 0; lane < m; lane++) {
-                        size_t j = start[lane] + round;
-                        unsigned ti;
-                        if (zgec_rs_get(runstart, j)) {
-                            ti = (unsigned)k;
-                        } else {
-                            uint8_t pidx = idx_lut[Z[j - 1]];
-                            if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
-                            ti = pidx;
-                        }
-                        uint32_t x = state[lane];
-                        uint32_t e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
-                        uint32_t f = (e >> 8) & 0xFFFu;
-                        if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
-                        Z[j] = (uint8_t)e;
-                        x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                        if (x < ZGEC_RANS_STATE_MIN) {
-                            if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
-                            x = (x << 16) | zgec_rd16(cursor);
-                            cursor += 2;
-                            remaining -= 2;
-                        }
-                        state[lane] = x;
+                for (; round < full && err == ZGEC_OK; round++) {
+                    size_t j0 = start[0] + round;
+                    size_t j1 = start[1] + round;
+                    size_t j2 = start[2] + round;
+                    size_t j3 = start[3] + round;
+                    size_t j4 = start[4] + round;
+                    size_t j5 = start[5] + round;
+                    size_t j6 = start[6] + round;
+                    size_t j7 = start[7] + round;
+
+                    unsigned ti0 = zgec_rs_get(runstart, j0) ? (unsigned)k : idx_lut[prev0];
+                    unsigned ti1 = zgec_rs_get(runstart, j1) ? (unsigned)k : idx_lut[prev1];
+                    unsigned ti2 = zgec_rs_get(runstart, j2) ? (unsigned)k : idx_lut[prev2];
+                    unsigned ti3 = zgec_rs_get(runstart, j3) ? (unsigned)k : idx_lut[prev3];
+                    unsigned ti4 = zgec_rs_get(runstart, j4) ? (unsigned)k : idx_lut[prev4];
+                    unsigned ti5 = zgec_rs_get(runstart, j5) ? (unsigned)k : idx_lut[prev5];
+                    unsigned ti6 = zgec_rs_get(runstart, j6) ? (unsigned)k : idx_lut[prev6];
+                    unsigned ti7 = zgec_rs_get(runstart, j7) ? (unsigned)k : idx_lut[prev7];
+
+                    if (ti0 == 0xFFu || ti1 == 0xFFu || ti2 == 0xFFu || ti3 == 0xFFu ||
+                        ti4 == 0xFFu || ti5 == 0xFFu || ti6 == 0xFFu || ti7 == 0xFFu) {
+                        err = ZGEC_ERR_CLASS_MAP; break;
                     }
+
+                    uint32_t e0 = tables[ti0].packed[x0 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e1 = tables[ti1].packed[x1 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e2 = tables[ti2].packed[x2 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e3 = tables[ti3].packed[x3 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e4 = tables[ti4].packed[x4 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e5 = tables[ti5].packed[x5 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e6 = tables[ti6].packed[x6 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e7 = tables[ti7].packed[x7 & (uint32_t)(ZGEC_RANS_M - 1)];
+
+                    uint32_t f0 = (e0 >> 8) & 0xFFFu;
+                    uint32_t f1 = (e1 >> 8) & 0xFFFu;
+                    uint32_t f2 = (e2 >> 8) & 0xFFFu;
+                    uint32_t f3 = (e3 >> 8) & 0xFFFu;
+                    uint32_t f4 = (e4 >> 8) & 0xFFFu;
+                    uint32_t f5 = (e5 >> 8) & 0xFFFu;
+                    uint32_t f6 = (e6 >> 8) & 0xFFFu;
+                    uint32_t f7 = (e7 >> 8) & 0xFFFu;
+
+                    if (f0 == 0u || f1 == 0u || f2 == 0u || f3 == 0u ||
+                        f4 == 0u || f5 == 0u || f6 == 0u || f7 == 0u) {
+                        err = ZGEC_ERR_RANS_STATE; break;
+                    }
+
+                    prev0 = (uint8_t)e0; Z[j0] = prev0;
+                    prev1 = (uint8_t)e1; Z[j1] = prev1;
+                    prev2 = (uint8_t)e2; Z[j2] = prev2;
+                    prev3 = (uint8_t)e3; Z[j3] = prev3;
+                    prev4 = (uint8_t)e4; Z[j4] = prev4;
+                    prev5 = (uint8_t)e5; Z[j5] = prev5;
+                    prev6 = (uint8_t)e6; Z[j6] = prev6;
+                    prev7 = (uint8_t)e7; Z[j7] = prev7;
+
+                    x0 = f0 * (x0 >> ZGEC_RANS_L) + (e0 >> 20);
+                    x1 = f1 * (x1 >> ZGEC_RANS_L) + (e1 >> 20);
+                    x2 = f2 * (x2 >> ZGEC_RANS_L) + (e2 >> 20);
+                    x3 = f3 * (x3 >> ZGEC_RANS_L) + (e3 >> 20);
+                    x4 = f4 * (x4 >> ZGEC_RANS_L) + (e4 >> 20);
+                    x5 = f5 * (x5 >> ZGEC_RANS_L) + (e5 >> 20);
+                    x6 = f6 * (x6 >> ZGEC_RANS_L) + (e6 >> 20);
+                    x7 = f7 * (x7 >> ZGEC_RANS_L) + (e7 >> 20);
+
+                    if (x0 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x0 = (x0 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x1 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x1 = (x1 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x2 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x2 = (x2 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x3 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x3 = (x3 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x4 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x4 = (x4 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x5 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x5 = (x5 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x6 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x6 = (x6 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x7 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x7 = (x7 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
                 }
             } else {
-                for (size_t round = 1; round < max_rounds && err == ZGEC_OK; round++) {
-                    unsigned m = (round < full) ? 8u : rem;
-                    for (unsigned lane = 0; lane < m; lane++) {
-                        size_t j = start[lane] + round;
+                for (; round < full && err == ZGEC_OK; round++) {
+                    size_t j0 = start[0] + round;
+                    size_t j1 = start[1] + round;
+                    size_t j2 = start[2] + round;
+                    size_t j3 = start[3] + round;
+                    size_t j4 = start[4] + round;
+                    size_t j5 = start[5] + round;
+                    size_t j6 = start[6] + round;
+                    size_t j7 = start[7] + round;
+
+                    uint8_t pidx0 = idx_lut[prev0];
+                    uint8_t pidx1 = idx_lut[prev1];
+                    uint8_t pidx2 = idx_lut[prev2];
+                    uint8_t pidx3 = idx_lut[prev3];
+                    uint8_t pidx4 = idx_lut[prev4];
+                    uint8_t pidx5 = idx_lut[prev5];
+                    uint8_t pidx6 = idx_lut[prev6];
+                    uint8_t pidx7 = idx_lut[prev7];
+
+                    if (pidx0 == 0xFFu || pidx1 == 0xFFu || pidx2 == 0xFFu || pidx3 == 0xFFu ||
+                        pidx4 == 0xFFu || pidx5 == 0xFFu || pidx6 == 0xFFu || pidx7 == 0xFFu) {
+                        err = ZGEC_ERR_CLASS_MAP; break;
+                    }
+
+                    uint32_t e0 = tables[pidx0].packed[x0 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e1 = tables[pidx1].packed[x1 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e2 = tables[pidx2].packed[x2 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e3 = tables[pidx3].packed[x3 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e4 = tables[pidx4].packed[x4 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e5 = tables[pidx5].packed[x5 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e6 = tables[pidx6].packed[x6 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t e7 = tables[pidx7].packed[x7 & (uint32_t)(ZGEC_RANS_M - 1)];
+
+                    uint32_t f0 = (e0 >> 8) & 0xFFFu;
+                    uint32_t f1 = (e1 >> 8) & 0xFFFu;
+                    uint32_t f2 = (e2 >> 8) & 0xFFFu;
+                    uint32_t f3 = (e3 >> 8) & 0xFFFu;
+                    uint32_t f4 = (e4 >> 8) & 0xFFFu;
+                    uint32_t f5 = (e5 >> 8) & 0xFFFu;
+                    uint32_t f6 = (e6 >> 8) & 0xFFFu;
+                    uint32_t f7 = (e7 >> 8) & 0xFFFu;
+
+                    if (f0 == 0u || f1 == 0u || f2 == 0u || f3 == 0u ||
+                        f4 == 0u || f5 == 0u || f6 == 0u || f7 == 0u) {
+                        err = ZGEC_ERR_RANS_STATE; break;
+                    }
+
+                    prev0 = (uint8_t)e0; Z[j0] = prev0;
+                    prev1 = (uint8_t)e1; Z[j1] = prev1;
+                    prev2 = (uint8_t)e2; Z[j2] = prev2;
+                    prev3 = (uint8_t)e3; Z[j3] = prev3;
+                    prev4 = (uint8_t)e4; Z[j4] = prev4;
+                    prev5 = (uint8_t)e5; Z[j5] = prev5;
+                    prev6 = (uint8_t)e6; Z[j6] = prev6;
+                    prev7 = (uint8_t)e7; Z[j7] = prev7;
+
+                    x0 = f0 * (x0 >> ZGEC_RANS_L) + (e0 >> 20);
+                    x1 = f1 * (x1 >> ZGEC_RANS_L) + (e1 >> 20);
+                    x2 = f2 * (x2 >> ZGEC_RANS_L) + (e2 >> 20);
+                    x3 = f3 * (x3 >> ZGEC_RANS_L) + (e3 >> 20);
+                    x4 = f4 * (x4 >> ZGEC_RANS_L) + (e4 >> 20);
+                    x5 = f5 * (x5 >> ZGEC_RANS_L) + (e5 >> 20);
+                    x6 = f6 * (x6 >> ZGEC_RANS_L) + (e6 >> 20);
+                    x7 = f7 * (x7 >> ZGEC_RANS_L) + (e7 >> 20);
+
+                    if (x0 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x0 = (x0 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x1 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x1 = (x1 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x2 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x2 = (x2 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x3 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x3 = (x3 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x4 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x4 = (x4 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x5 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x5 = (x5 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x6 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x6 = (x6 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                    if (x7 < ZGEC_RANS_STATE_MIN) { if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; } x7 = (x7 << 16) | zgec_rd16(cursor); cursor += 2; remaining -= 2; }
+                }
+            }
+
+            state[0] = x0;
+            state[1] = x1;
+            state[2] = x2;
+            state[3] = x3;
+            state[4] = x4;
+            state[5] = x5;
+            state[6] = x6;
+            state[7] = x7;
+
+            for (; round < max_rounds && err == ZGEC_OK; round++) {
+                unsigned m = (round < full) ? 8u : rem;
+                for (unsigned lane = 0; lane < m; lane++) {
+                    size_t j = start[lane] + round;
+                    unsigned ti;
+                    if (has_rs && zgec_rs_get(runstart, j)) {
+                        ti = (unsigned)k;
+                    } else {
                         uint8_t pidx = idx_lut[Z[j - 1]];
                         if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
-                        unsigned ti = pidx;
-                        uint32_t x = state[lane];
-                        uint32_t e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
-                        uint32_t f = (e >> 8) & 0xFFFu;
-                        if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
-                        Z[j] = (uint8_t)e;
-                        x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                        if (x < ZGEC_RANS_STATE_MIN) {
-                            if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
-                            x = (x << 16) | zgec_rd16(cursor);
-                            cursor += 2;
-                            remaining -= 2;
-                        }
-                        state[lane] = x;
+                        ti = pidx;
                     }
+                    uint32_t x = state[lane];
+                    uint32_t e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f = (e >> 8) & 0xFFFu;
+                    if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j] = (uint8_t)e;
+                    x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+                    if (x < ZGEC_RANS_STATE_MIN) {
+                        if (remaining < 2) { err = ZGEC_ERR_RANS_CURSOR; break; }
+                        x = (x << 16) | zgec_rd16(cursor);
+                        cursor += 2;
+                        remaining -= 2;
+                    }
+                    state[lane] = x;
                 }
             }
         }
