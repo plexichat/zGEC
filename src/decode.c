@@ -1793,6 +1793,15 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * before the match, so the byte-at-a-time order is
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
+                } else if (moff >= 32 && mlen >= 32) {
+                    exec_match_wide(d, msrc, mlen, 32);
+                } else if (moff >= 16 && mlen >= 16) {
+                    exec_match_wide(d, msrc, mlen, 16);
+                } else if (moff >= 8 && mlen > 8) {
+                    exec_match_wide(d, msrc, mlen, 8);
+                /* The periodic-offset replicators below are reachable
+                 * only for moff < 8 now (2/4); moff 8/16 fall through
+                 * to the wide copies above with identical output. */
 #if defined(__AVX2__)
                 } else if (moff == 2 && mlen >= 8) {
                     uint16_t p16 = zgec_rd16(msrc);
@@ -1820,39 +1829,7 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                         i += 8;
                     }
                     for (; i < mlen; i++) d[i] = msrc[i % 4];
-                } else if (moff == 8 && mlen >= 8) {
-                    uint64_t p64 = zgec_rd64(msrc);
-                    __m256i v256 = _mm256_set1_epi64x((long long)p64);
-                    size_t i = 0;
-                    while (i + 32 <= mlen) {
-                        _mm256_storeu_si256((__m256i *)(d + i), v256);
-                        i += 32;
-                    }
-                    while (i + 8 <= mlen) {
-                        zgec_wr64(d + i, p64);
-                        i += 8;
-                    }
-                    for (; i < mlen; i++) d[i] = msrc[i % 8];
-                } else if (moff == 16 && mlen >= 16) {
-                    __m128i v128 = _mm_loadu_si128((const __m128i *)msrc);
-                    __m256i v256 = _mm256_broadcastsi128_si256(v128);
-                    size_t i = 0;
-                    while (i + 32 <= mlen) {
-                        _mm256_storeu_si256((__m256i *)(d + i), v256);
-                        i += 32;
-                    }
-                    if (i + 16 <= mlen) {
-                        _mm_storeu_si128((__m128i *)(d + i), v128);
-                        i += 16;
-                    }
-                    _mm_storeu_si128((__m128i *)(d + mlen - 16), _mm_loadu_si128((const __m128i *)(msrc + ((mlen - 16) % 16))));
 #endif
-                } else if (moff >= 32 && mlen >= 32) {
-                    exec_match_wide(d, msrc, mlen, 32);
-                } else if (moff >= 16 && mlen >= 16) {
-                    exec_match_wide(d, msrc, mlen, 16);
-                } else if (moff >= 8 && mlen > 8) {
-                    exec_match_wide(d, msrc, mlen, 8);
                 } else if (moff >= 8 && mlen == 8) {
                     zgec_wr64(d, zgec_rd64(msrc));
                 } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
