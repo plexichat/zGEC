@@ -746,11 +746,17 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             unsigned nb;
             uint64_t w;
 
-            /* refill to 56..63 bits */
-            if (nacc < 56u) {
-                nb = (63u - nacc) >> 3;
-                w = zgec_rd64(ptr - 7);
-                acc |= w >> nacc;
+            /* refill to 56..63 bits, branchless: the top-up width is
+             * zero when nacc is already >= 56, so the OR is masked off
+             * and nacc/ptr/left stay put. The load runs unconditionally,
+             * which the loop's left > 16u guard keeps in bounds; the bit
+             * pattern of nacc < 56 is data dependent, so trading the
+             * branch for a mask is cheaper than the mispredicts. */
+            w = zgec_rd64(ptr - 7);
+            nb = (63u - nacc) >> 3;
+            {
+                uint64_t m = (uint64_t)0 - (uint64_t)(nacc < 56u);
+                acc |= (w >> nacc) & m;
                 nacc += 8u * nb;
                 ptr -= nb;
                 left -= nb;
@@ -791,11 +797,12 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
 
             if (nbits != NULL) xb = (unsigned)nbits[sym];
 
-            /* refill to 56..63 bits */
-            if (nacc < 56u) {
-                nb = (63u - nacc) >> 3;
-                w = zgec_rd64(ptr - 7);
-                acc |= w >> nacc;
+            /* refill to 56..63 bits, branchless (mask as above) */
+            w = zgec_rd64(ptr - 7);
+            nb = (63u - nacc) >> 3;
+            {
+                uint64_t m = (uint64_t)0 - (uint64_t)(nacc < 56u);
+                acc |= (w >> nacc) & m;
                 nacc += 8u * nb;
                 ptr -= nb;
                 left -= nb;
@@ -966,14 +973,15 @@ bad:
         int32_t _next2; \
         unsigned _nb2; \
         uint64_t _w2; \
-        if ((_NACC) < 56u) { \
-            _nb2 = (63u - (_NACC)) >> 3; \
-            _w2 = zgec_rd64((_PTR) - 7); \
-            (_ACC) |= _w2 >> (_NACC); \
-            (_NACC) += 8u * _nb2; \
-            (_PTR) -= _nb2; \
-            (_LEFT) -= _nb2; \
+        _w2 = zgec_rd64((_PTR) - 7); \
+        _nb2 = (63u - (_NACC)) >> 3; \
+        { \
+            uint64_t _m2 = (uint64_t)0 - (uint64_t)((_NACC) < 56u); \
+            (_ACC) |= (_w2 >> (_NACC)) & _m2; \
         } \
+        (_NACC) += 8u * _nb2; \
+        (_PTR) -= _nb2; \
+        (_LEFT) -= _nb2; \
         _extra2 = (uint32_t)(((_ACC) >> 1) >> (63u - _xb2)); \
         (_ACC) <<= _xb2; \
         (_NACC) -= _xb2; \
