@@ -308,6 +308,19 @@ static inline float parse_score_fast(uint32_t len, float ll_cost, uint32_t offba
     return (float)len * lbar - cost * lscale;
 }
 
+static inline float parse_score_rep_fast(uint32_t len, float ll_cost, unsigned ri,
+                                         const float *l2tot,
+                                         const float *ml_base, const float *of_base,
+                                         float lbar, float lscale)
+{
+    uint8_t nb_ml = 0;
+    uint8_t c_ml = zgec_seq_code_of(len >= 3u ? len - 3u : 0u, &nb_ml);
+    float cost = ll_cost;
+    cost += (l2tot[1] - ml_base[c_ml]) + (float)nb_ml;
+    cost += (l2tot[2] - of_base[ri]);
+    return (float)len * lbar - cost * lscale;
+}
+
 /* Running estimate of the average cost in bits of one literal
  * (section 11.4): the order-0 entropy of the literals seen so far,
  * lightly smoothed so early estimates stay finite, clamped to the
@@ -1299,10 +1312,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                          * The test is exact, so the choice is unchanged. */
                         if ((float)rep_len[ri] * lbar > cur_score) {
                             uint32_t rlen = rep_len[ri];
-                            uint32_t roffbase = parse_offbase(roff, &reps);
-                            float rscore = parse_score_fast(rlen, ll_cost, roffbase,
-                                                             l2tot, ml_base, of_base,
-                                                             lbar, lscale);
+                            float rscore = parse_score_rep_fast(rlen, ll_cost, ri,
+                                                                l2tot, ml_base, of_base,
+                                                                lbar, lscale);
                             if (rscore > cur_score) {
                                 cur_score = rscore;
                                 cur_len = rlen;
@@ -1360,10 +1372,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                         if (ncap >= 4u && nrep_len[ri] >= 4u) {
                             if ((float)nrep_len[ri] * lbar > base) {
                                 uint32_t rlen = nrep_len[ri];
-                                uint32_t roffbase = parse_offbase(roff, &reps);
-                                float rscore = parse_score_fast(rlen, nll_cost, roffbase,
-                                                                l2tot, ml_base, of_base,
-                                                                lbar, lscale);
+                                float rscore = parse_score_rep_fast(rlen, nll_cost, ri,
+                                                                    l2tot, ml_base, of_base,
+                                                                    lbar, lscale);
                                 if (rscore > nscore) {
                                     nscore = rscore;
                                 }
