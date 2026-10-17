@@ -1733,6 +1733,10 @@ static void exec_match_wide(uint8_t *d, const uint8_t *src, size_t len,
     memcpy(d + len - quantum, src + len - quantum, quantum);
 }
 
+/* Read-only dummy literal source for the branch-free 0..4-byte literal
+ * write in exec_block (see there). */
+static const uint8_t zgec_lit_dummy[4] = { 0, 0, 0, 0 };
+
 static zgec_err exec_block(zgec_block_arrays *ba)
 {
     /* u64 accumulators: on 32-bit a size_t sum_ll could wrap past the
@@ -1769,20 +1773,35 @@ static zgec_err exec_block(zgec_block_arrays *ba)
             if (out_pos + (uint64_t)ll + (uint64_t)ml >
                 (uint64_t)ba->raw_size)
                 return ZGEC_ERR_RAW_LEN;
-            if (ll > 0) {
-                if (lit_cur == NULL || (size_t)ll > lit_rem)
-                    return ZGEC_ERR_LL_SUM;
-                if (seg->lit_form == 0) {
-                    me = exec_literals_plain(ba->out, lit_cur, (size_t)ll,
-                                        (size_t)out_pos, ba->raw_size);
-                    if (me != ZGEC_OK) return me;
-                } else
-                    exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)ll,
-                                      seg->rep0_before[j], (size_t)out_pos,
-                                      LdLl);
-                lit_cur += (size_t)ll; /* ll <= lit_rem: stays in-bounds */
-                lit_rem -= (size_t)ll;
+            if ((size_t)ll > lit_rem) return ZGEC_ERR_LL_SUM;
+            if (seg->lit_form != 0) {
+                exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)ll,
+                                  seg->rep0_before[j], (size_t)out_pos,
+                                  LdLl);
+            } else if (ll <= 4 && ba->raw_size > 64 &&
+                       out_pos + (uint64_t)ll <= (uint64_t)ba->raw_size - 64) {
+                /* 0..4 literal bytes (the common case): one branch-free
+                 * 4-byte write. The index clamps keep every source read
+                 * inside the literal slice (no overread), and a NULL
+                 * lit_cur (n_lit == 0, hence lit_rem == 0) is only
+                 * reachable with ll == 0, which reads the dummy. For
+                 * ll < 4 the bytes past the literals are garbage that a
+                 * later write always replaces before the buffer is read
+                 * (same argument as the match arm below). */
+                const uint8_t *ls = (ll > 0) ? lit_cur : zgec_lit_dummy;
+                uint32_t b0 = ls[0];
+                uint32_t b1 = ls[(ll > 1u) ? 1u : 0u];
+                uint32_t b2 = ls[(ll > 2u) ? 2u : 0u];
+                uint32_t b3 = ls[(ll > 3u) ? 3u : 0u];
+                zgec_wr32(ba->out + (size_t)out_pos,
+                          b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+            } else if (ll > 0) {
+                me = exec_literals_plain(ba->out, lit_cur, (size_t)ll,
+                                    (size_t)out_pos, ba->raw_size);
+                if (me != ZGEC_OK) return me;
             }
+            lit_cur = (ll > 0) ? lit_cur + (size_t)ll : lit_cur;
+            lit_rem -= (size_t)ll;
             out_pos += (uint64_t)ll;
             /* Inlined match (was exec_match call): one assert-style offset
              * check per seq; length bounds already proven by the
@@ -1816,6 +1835,23 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * before the match, so the byte-at-a-time order is
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
+                } else if (moff >= 8 && mlen <= 32 && ba->raw_size > 64) {
+                    /* 1..32 bytes with off >= 8: four 8-byte chunks,
+                     * branch-free. Chunk k reads [d-off+8k, d-off+8k+8)
+                     * and writes [d+8k, d+8k+8): off >= 8 puts the source
+                     * before the destination of the same chunk, and the
+                     * bytes above d come from the earlier chunks, so the
+                     * result matches the byte-at-a-time order. Bytes past
+                     * the match end are written but never read: outside
+                     * the last-64 window every position below raw_size is
+                     * claimed and rewritten by a later sequence before
+                     * the buffer is read (the near-end guard above keeps
+                     * the last 64 exact, and raw_size > 64 is checked
+                     * here because that guard is what proves the slack). */
+                    zgec_wr64(d, zgec_rd64(msrc));
+                    zgec_wr64(d + 8, zgec_rd64(msrc + 8));
+                    zgec_wr64(d + 16, zgec_rd64(msrc + 16));
+                    zgec_wr64(d + 24, zgec_rd64(msrc + 24));
                 } else if (moff >= 32 && mlen >= 32) {
                     exec_match_wide(d, msrc, mlen, 32);
                 } else if (moff >= 16 && mlen >= 16) {
@@ -1853,8 +1889,6 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                     }
                     for (; i < mlen; i++) d[i] = msrc[i % 4];
 #endif
-                } else if (moff >= 8 && mlen == 8) {
-                    zgec_wr64(d, zgec_rd64(msrc));
                 } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
                     memcpy(d, msrc, 4);
                     memcpy(d + mlen - 4, msrc + mlen - 4, 4);
