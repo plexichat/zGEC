@@ -1,4 +1,4 @@
-#if defined(__AVX2__)
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
 #include "zgec_seq.h"
@@ -221,7 +221,30 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
         if (!syms) return 0;
         syms_allocated = 1;
     }
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+#if defined(__AVX2__)
+    __m256i vmask = _mm256_set1_epi32((int)~511u);
+    while (i + 8 <= n) {
+        __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
+        if (_mm256_testz_si256(vv, vmask)) {
+            syms[i + 0] = (uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8);
+            syms[i + 1] = (uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8);
+            syms[i + 2] = (uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8);
+            syms[i + 3] = (uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8);
+            syms[i + 4] = (uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8);
+            syms[i + 5] = (uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8);
+            syms[i + 6] = (uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8);
+            syms[i + 7] = (uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8);
+        } else {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t nb_dummy;
+                syms[i + k] = zgec_seq_code_of(values[i + k], &nb_dummy);
+            }
+        }
+        i += 8;
+    }
+#endif
+    for (; i < n; i++) {
         uint8_t nb_dummy;
         syms[i] = zgec_seq_code_of(values[i], &nb_dummy);
     }

@@ -521,7 +521,13 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
         uint32_t mlen = ml_coded ? (ml_coded[s] + 3u) : 0u;
         uint32_t u = 0;
 #if defined(__AVX2__)
-        if (r0 != 0u) {
+        if (r0 == 0u) {
+            while (u + 32u <= llen && li + u + 32u <= n_lit) {
+                __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vlit);
+                u += 32u;
+            }
+        } else {
             while (u + 32u <= llen && li + u + 32u <= n_lit) {
                 if ((size_t)r0 <= p + u) {
                     __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
@@ -546,7 +552,13 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
     {
         uint32_t u = 0;
 #if defined(__AVX2__)
-        if (rep0_tail != 0u) {
+        if (rep0_tail == 0u) {
+            while (li + u + 32u <= n_lit) {
+                __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vlit);
+                u += 32u;
+            }
+        } else {
             while (li + u + 32u <= n_lit) {
                 if ((size_t)rep0_tail <= p + u) {
                     __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
@@ -2837,7 +2849,34 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
     size_t i;
     size_t runs = 0;
     memset(hist, 0, sizeof(hist));
-    for (i = 0; i < n; i++) hist[p[i]]++;
+    uint32_t c0[ZGEC_NSYM_LIT] = {0};
+    uint32_t c1[ZGEC_NSYM_LIT] = {0};
+    uint32_t c2[ZGEC_NSYM_LIT] = {0};
+    uint32_t c3[ZGEC_NSYM_LIT] = {0};
+    i = 0;
+    for (; i + 4 <= n; i += 4) {
+        c0[p[i]]++;
+        c1[p[i + 1]]++;
+        c2[p[i + 2]]++;
+        c3[p[i + 3]]++;
+    }
+    for (; i < n; i++) {
+        c0[p[i]]++;
+    }
+#if defined(__AVX2__)
+    for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+        __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+        __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+        __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+        __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+        _mm256_storeu_si256((__m256i *)(hist + s), sum);
+    }
+#else
+    for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
+        hist[s] = c0[s] + c1[s] + c2[s] + c3[s];
+    }
+#endif
     i = 1;
 #if defined(__AVX2__)
     while (i + 32 <= n) {
