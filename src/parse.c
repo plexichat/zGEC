@@ -301,7 +301,13 @@ static inline float parse_score_fast(uint32_t len, float ll_cost, uint32_t offba
 {
     uint8_t nb_ml = 0, nb_of = 0;
     uint8_t c_ml = zgec_seq_code_of(len >= 3u ? len - 3u : 0u, &nb_ml);
-    uint8_t c_of = zgec_seq_code_of(offbase >= 1u ? offbase - 1u : 0u, &nb_of);
+    uint8_t c_of;
+    if (offbase <= 3u) {
+        c_of = (uint8_t)(offbase >= 1u ? offbase - 1u : 0u);
+        nb_of = 0;
+    } else {
+        c_of = zgec_seq_code_of(offbase - 1u, &nb_of);
+    }
     float cost = ll_cost;
     cost += (l2tot[1] - ml_base[c_ml]) + (float)nb_ml;
     cost += (l2tot[2] - of_base[c_of]) + (float)nb_of;
