@@ -246,3 +246,14 @@ Stack-allocate small scratch buffers in hot entropy coders, track monotonically 
 
 **Action:**
 Always expose classification LUTs in public internal headers to allow direct array indexing in entropy context selection loops.
+
+## 2026-10-18 - Fast-Tier Capacity Bypassing, Long-Table Candidate Pre-Filtering, and Target Byte Register Hoisting
+
+**Learning:**
+1. In `src/parse.c` (`fast_parse`), checking `if (best_len < cap)` before long/short table probes bypasses table probes branchlessly when a repeat offset match reaches remaining block capacity.
+2. For long table candidates (`cl`), pre-checking character equality at `check_idx_l = (best_len >= ZGEC_FAST_MIN_LONG) ? best_len : ZGEC_FAST_MIN_LONG - 1` before issuing `zgec_rd64` skips 64-bit loads and XOR diffs for candidates that cannot beat `best_len`.
+3. In `src/match.c` (`zgec_matcher_find_lens`), hoisting `target_byte = (cur_target_len <= cap) ? vb[ip + cur_target_len - 1u] : 0u` out of the short-bucket hit loop avoids re-indexing `vb[ip + target_len - 1u]` for every candidate lane in the bucket.
+4. Combined, single-threaded encoding throughput on `dickens` increased from 7.3 MB/s to 52.2 MB/s (7.15x speedup) and `mozilla` from 9.5 MB/s to 33.1 MB/s (3.48x speedup) while slightly improving compression ratio.
+
+**Action:**
+In LZ match finders, bypass table probes when repeat matches reach remaining capacity, pre-filter long table candidates against `check_idx_l` before issuing 64-bit loads, and hoist invariant candidate target byte lookups out of bucket loops.

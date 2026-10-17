@@ -1225,6 +1225,8 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
             if (n < 32u) {
                 rm &= (uint32_t)(((uint64_t)1u << n) - 1u);
             }
+            uint32_t cur_target_len = (best.length > hash_min) ? best.length : hash_min;
+            uint8_t target_byte = (cur_target_len <= cap) ? vb[ip + (size_t)cur_target_len - 1u] : 0u;
             while (rm != 0u && nhit > 0) {
                 uint32_t bpos = 31u - (uint32_t)__builtin_clz(rm);
                 uint32_t lane = (head + bpos) & (n - 1u);
@@ -1242,20 +1244,16 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 d = (uint32_t)(ip - (size_t)pos);
                 /* Assert-style: d <= ip < vb_size <= vb_capacity. */
                 assert((size_t)d <= m->vb_capacity);
-                /* No first-4-byte screen here: it would re-read the very
-                 * line the length compare below loads (a first-4 mismatch
-                 * sets some of the low four diff bits, so the length comes
-                 * out under 4 and the hash_min gate rejects it), and
-                 * pos < ip keeps the 8-byte read inside the buffer, so
-                 * dropping the screen removes a load without adding a
-                 * candidate. */
                 uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
+                if (target_len != cur_target_len) {
+                    cur_target_len = target_len;
+                    target_byte = (cur_target_len <= cap) ? vb[ip + (size_t)cur_target_len - 1u] : 0u;
+                }
                 /* A candidate can only beat `best` if it matches at
                  * target_len - 1 as well; one byte compare there skips
                  * the length scan for the candidates that cannot. */
-                if (target_len <= cap &&
-                    vb[ip - (size_t)d + (size_t)target_len - 1u] !=
-                    vb[ip + (size_t)target_len - 1u]) {
+                if (cur_target_len <= cap &&
+                    vb[ip - (size_t)d + (size_t)cur_target_len - 1u] != target_byte) {
                     continue;
                 }
                 if (has_v8) {
