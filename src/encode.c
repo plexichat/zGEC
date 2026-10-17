@@ -1128,31 +1128,31 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
 
                 h0[(size_t)(p0 & 63u) * 256u + n0]++;
                 h1[(size_t)(p0 >> 2u) * 256u + n0]++;
-                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p0) * 256u + n0]++;
-                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p0) * 256u + n0]++;
+                h2[(size_t)zgec_ctx_text_lut[p0] * 256u + n0]++;
+                h3[(size_t)zgec_ctx_signed_lut[p0] * 256u + n0]++;
 
                 h0[(size_t)(p1 & 63u) * 256u + n1]++;
                 h1[(size_t)(p1 >> 2u) * 256u + n1]++;
-                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p1) * 256u + n1]++;
-                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p1) * 256u + n1]++;
+                h2[(size_t)zgec_ctx_text_lut[p1] * 256u + n1]++;
+                h3[(size_t)zgec_ctx_signed_lut[p1] * 256u + n1]++;
 
                 h0[(size_t)(p2 & 63u) * 256u + n2]++;
                 h1[(size_t)(p2 >> 2u) * 256u + n2]++;
-                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p2) * 256u + n2]++;
-                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p2) * 256u + n2]++;
+                h2[(size_t)zgec_ctx_text_lut[p2] * 256u + n2]++;
+                h3[(size_t)zgec_ctx_signed_lut[p2] * 256u + n2]++;
 
                 h0[(size_t)(p3 & 63u) * 256u + n3]++;
                 h1[(size_t)(p3 >> 2u) * 256u + n3]++;
-                h2[(size_t)zgec_classify(ZGEC_CTX_TEXT, p3) * 256u + n3]++;
-                h3[(size_t)zgec_classify(ZGEC_CTX_SIGNED, p3) * 256u + n3]++;
+                h2[(size_t)zgec_ctx_text_lut[p3] * 256u + n3]++;
+                h3[(size_t)zgec_ctx_signed_lut[p3] * 256u + n3]++;
             }
             for (; j < n_lit; j++) {
                 uint8_t prev = lit[j - 1];
                 uint32_t nxt = (uint32_t)lit[j];
                 unsigned c0 = (unsigned)(prev & 63u);
                 unsigned c1 = (unsigned)(prev >> 2u);
-                unsigned c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
-                unsigned c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
+                unsigned c2 = (unsigned)zgec_ctx_text_lut[prev];
+                unsigned c3 = (unsigned)zgec_ctx_signed_lut[prev];
                 h0[(size_t)c0 * 256u + nxt]++;
                 h1[(size_t)c1 * 256u + nxt]++;
                 h2[(size_t)c2 * 256u + nxt]++;
@@ -1165,8 +1165,8 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
                 uint32_t nxt = (uint32_t)lit[j];
                 unsigned c0 = (unsigned)(prev & 63u);
                 unsigned c1 = (unsigned)(prev >> 2u);
-                unsigned c2 = (unsigned)zgec_classify(ZGEC_CTX_TEXT, prev);
-                unsigned c3 = (unsigned)zgec_classify(ZGEC_CTX_SIGNED, prev);
+                unsigned c2 = (unsigned)zgec_ctx_text_lut[prev];
+                unsigned c3 = (unsigned)zgec_ctx_signed_lut[prev];
                 h0[(size_t)c0 * 256u + nxt]++;
                 h1[(size_t)c1 * 256u + nxt]++;
                 h2[(size_t)c2 * 256u + nxt]++;

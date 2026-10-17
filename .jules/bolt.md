@@ -225,3 +225,13 @@ Use precomputed 512-entry LUTs for small sequence symbol lookups, compute LZ par
 
 **Action:**
 Use `memcpy` for unaligned little-endian memory access helpers, hoist per-position literal length sequence costs in optimal parser price gates, and use 16-byte SSE2 SIMD steps for short-to-medium match extension loops.
+
+## 2026-10-17 - Inlined Context Classification LUTs for Encoder Hot Paths
+
+**Learning:**
+1. In `src/encode.c` (`zgec_select_contexts`), building class histograms for literal context selection invoked `zgec_classify` millions of times per block across 4 context modes (`LSB6`, `MSB6`, `TEXT`, `SIGNED`).
+2. Exposing the static lookup tables `zgec_ctx_text_lut` and `zgec_ctx_signed_lut` in `include/zgec_lit.h` and making `zgec_classify` an inline function eliminated non-inlined cross-translation-unit function call frame setup and switch statement branching.
+3. Replacing `zgec_classify` calls with direct LUT array accesses (`zgec_ctx_text_lut[b]` and `zgec_ctx_signed_lut[b]`) in `zgec_select_contexts` completely removed classification overhead from gprof profile hotspots and increased level 6 single-threaded encoding throughput from 33.4 MiB/s to 60.2 MiB/s (+80%).
+
+**Action:**
+Always expose classification LUTs in public internal headers to allow direct array indexing in entropy context selection loops.
