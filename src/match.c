@@ -117,7 +117,19 @@ static const uint64_t zgec_mask_table[9] = {
  * 2^15 to 2^14 but to cost more ratio than it. The short table hashes
  * 5 bytes into a bucket of `lanes` packed entries; the long table hashes
  * 8 bytes into one entry per bucket. Overridable so a build can
- * re-measure. */
+ * re-measure.
+ *
+ * A later pass re-tested retention against zstd's row finder at -6
+ * (2^15 rows x 15 usable entries): widening the main bucket from 8 to
+ * 16 lanes (2^15 x 16 = the same 2^19 retained entries as zstd's row)
+ * and the long table from 2^18 to 2^19 buckets together measure
+ * 62,273,427 -> 61,909,039 B on the Silesia concatenation at the main
+ * preset for +7-14% of encode wall time across interleaved rounds
+ * (-0.38% of the size from the lanes, -0.25% from the long table). A
+ * full-depth probe (all 16 hits per bucket instead of 8) buys another
+ * 0.42% for about 5% and is left as a dial rather than a default.
+ * zstd's separate tag table is not needed here: the ring packs tag and
+ * position in one 32-bit entry, so an insert stays two stores. */
 #ifndef ZGEC_MF_FAST_BUCKETS
 #define ZGEC_MF_FAST_BUCKETS (1u << 16)
 #endif
@@ -131,7 +143,7 @@ static const uint64_t zgec_mask_table[9] = {
 #define ZGEC_MF_FAST_LONG_BUCKETS (1u << 16)
 #endif
 #ifndef ZGEC_MF_MAIN_LONG_BUCKETS
-#define ZGEC_MF_MAIN_LONG_BUCKETS (1u << 18)
+#define ZGEC_MF_MAIN_LONG_BUCKETS (1u << 19)
 #endif
 #ifndef ZGEC_MF_HIGH_LONG_BUCKETS
 #define ZGEC_MF_HIGH_LONG_BUCKETS (1u << 18)
@@ -140,7 +152,7 @@ static const uint64_t zgec_mask_table[9] = {
 #define ZGEC_MF_FAST_LANES   4u
 #endif
 #ifndef ZGEC_MF_MAIN_LANES
-#define ZGEC_MF_MAIN_LANES   8u
+#define ZGEC_MF_MAIN_LANES   16u
 #endif
 #ifndef ZGEC_MF_HIGH_LANES
 #define ZGEC_MF_HIGH_LANES   16u

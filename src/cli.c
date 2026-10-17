@@ -317,12 +317,14 @@ typedef struct {
  * at 4.7 s), so 6-9 ran fast and high directly. A later fix to the main
  * tier's interior insertion (every match position in both tables up to 16
  * bytes; longer matches keep the bounded sample grid) removed its text
- * deficit and made it a rung again: level 7 is main+ctx+sub+cond
- * (62,273,427 B at 9.1 s on the reference corpus, against 4.7 s for
- * level 6 and 12.4 s for level 8 in the same session, one thread). Every
- * rung is smaller than the one below and no slower. The retired level-7
- * preset (fast+ctx+sub+cond, 63,055,806 B at 4.7 s) stays reachable as
- * level 6 plus --conditioning. */
+ * deficit and made it a rung again: level 7 is main+ctx+sub+cond, and the
+ * matcher then widened its retention to zstd's row-finder shape (16-lane
+ * buckets, 2^19 long buckets): 61,909,039 B on the reference corpus for
+ * ~8% more encode time than the narrow (62,273,427 B) geometry, against
+ * 4.7 s for level 6 and 12.4 s for level 8. Every rung is smaller than
+ * the one below and no slower. The retired level-7 preset
+ * (fast+ctx+sub+cond, 63,055,806 B at 4.7 s) stays reachable as level 6
+ * plus --conditioning. */
 static const cli_level cli_levels[CLI_LEVEL_MAX] = {
     /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
     /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
