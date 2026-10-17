@@ -764,14 +764,21 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
      * ~1.9 KiB stack copy per pair. */
     changed = 1;
     {
-        double *gcost = (double *)zgec_alloc(
-            (n_gran ? n_gran : 1) * sizeof(*gcost), _Alignof(double));
+        double stack_gcost[64];
+        double *gcost = NULL;
+        int gcost_owned = 0;
         zgec_granule comb;
-        if (!gcost) {
-            zgec_free(grans);
-            zgec_free(gstart);
-            zgec_free(lit_of_seq);
-            return ZGEC_ERR_NOMEM;
+        if (n_gran <= 64) {
+            gcost = stack_gcost;
+        } else {
+            gcost = (double *)zgec_alloc((n_gran ? n_gran : 1) * sizeof(*gcost), _Alignof(double));
+            if (!gcost) {
+                zgec_free(grans);
+                zgec_free(gstart);
+                zgec_free(lit_of_seq);
+                return ZGEC_ERR_NOMEM;
+            }
+            gcost_owned = 1;
         }
         memset(&comb, 0, sizeof(comb));
         while (changed && n_gran > 1) {
@@ -805,7 +812,7 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
             }
             n_gran = w;
         }
-        zgec_free(gcost);
+        if (gcost_owned) zgec_free(gcost);
     }
 
     {
@@ -1111,13 +1118,19 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         memset(cmap_out, 0, ZGEC_ENC_NCLASS);
         return ZGEC_OK;
     }
-    runstart = (uint8_t *)zgec_alloc(zgec_rs_bytes(n_lit), 1);
-    hist4 = (uint32_t *)zgec_alloc(4u * hist_bytes, 64);
-    if (!runstart || !hist4) {
-        zgec_free(runstart);
-        zgec_free(hist4);
-        return ZGEC_ERR_NOMEM;
+    static ZGEC_ENC_TLS uint32_t tls_hist4[4u * 64u * 256u];
+    uint8_t stack_rs[8192];
+    int rs_owned = 0;
+    size_t rsb = zgec_rs_bytes(n_lit);
+
+    if (rsb <= sizeof(stack_rs)) {
+        runstart = stack_rs;
+    } else {
+        runstart = (uint8_t *)zgec_alloc(rsb, 1);
+        if (!runstart) return ZGEC_ERR_NOMEM;
+        rs_owned = 1;
     }
+    hist4 = tls_hist4;
     zgec_enc_runstart(runstart, n_lit, ll, n_seq);
 
     /* One pass builds all four class histograms: LSB6 and MSB6 are
@@ -1296,8 +1309,7 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
             }
         }
     }
-    zgec_free(runstart);
-    zgec_free(hist4);
+    if (rs_owned) zgec_free(runstart);
     if (best_k == 1) {
         *mode_out = 0;
         *k_out = 1;
@@ -2758,14 +2770,15 @@ static void zgec_enc_seg_job(void *ctx, size_t s)
         n_lit_slice = p->parse->n_lit - l0;
     }
 
+    static ZGEC_ENC_TLS uint32_t tls_scratch_cls[64u * 256u];
+    static ZGEC_ENC_TLS uint32_t tls_scratch_cond[3u * ZGEC_NSYM_SEQ];
+
     if (p->params->use_contexts &&
         (p->bp->plain.ctx_count > 1 || p->bp->sub.ctx_count > 1)) {
-        scratch_cls = (uint32_t *)zgec_alloc((size_t)64 * 256u * sizeof(uint32_t), 64);
-        if (!scratch_cls) { p->errs[s] = ZGEC_ERR_NOMEM; return; }
+        scratch_cls = tls_scratch_cls;
     }
     if (p->params->use_conditioning) {
-        scratch_cond = (uint32_t *)zgec_alloc(3u * ZGEC_NSYM_SEQ * sizeof(uint32_t), 64);
-        if (!scratch_cond) { zgec_free(scratch_cls); p->errs[s] = ZGEC_ERR_NOMEM; return; }
+        scratch_cond = tls_scratch_cond;
     }
 
     memset(&prep, 0, sizeof(prep));
@@ -2796,8 +2809,6 @@ static void zgec_enc_seg_job(void *ctx, size_t s)
     zgec_seg_prep_free(&prep);
 
 sjob_done:
-    zgec_free(scratch_cls);
-    zgec_free(scratch_cond);
     p->errs[s] = err;
     if (err == ZGEC_OK) {
         p->seg_bufs[s] = seg_payload;
