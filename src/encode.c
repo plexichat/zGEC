@@ -1463,24 +1463,57 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        size_t next_lane_idx = 0;
         int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
-        for (j = 0; j < n_z; j++) {
-            if (has_rs && zgec_rs_get(runstart, j)) {
-                rs_hist[z[j]]++;
+        if (!has_rs) {
+            for (unsigned l = 0; l < ZGEC_NLANES; l++) {
+                size_t l_start = start[l];
+                size_t l_end = (l + 1 < ZGEC_NLANES) ? start[l + 1] : n_z;
+                if (l_start >= l_end) continue;
+                rs_hist[z[l_start]]++;
                 rs_total++;
-                continue;
+                j = l_start + 1;
+                for (; j + 4 <= l_end; j += 4) {
+                    unsigned g0 = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)g0 * 256u + (uint32_t)z[j]]++;
+                    grp_total[g0]++;
+
+                    unsigned g1 = (unsigned)grp_lut[z[j]];
+                    cls_hist[(size_t)g1 * 256u + (uint32_t)z[j + 1]]++;
+                    grp_total[g1]++;
+
+                    unsigned g2 = (unsigned)grp_lut[z[j + 1]];
+                    cls_hist[(size_t)g2 * 256u + (uint32_t)z[j + 2]]++;
+                    grp_total[g2]++;
+
+                    unsigned g3 = (unsigned)grp_lut[z[j + 2]];
+                    cls_hist[(size_t)g3 * 256u + (uint32_t)z[j + 3]]++;
+                    grp_total[g3]++;
+                }
+                for (; j < l_end; j++) {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
-            if (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) {
-                while (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) next_lane_idx++;
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
-            }
-            {
-                unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                grp_total[grp]++;
+        } else {
+            size_t next_lane_idx = 0;
+            for (j = 0; j < n_z; j++) {
+                if (zgec_rs_get(runstart, j)) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    continue;
+                }
+                if (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) {
+                    while (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) next_lane_idx++;
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    continue;
+                }
+                {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
         }
     }

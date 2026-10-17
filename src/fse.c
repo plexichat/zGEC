@@ -1148,13 +1148,15 @@ zgec_err zgec_fse_symbol_extra(unsigned sym, uint32_t value,
  * marginally better code without a forced hint, so the attribute is only
  * applied for clang. (Found via llvm-nm symbol presence; see
  * .bench-cache/branch-eval/merged-stack-results.md.) */
-#if defined(__clang__)
-#define ZGEC_FSE_BW_INLINE __attribute__((always_inline))
+#if defined(__GNUC__) || defined(__clang__)
+#define ZGEC_ALWAYS_INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define ZGEC_ALWAYS_INLINE static __forceinline
 #else
-#define ZGEC_FSE_BW_INLINE
+#define ZGEC_ALWAYS_INLINE static inline
 #endif
 
-static inline ZGEC_FSE_BW_INLINE
+ZGEC_ALWAYS_INLINE
 void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
                              uint8_t **bw_ptr, const uint8_t *bw_end,
                              int *overflow, uint32_t val, unsigned n)

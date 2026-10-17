@@ -12,6 +12,14 @@
 #include <immintrin.h>
 #endif
 
+#if defined(__GNUC__) || defined(__clang__)
+#define ZGEC_ALWAYS_INLINE static inline __attribute__((always_inline))
+#elif defined(_MSC_VER)
+#define ZGEC_ALWAYS_INLINE static __forceinline
+#else
+#define ZGEC_ALWAYS_INLINE static inline
+#endif
+
 /* Branchless renormalisation for the scalar decoder loops.
  *
  * The renorm decision (x < 2^16) is roughly a one-in-three coin flip per
@@ -423,9 +431,9 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     return err;
 }
 
-static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_t s,
-                                          uint32_t *state_ptr, uint16_t *words,
-                                          size_t *nwords_ptr, size_t words_cap)
+ZGEC_ALWAYS_INLINE int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_t s,
+                                               uint32_t *state_ptr, uint16_t *words,
+                                               size_t *nwords_ptr, size_t words_cap)
 {
     uint32_t f = tab->f[s];
     if (f == 0u) return -1;

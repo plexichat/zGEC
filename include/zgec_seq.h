@@ -17,7 +17,7 @@
 
 /* ---- value codes (section 8.1) ---- */
 
-extern const uint16_t zgec_seq_lut512[512];
+extern const uint16_t zgec_seq_lut512[513];
 
 /* Map a value v to its code and extra-bit count.
    v < 8: code = v, nbits = 0.
