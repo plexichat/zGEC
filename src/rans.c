@@ -38,6 +38,23 @@ static inline int zgec_rans_renorm(uint32_t *xp, const uint8_t **cursorp,
     return 1;
 }
 
+/* Unguarded renormalisation for the fast rounds: the caller guarantees at
+ * least two readable bytes at *cursorp, so the cursor bound test and the
+ * clamped-load select of zgec_rans_renorm are dead and dropped. Same
+ * arithmetic, same cursor/remaining updates; the load stays unconditional
+ * (a data-dependent branch on `need` would mispredict about a third of the
+ * time and costs far more than the always-taken load). */
+static inline uint32_t zgec_rans_renorm_unguarded(uint32_t x,
+                                                  const uint8_t **cursorp,
+                                                  size_t *remainingp)
+{
+    uint32_t need = (x < ZGEC_RANS_STATE_MIN) ? 1u : 0u;
+    uint32_t w = (uint32_t)zgec_rd16(*cursorp);
+    *cursorp += (size_t)need * 2u;
+    *remainingp -= (size_t)need * 2u;
+    return need ? ((x << 16) | w) : x;
+}
+
 /* ---- context mode validation (Annex C) ----
  *
  * Section 9.3 lets a stream name one of five classification functions.
@@ -237,6 +254,25 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
          * faster, because the gather plus the per-lane renorm branches
          * cost more than the branchless scalar lane update. */
         size_t round = 0;
+        /* Unguarded rounds: while more than 15 bytes remain at the top of
+         * a full round, every lane's branchless 2-byte renorm load is in
+         * bounds (a round consumes at most 16), so the cursor bound test
+         * and the clamped-load select of zgec_rans_renorm are dead here
+         * and are dropped; the guarded loop below covers the tail. */
+        for (; round < full && remaining > 15u; round++) {
+            for (unsigned lane = 0; lane < 8; lane++) {
+                size_t j = start[lane] + round;
+                uint32_t x = state[lane];
+                uint32_t e = tables[0].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                uint32_t f = (e >> 8) & 0xFFFu;
+                if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                Z[j] = (uint8_t)e;
+                x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+                x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
+                state[lane] = x;
+            }
+            if (err != ZGEC_OK) break;
+        }
         for (; round < max_rounds && err == ZGEC_OK; round++) {
             unsigned m = (round < full) ? 8u : rem;
             for (unsigned lane = 0; lane < m; lane++) {
@@ -280,7 +316,35 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
         }
         if (err == ZGEC_OK) {
             if (has_rs) {
-                for (size_t round = 1; round < max_rounds && err == ZGEC_OK; round++) {
+                size_t round = 1;
+                /* Unguarded rounds as for k == 1 above: the renorm guards
+                 * are deferred to the steady-state loop below. */
+                for (; round < full && remaining > 15u; round++) {
+                    for (unsigned lane = 0; lane < 8; lane++) {
+                        size_t j = start[lane] + round;
+                        unsigned ti;
+                        uint32_t x;
+                        uint32_t e;
+                        uint32_t f;
+                        if (zgec_rs_get(runstart, j)) {
+                            ti = (unsigned)k;
+                        } else {
+                            uint8_t pidx = idx_lut[Z[j - 1]];
+                            if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
+                            ti = pidx;
+                        }
+                        x = state[lane];
+                        e = tables[ti].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                        f = (e >> 8) & 0xFFFu;
+                        if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                        Z[j] = (uint8_t)e;
+                        x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+                        x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
+                        state[lane] = x;
+                    }
+                    if (err != ZGEC_OK) break;
+                }
+                for (; round < max_rounds && err == ZGEC_OK; round++) {
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {
                         size_t j = start[lane] + round;
@@ -306,7 +370,27 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                     }
                 }
             } else {
-                for (size_t round = 1; round < max_rounds && err == ZGEC_OK; round++) {
+                size_t round = 1;
+                for (; round < full && remaining > 15u; round++) {
+                    for (unsigned lane = 0; lane < 8; lane++) {
+                        size_t j = start[lane] + round;
+                        uint8_t pidx = idx_lut[Z[j - 1]];
+                        uint32_t x;
+                        uint32_t e;
+                        uint32_t f;
+                        if (pidx == 0xFFu) { err = ZGEC_ERR_CLASS_MAP; break; }
+                        x = state[lane];
+                        e = tables[pidx].packed[x & (uint32_t)(ZGEC_RANS_M - 1)];
+                        f = (e >> 8) & 0xFFFu;
+                        if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                        Z[j] = (uint8_t)e;
+                        x = f * (x >> ZGEC_RANS_L) + (e >> 20);
+                        x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
+                        state[lane] = x;
+                    }
+                    if (err != ZGEC_OK) break;
+                }
+                for (; round < max_rounds && err == ZGEC_OK; round++) {
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {
                         size_t j = start[lane] + round;
