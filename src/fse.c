@@ -646,6 +646,39 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
         } \
     } while (0)
 
+/* Parametrized take for the fused two-stream decoder below: same behaviour
+ * as ZGEC_BRF_TAKE, but the reader lives in the caller's per-lane locals and
+ * the br handle is explicit. Same width contract (<= 32). */
+#define ZGEC_FSE2_TAKE(_ACC, _NACC, _PTR, _LEFT, _BR, _NB, _DST) do { \
+        unsigned _k = (unsigned)(_NB); \
+        if (_k != 0u) { \
+            if ((_NACC) < _k) { \
+                if ((_LEFT) >= 8u && (_NACC) <= 56u) { \
+                    unsigned _nb8 = (56u - (_NACC)) / 8u + 1u; \
+                    uint64_t _w = zgec_rd64((_PTR) - 7); \
+                    (_ACC) |= _w >> (_NACC); \
+                    (_NACC) += 8u * _nb8; \
+                    (_LEFT) -= _nb8; \
+                    (_PTR) -= _nb8; \
+                    if ((_LEFT) == 0u) (_PTR)++; \
+                } else { \
+                    while ((_NACC) <= 56u && (_LEFT) > 0u) { \
+                        (_ACC) |= (uint64_t)((_PTR)[0]) << (56u - (_NACC)); \
+                        (_NACC) += 8u; \
+                        (_LEFT)--; \
+                        if ((_LEFT) > 0u) (_PTR)--; \
+                    } \
+                } \
+            } \
+            if ((_NACC) < _k) { (_BR)->overflow = 1; goto bad; } \
+            (_DST) = (uint32_t)((_ACC) >> (64u - _k)); \
+            (_ACC) <<= _k; \
+            (_NACC) -= _k; \
+        } else { \
+            (_DST) = 0u; \
+        } \
+    } while (0)
+
 zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
                           uint32_t *out, uint8_t *syms, size_t n,
                           const uint32_t *base, const uint8_t *nbits)
@@ -838,6 +871,213 @@ bad:
     br->nacc = nacc;
     br->ptr = ptr;
     br->left = left;
+    return err;
+}
+
+/* One lane of the fused decoder: the reader's locals plus the geometry of
+ * the tail pass. */
+typedef struct {
+    const zgec_fse_dec_table *t;
+    zgec_br *br;
+    uint32_t *out;
+    const uint32_t *base;
+    const uint8_t *nbits;
+    uint64_t acc;
+    unsigned nacc;
+    const uint8_t *ptr;
+    size_t left;
+    unsigned state;
+    unsigned S;
+    size_t i;
+} fse2_lane;
+
+/* Tail of one fused lane: decode symbols i..n-1 through the exact byte-wise
+ * reader and then check V5, mirroring the generic tail of zgec_fse_decode
+ * (out/base/nbits are always non-NULL here). */
+static zgec_err fse2_finish(fse2_lane *L, size_t n)
+{
+    const zgec_fse_dec_table *t = L->t;
+    zgec_br *br = L->br;
+    uint64_t acc = L->acc;
+    unsigned nacc = L->nacc;
+    const uint8_t *ptr = L->ptr;
+    size_t left = L->left;
+    unsigned state = L->state;
+    unsigned S = L->S;
+    size_t i;
+    zgec_err err = ZGEC_ERR_BITSTREAM;
+
+    for (i = L->i; i < n; i++) {
+        const zgec_fse_dec_entry *e = &t->e[state];
+        unsigned sym;
+        unsigned extra_bits = 0;
+        uint32_t extra = 0;
+        if (e->symbol < 0 || e->symbol >= t->nsym) {
+            err = ZGEC_ERR_FSE_SYMBOL;
+            goto bad;
+        }
+        sym = (unsigned)e->symbol;
+        if (L->nbits != NULL) {
+            extra_bits = (unsigned)L->nbits[sym];
+            if (extra_bits > 32u) {
+                err = ZGEC_ERR_FSE_SYMBOL;
+                goto bad;
+            }
+        }
+        if (extra_bits > 0u)
+            ZGEC_FSE2_TAKE(acc, nacc, ptr, left, br, extra_bits, extra);
+        L->out[i] = L->base[sym] + extra;
+        if (i + 1 < n) {
+            uint32_t bits = 0;
+            int32_t next;
+            ZGEC_FSE2_TAKE(acc, nacc, ptr, left, br, e->nb_bits, bits);
+            next = e->baseline + (int32_t)bits;
+            if (next < 0 || next >= (int32_t)S) {
+                err = ZGEC_ERR_BITSTREAM;
+                goto bad;
+            }
+            state = (unsigned)next;
+        }
+    }
+    br->acc = acc;
+    br->nacc = nacc;
+    br->ptr = ptr;
+    br->left = left;
+    if (!zgec_br_done(br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
+    return ZGEC_OK;
+bad:
+    br->acc = acc;
+    br->nacc = nacc;
+    br->ptr = ptr;
+    br->left = left;
+    return err;
+}
+
+/* One fused step for a lane: the body of zgec_fse_decode's fast loop for a
+ * single symbol. `nbits` must have been validated (all widths <= 32), the
+ * caller's reader must satisfy left > 16, and S is the lane's table size. */
+#define ZGEC_FSE2_STEP(_TE, _ACC, _NACC, _PTR, _LEFT, _ST, _OUT, _S) do { \
+        const zgec_fse_dec_entry *_e2 = &(_TE)[(_ST)]; \
+        unsigned _sym2 = (unsigned)_e2->symbol; \
+        unsigned _xb2 = (unsigned)nbits[_sym2]; \
+        uint32_t _extra2; \
+        unsigned _nbq2; \
+        uint32_t _bits2; \
+        int32_t _next2; \
+        unsigned _nb2; \
+        uint64_t _w2; \
+        if ((_NACC) < 56u) { \
+            _nb2 = (63u - (_NACC)) >> 3; \
+            _w2 = zgec_rd64((_PTR) - 7); \
+            (_ACC) |= _w2 >> (_NACC); \
+            (_NACC) += 8u * _nb2; \
+            (_PTR) -= _nb2; \
+            (_LEFT) -= _nb2; \
+        } \
+        _extra2 = (uint32_t)(((_ACC) >> 1) >> (63u - _xb2)); \
+        (_ACC) <<= _xb2; \
+        (_NACC) -= _xb2; \
+        (_OUT)[i] = base[_sym2] + _extra2; \
+        _nbq2 = _e2->nb_bits; \
+        _bits2 = (uint32_t)(((_ACC) >> 1) >> (63u - _nbq2)); \
+        (_ACC) <<= _nbq2; \
+        (_NACC) -= _nbq2; \
+        _next2 = _e2->baseline + (int32_t)_bits2; \
+        if ((unsigned)_next2 >= (_S)) { err = ZGEC_ERR_BITSTREAM; goto bad; } \
+        (_ST) = (unsigned)_next2; \
+    } while (0)
+
+/* Two-stream fused decode: n symbols into out1/out2 from the independent
+ * backward bitstreams br1/br2 under tables t1/t2 (ML and OF of one
+ * unconditioned segment). The two state machines are interleaved symbol by
+ * symbol so their load-to-use latencies overlap; each lane's bit order,
+ * consumed bits and results are exactly those of a sequential
+ * zgec_fse_decode call.
+ *
+ * Contract on failure: out1/out2 and both readers are left in an
+ * unspecified state and the error code carries no guarantee -- callers are
+ * expected to fall back to the sequential path for this segment, which
+ * reproduces the exact per-pass error of the spec order. Only ZGEC_OK
+ * carries the identity guarantee. */
+zgec_err zgec_fse_decode2(const zgec_fse_dec_table *t1, zgec_br *br1,
+                          uint32_t *out1,
+                          const zgec_fse_dec_table *t2, zgec_br *br2,
+                          uint32_t *out2,
+                          size_t n, const uint32_t *base,
+                          const uint8_t *nbits)
+{
+    uint64_t acc1, acc2;
+    unsigned nacc1, nacc2;
+    const uint8_t *ptr1, *ptr2;
+    size_t left1, left2;
+    unsigned st1, st2;
+    unsigned S1, S2;
+    size_t i;
+    zgec_err err = ZGEC_ERR_BITSTREAM;
+
+    if (!t1 || !br1 || !out1 || !t2 || !br2 || !out2 || !base || !nbits)
+        return ZGEC_ERR_INVAL;
+    if (t1->al < ZGEC_MIN_AL || t1->al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
+    if (t1->nsym <= 0 || t1->nsym > 256) return ZGEC_ERR_FSE_COUNTS;
+    if (t1->e == NULL) return ZGEC_ERR_FSE_COUNTS;
+    if (t2->al < ZGEC_MIN_AL || t2->al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
+    if (t2->nsym <= 0 || t2->nsym > 256) return ZGEC_ERR_FSE_COUNTS;
+    if (t2->e == NULL) return ZGEC_ERR_FSE_COUNTS;
+    if (n == 0) {
+        if (!zgec_br_done(br1) || !zgec_br_done(br2))
+            return ZGEC_ERR_BITSTREAM_UNCONSUMED;
+        return ZGEC_OK;
+    }
+    S1 = (unsigned)1 << (unsigned)t1->al;
+    S2 = (unsigned)1 << (unsigned)t2->al;
+    acc1 = br1->acc;
+    nacc1 = br1->nacc;
+    ptr1 = br1->ptr;
+    left1 = br1->left;
+    acc2 = br2->acc;
+    nacc2 = br2->nacc;
+    ptr2 = br2->ptr;
+    left2 = br2->left;
+
+    ZGEC_FSE2_TAKE(acc1, nacc1, ptr1, left1, br1, t1->al, st1);
+    if (st1 >= S1) goto bad;
+    ZGEC_FSE2_TAKE(acc2, nacc2, ptr2, left2, br2, t2->al, st2);
+    if (st2 >= S2) goto bad;
+
+    for (int s = 0; s < t1->nsym; s++) {
+        if (nbits[s] > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+    }
+    for (int s = 0; s < t2->nsym; s++) {
+        if (nbits[s] > 32u) { err = ZGEC_ERR_FSE_SYMBOL; goto bad; }
+    }
+
+    i = 0;
+    while (i + 1 < n && left1 > 16u && left2 > 16u) {
+        ZGEC_FSE2_STEP(t1->e, acc1, nacc1, ptr1, left1, st1, out1, S1);
+        ZGEC_FSE2_STEP(t2->e, acc2, nacc2, ptr2, left2, st2, out2, S2);
+        i++;
+    }
+    {
+        fse2_lane L1 = { t1, br1, out1, base, nbits,
+                         acc1, nacc1, ptr1, left1, st1, S1, i };
+        fse2_lane L2 = { t2, br2, out2, base, nbits,
+                         acc2, nacc2, ptr2, left2, st2, S2, i };
+        err = fse2_finish(&L1, n);
+        if (err != ZGEC_OK) return err;
+        err = fse2_finish(&L2, n);
+        if (err != ZGEC_OK) return err;
+    }
+    return ZGEC_OK;
+
+bad:
+    br1->acc = acc1;
+    br1->nacc = nacc1;
+    br1->ptr = ptr1;
+    br1->left = left1;
+    br2->acc = acc2;
+    br2->nacc = nacc2;
+    br2->ptr = ptr2;
+    br2->left = left2;
     return err;
 }
 

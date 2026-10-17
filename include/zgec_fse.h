@@ -98,6 +98,20 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
                              uint32_t *out, uint8_t *syms, size_t n,
                              const uint32_t *base, const uint8_t *nbits);
 
+/* Two-stream fused decode of two independent table-mode streams (v1: the ML
+ * and OF streams of one unconditioned segment).
+ *
+ * On success the results and both readers are identical to two sequential
+ * zgec_fse_decode calls. On failure the outputs and readers are unspecified
+ * and the error code carries no guarantee: the caller must fall back to the
+ * sequential calls for the segment, which reproduce the spec-order error. */
+zgec_err zgec_fse_decode2(const zgec_fse_dec_table *t1, zgec_br *br1,
+                             uint32_t *out1,
+                             const zgec_fse_dec_table *t2, zgec_br *br2,
+                             uint32_t *out2,
+                             size_t n, const uint32_t *base,
+                             const uint8_t *nbits);
+
 /* Encode n symbols into the backward bitstream.
    values[0..n-1] are the values to encode; syms[0..n-1] are the symbols
    (the caller maps values to symbols via the section 8.1 code table).

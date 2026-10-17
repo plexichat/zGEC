@@ -1432,21 +1432,44 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     if (!rs_is_stack) zgec_free(runstart);
     runstart = NULL;
 
-    /* ML then OF for the unconditioned path (ML-first). */
+    /* ML then OF for the unconditioned path (ML-first). Both streams are
+     * table-mode on the common path; decode them interleaved in one fused
+     * pass and fall back to the sequential calls on any error, so a corrupt
+     * segment reports the error the spec order produces. */
     if (!h.ctx_ll && !h.ctx_of && seg->n_seq > 0) {
-        e = seq_decode_one(seg->ml, seg->n_seq, cur->ml, cur->ml_rle,
-                           ml_stream, (size_t)h.ml_size);
-        if (e != ZGEC_OK) return e;
+        int fused = 0;
+        if (cur->ml_rle < 0 && cur->n_of > 0 && cur->of_rle[0] < 0 &&
+            cur->ml != NULL && cur->of[0] != NULL &&
+            ml_stream != NULL && of_stream != NULL &&
+            h.ml_size > 0 && h.of_size > 0) {
+            zgec_br brm, bro;
+            zgec_br_init(&brm, ml_stream, (size_t)h.ml_size);
+            zgec_br_init(&bro, of_stream, (size_t)h.of_size);
+            if (!brm.overflow && !bro.overflow) {
+                e = zgec_fse_decode2(cur->ml, &brm, seg->ml,
+                                     cur->of[0], &bro, seg->of,
+                                     seg->n_seq, zgec_seq_base,
+                                     zgec_seq_nbits);
+                fused = (e == ZGEC_OK);
+            }
+        }
+        if (!fused) {
+            e = seq_decode_one(seg->ml, seg->n_seq, cur->ml, cur->ml_rle,
+                               ml_stream, (size_t)h.ml_size);
+            if (e != ZGEC_OK) return e;
+        }
         for (i = 0; i < seg->n_seq; i++) {
             uint64_t m = (uint64_t)seg->ml[i] + 3u;
             if (m < 3u || m > 0xFFFFFFFFu) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
             seg->ml[i] = (uint32_t)m;
         }
-        e = seq_decode_one(seg->of, seg->n_seq,
-                           (cur->n_of > 0) ? cur->of[0] : NULL,
-                           (cur->n_of > 0) ? cur->of_rle[0] : -1,
-                           of_stream, (size_t)h.of_size);
-        if (e != ZGEC_OK) return e;
+        if (!fused) {
+            e = seq_decode_one(seg->of, seg->n_seq,
+                               (cur->n_of > 0) ? cur->of[0] : NULL,
+                               (cur->n_of > 0) ? cur->of_rle[0] : -1,
+                               of_stream, (size_t)h.of_size);
+            if (e != ZGEC_OK) return e;
+        }
         for (i = 0; i < seg->n_seq; i++) {
             uint64_t ob = (uint64_t)seg->of[i] + 1u;
             if (ob < 1u || ob > 0xFFFFFFFFu) return ZGEC_ERR_OFFSET;
