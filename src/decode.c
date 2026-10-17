@@ -1264,10 +1264,22 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             e = seq_decode_one(seg->ml, seg->n_seq, cur->ml, cur->ml_rle,
                                ml_stream, (size_t)h.ml_size);
             if (e != ZGEC_OK) return e;
-            for (i = 0; i < seg->n_seq; i++) {
-                uint64_t m = (uint64_t)seg->ml[i] + 3u;
-                if (m < 3u || m > 0xFFFFFFFFu) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
-                seg->ml[i] = (uint32_t)m;
+            {
+                /* ml + 3, folded. The old u64 test could only fire when
+                 * m > 0xFFFFFFFF (m < 3 is impossible for a u64 sum), and
+                 * a 32-bit add makes that wrap land in {0, 1, 2} - so one
+                 * `v < 3` tests exactly the same condition without a
+                 * branch in the loop. The walk also accumulates the V1 ML
+                 * total from the values it stores, which removes the
+                 * second pass over ml[] entirely. */
+                uint32_t bad = 0;
+                for (i = 0; i < seg->n_seq; i++) {
+                    uint32_t v = seg->ml[i] + 3u;
+                    seg->ml[i] = v;
+                    sum_ml += (uint64_t)v;
+                    bad |= (v < 3u);
+                }
+                if (bad) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
             }
             if (h.ctx_of) {
                 if (cur->n_of == 3 && cur->of[0] && cur->of[1] && cur->of[2] &&
@@ -1289,10 +1301,17 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                                    of_stream, (size_t)h.of_size);
             }
             if (e != ZGEC_OK) return e;
-            for (i = 0; i < seg->n_seq; i++) {
-                uint64_t ob = (uint64_t)seg->of[i] + 1u;
-                if (ob < 1u || ob > 0xFFFFFFFFu) return ZGEC_ERR_OFFSET;
-                seg->of[i] = (uint32_t)ob;
+            {
+                /* ob = raw + 1 in 32-bit: the only raw value the old u64
+                 * bound (ob < 1 impossible, ob > 0xFFFFFFFF) could reject
+                 * is 0xFFFFFFFF, and that add wraps it to a stored zero. */
+                uint32_t bad = 0;
+                for (i = 0; i < seg->n_seq; i++) {
+                    uint32_t ob = seg->of[i] + 1u;
+                    seg->of[i] = ob;
+                    bad |= (ob == 0u);
+                }
+                if (bad) return ZGEC_ERR_OFFSET;
             }
             if (h.ctx_ll) {
                 if (cur->n_ll == 3 && cur->ll[0] && cur->ll[1] && cur->ll[2] &&
@@ -1382,28 +1401,6 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             s += l;
         }
         if (tail > 0) {
-            if ((uint64_t)sum_ll >= (uint64_t)seg->n_lit) {
-                if (!rs_is_stack) zgec_free(runstart);
-                return ZGEC_ERR_LL_SUM;
-            }
-            if (runstart == NULL) {
-                if (!rs_is_stack) zgec_free(runstart);
-                return ZGEC_ERR_LL_SUM;
-            }
-            zgec_rs_set(runstart, (size_t)sum_ll); /* tail run start (9.3) */
-        }
-    }
-    if (sum_ll > (uint64_t)seg->n_lit) {
-        if (!rs_is_stack) zgec_free(runstart);
-        return ZGEC_ERR_LL_SUM; /* V1 */
-    }
-    tail = (uint64_t)seg->n_lit - sum_ll;
-    if (tail > 0) {
-        if ((uint64_t)sum_ll >= (uint64_t)seg->n_lit) {
-            if (!rs_is_stack) zgec_free(runstart);
-            return ZGEC_ERR_LL_SUM;
-        }
-        if (need_rs) {
             if (runstart == NULL) {
                 if (!rs_is_stack) zgec_free(runstart);
                 return ZGEC_ERR_LL_SUM;
@@ -1483,10 +1480,16 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                                ml_stream, (size_t)h.ml_size);
             if (e != ZGEC_OK) return e;
         }
-        for (i = 0; i < seg->n_seq; i++) {
-            uint64_t m = (uint64_t)seg->ml[i] + 3u;
-            if (m < 3u || m > 0xFFFFFFFFu) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
-            seg->ml[i] = (uint32_t)m;
+        {
+            /* Same fold as the conditioned path above. */
+            uint32_t bad = 0;
+            for (i = 0; i < seg->n_seq; i++) {
+                uint32_t v = seg->ml[i] + 3u;
+                seg->ml[i] = v;
+                sum_ml += (uint64_t)v;
+                bad |= (v < 3u);
+            }
+            if (bad) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
         }
         if (!fused) {
             e = seq_decode_one(seg->of, seg->n_seq,
@@ -1495,10 +1498,15 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                                of_stream, (size_t)h.of_size);
             if (e != ZGEC_OK) return e;
         }
-        for (i = 0; i < seg->n_seq; i++) {
-            uint64_t ob = (uint64_t)seg->of[i] + 1u;
-            if (ob < 1u || ob > 0xFFFFFFFFu) return ZGEC_ERR_OFFSET;
-            seg->of[i] = (uint32_t)ob;
+        {
+            /* Same fold as the conditioned path above. */
+            uint32_t bad = 0;
+            for (i = 0; i < seg->n_seq; i++) {
+                uint32_t ob = seg->of[i] + 1u;
+                seg->of[i] = ob;
+                bad |= (ob == 0u);
+            }
+            if (bad) return ZGEC_ERR_OFFSET;
         }
     }
 
@@ -1531,8 +1539,8 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
     }
     seg->rep0_tail = (seg->n_seq > 0) ? rep0 : 1u;
 
-    /* V1: raw_len == n_lit + sum ML (u64, then 32-bit fit). */
-    for (i = 0; i < seg->n_seq; i++) sum_ml += (uint64_t)seg->ml[i];
+    /* V1: raw_len == n_lit + sum ML (u64, then 32-bit fit); sum_ml was
+     * accumulated by the ML fixup walk that stored the values. */
     raw_total = (uint64_t)seg->n_lit + sum_ml;
     if (raw_total > 0xFFFFFFFFu) return ZGEC_ERR_RAW_LEN;
     if ((uint32_t)raw_total != dir_raw_len) return ZGEC_ERR_RAW_LEN;
