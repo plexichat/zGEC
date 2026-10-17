@@ -1074,6 +1074,11 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * leaves this position's hashes intact for the main probe's insert. */
     m->c_ip[ip & 1u] = ip;
     m->c_flags[ip & 1u] = 0u;
+
+    if (best.length >= cap && (best_is_rep || best.length > cap || best.offset <= 1u)) {
+        return best;
+    }
+
     /* 2. Long table: 8-byte hash, one entry per bucket,
      * tag-checked before any length work. hl/lb/ltag/le were computed (and
      * the line prefetched) above, ahead of the rep scan, so what remains
@@ -1244,6 +1249,9 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                 }
                 if (len >= hash_min) {
                     mf_update_best(d, len, &best, rep0, rep1, rep2, &best_is_rep);
+                    if (best.length >= cap && (best_is_rep || best.length > cap || best.offset <= 1u)) {
+                        break;
+                    }
                 }
             }
         }
