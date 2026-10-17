@@ -189,6 +189,14 @@ static const uint64_t zgec_mask_table[9] = {
 #define ZGEC_MF_MATCH_SAMPLES_FAST 3u
 #endif
 
+/* Matches up to this length insert every position into both tables on the
+ * main tier, the walk the fast tier's interior insert already runs. The
+ * sampled grid above this length is a measured speed/ratio point, not a
+ * correctness requirement; see zgec_matcher_insert_match. */
+#ifndef ZGEC_MF_MATCH_DENSE
+#define ZGEC_MF_MATCH_DENSE 16u
+#endif
+
 /* Minimum non-repeat match is 5; 4 is permitted for
  * repeat offsets (section 11.2). */
 #define ZGEC_MF_MIN_HASH_MATCH 5u
@@ -1355,12 +1363,15 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
     }
     /* Insertion policy: visited positions only (the
      * parse drives inserts); the high tier inserts
-     * every position. Section 11.2 names 2-3 sampled
-     * positions for fast and main, but main samples
-     * ZGEC_MF_MATCH_SAMPLES (16 by default, see the
-     * note at that macro) because the spec's figure
-     * measured worse in ratio here; the fast tier
-     * keeps 3 through ZGEC_MF_MATCH_SAMPLES_FAST. */
+     * every position, sampling only very long
+     * matches. Section 11.2 named 2-3 sampled
+     * positions for fast and main, but measurement
+     * rejected every sampled variant at short
+     * lengths: the walk here inserts every position
+     * up to ZGEC_MF_MATCH_DENSE and switches to the
+     * tier's sample count above it (see the note at
+     * ZGEC_MF_MATCH_SAMPLES and the density block
+     * below). */
     if (m->tier == ZGEC_TIER_HIGH) {
         /* Every position in the range, sampled if the
          * match is very long. */
@@ -1384,15 +1395,20 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
         size_t t;
         size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
                                    : (size_t)ZGEC_MF_HASH_BYTES;
-        /* Adaptive sampling: short matches need few inserts to cover the
-         * range, so cap the sample count at 2 + (len >> 2). Matches < 8
-         * bytes insert ~2-3 positions; the full count applies only for
-         * len >= ~56. */
-        {
-            size_t cap = (size_t)2 + (len >> 2);
-            if (nsamp > cap) nsamp = cap;
+        /* Dense below ZGEC_MF_MATCH_DENSE, the flat sample grid above.
+         * Measured on Silesia (-l 6 --tier main): the old (2 + (len >> 2))
+         * cap sampled a 6-byte match down to 3 positions with the middle
+         * sample short-table only, and that sparsity was the main tier's
+         * whole deficit on text (dickens -3.9%, webster -4.3%, corpus
+         * -2.0% with the dense walk). Every position in both tables while
+         * the match is short recovers it; above the threshold the grid
+         * stays bounded at the tier's sample count, which measured 2-5%
+         * faster than the fully dense walk for +0.22% of corpus size. The
+         * earlier first/last-only long-table writes are gone with it: they
+         * left the long table starved near a match's tail. */
+        if (len <= (size_t)ZGEC_MF_MATCH_DENSE || nsamp > len) {
+            nsamp = len;
         }
-        if (nsamp > len) nsamp = len;
         if (nsamp < 1u) nsamp = 1u;
         /* Sample offsets are floor((len-1) * t / (nsamp-1)), the same grid
          * the old per-sample 64-bit division produced. The stride is
@@ -1408,9 +1424,8 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
             size_t rem = 0u;
             size_t pos = start;
             for (t = 0; t < nsamp; t++) {
-                int long_ok = (t == 0u || t + 1u == nsamp) ? 1 : 0;
                 if (pos < m->vb_size && need <= m->vb_size - pos) {
-                    mf_insert_pos(m, vb, pos, long_ok);
+                    mf_insert_pos(m, vb, pos, 1);
                 }
                 rem += r;
                 if (rem >= den) {

@@ -386,12 +386,51 @@ static void zgec_count_coders(const uint8_t *frame, size_t n,
  * per-segment coder selection (section 11.7) a reason to prefer a
  * different family; the test then requires that every family is emitted
  * somewhere across the set. */
-#define ZGEC_TEST_TEXTURES 4
+#define ZGEC_TEST_TEXTURES 5
 static void zgec_test_texture(int kind, uint8_t *src, size_t n)
 {
     const char *w = "the quick brown fox jumps over the lazy dog 0123456789 ";
     size_t wl = strlen(w);
     uint32_t r = 12345u;
+    if (kind == 4) {
+        /* Conditioning texture (8.6): a period-101 pseudorandom template
+         * with a break every 32 bytes gives thousands of ML 31 matches at
+         * a small fixed offset (ML class 2), and unique 8-byte tokens
+         * planted 30-180 KB apart give ML ~10 matches at large offsets
+         * (ML class 1), so the match-length class predicts the offset
+         * magnitude and conditioned OF tables have a large entropy drop
+         * to find. The other textures give the rANS/sub-literal selectors
+         * their reason to fire but make conditioning pay only through
+         * parse-dependent margin, so this texture exists to hold the
+         * ZGEC_SEG_SEQ_CTX_OF path open. */
+        uint8_t tpl[101];
+        size_t i;
+        size_t j;
+        for (i = 0; i < sizeof(tpl); i++) {
+            r = r * 1664525u + 1013904223u;
+            tpl[i] = (uint8_t)(r >> 24);
+        }
+        for (i = 0; i < n; i++) {
+            uint8_t b = tpl[i % sizeof(tpl)];
+            if ((i % 32u) == 0u) b = (uint8_t)(b ^ 0x5Au);
+            src[i] = b;
+        }
+        for (j = 0; (j * 200u) + 10000u + 16u <= n; j++) {
+            uint8_t tk[8];
+            size_t p = 10000u + j * 200u;
+            size_t d = 30000u + ((j * 7919u) % 150000u);
+            size_t b;
+            for (b = 0; b < sizeof(tk); b++) {
+                r = r * 1664525u + 1013904223u;
+                tk[b] = (uint8_t)(r >> 24);
+            }
+            memcpy(src + p, tk, sizeof(tk));
+            if (p + d + sizeof(tk) <= n) {
+                memcpy(src + p + d, tk, sizeof(tk));
+            }
+        }
+        return;
+    }
     for (size_t i = 0; i < n; i++) {
         r = r * 1664525u + 1013904223u;
         switch (kind) {

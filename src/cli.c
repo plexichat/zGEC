@@ -314,12 +314,15 @@ typedef struct {
  * Rungs 6-9 were re-measured after the fast tier gained its dense schedule
  * and repeat probing: the main tier became dominated on the reference corpus
  * (main+ctx: 64,135,979 B at 6.3 s against fast+ctx+sub+cond: 63,055,806 B
- * at 4.7 s), so 6-9 run fast and high directly. Level 6 = fast+ctx+sub
- * (63,199,065 B, 4.5 s), level 7 = +conditioning (63,055,806 B, 4.7 s),
- * level 8 = high+ctx (61,791,618 B, 10.3 s), level 9 = high+ctx+sub+cond
- * (61,299,800 B, 11.8 s): every rung is smaller than the one below and no
- * slower. The main tier keeps its own presets nowhere, but stays reachable
- * with --tier main for the inputs (mozilla, nci) where it still wins. */
+ * at 4.7 s), so 6-9 ran fast and high directly. A later fix to the main
+ * tier's interior insertion (every match position in both tables up to 16
+ * bytes; longer matches keep the bounded sample grid) removed its text
+ * deficit and made it a rung again: level 7 is main+ctx+sub+cond
+ * (62,273,427 B at 9.1 s on the reference corpus, against 4.7 s for
+ * level 6 and 12.4 s for level 8 in the same session, one thread). Every
+ * rung is smaller than the one below and no slower. The retired level-7
+ * preset (fast+ctx+sub+cond, 63,055,806 B at 4.7 s) stays reachable as
+ * level 6 plus --conditioning. */
 static const cli_level cli_levels[CLI_LEVEL_MAX] = {
     /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
     /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
@@ -327,7 +330,7 @@ static const cli_level cli_levels[CLI_LEVEL_MAX] = {
     /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  6 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 0, 0, 0, 0, 0, 21, 1 },
-    /*  7 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
+    /*  7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
     /*  8 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
     /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 1 },

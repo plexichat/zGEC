@@ -45,7 +45,7 @@ Levels 13-14 add epoch dictionaries and pre-filtering; levels 15-25 progressivel
 | 4 | fast | - | - | - | - | - | - | - | 21 (2 MiB) |
 | 5 | fast | x | - | - | - | - | - | - | 21 (2 MiB) |
 | 6 | fast | x | x | - | - | - | - | - | 21 (2 MiB) |
-| 7 | fast | x | x | x | - | - | - | - | 21 (2 MiB) |
+| 7 | main | x | x | x | - | - | - | - | 21 (2 MiB) |
 | 8 | high | x | - | - | - | - | - | - | 21 (2 MiB) |
 | 9 | high | x | x | x | - | - | - | - | 21 (2 MiB) |
 | 10 | high | x | x | x | x | - | - | - | 21 (2 MiB) |
