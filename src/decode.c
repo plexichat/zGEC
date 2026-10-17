@@ -1347,25 +1347,50 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         if (!rs_is_stack) zgec_free(runstart);
         return ZGEC_ERR_INTERNAL;
     }
-    for (i = 0; i < seg->n_seq; i++) {
-        sum_ll += (uint64_t)seg->ll[i];
-        if (sum_ll > (uint64_t)seg->n_lit) { /* V1 */
-            if (!rs_is_stack) zgec_free(runstart);
-            return ZGEC_ERR_LL_SUM;
+    /* V1 validation is a plain total: every `sum_ll > n_lit` prefix trips
+     * the walk's first test, and the old per-sequence companion check
+     * (`start >= n_lit` when ll[i] > 0, where start is the prefix before i)
+     * implies sum_ll > n_lit at that same index, so it could never fire
+     * without the first test firing first. With the checks folded away the
+     * walk is branch-free, which matters because the 60/40 zero/non-zero
+     * mix of ll[i] used to mispredict here on every other symbol. */
+    {
+        uint64_t total = 0;
+        for (i = 0; i < seg->n_seq; i++) {
+            total += (uint64_t)seg->ll[i];
         }
-        if (seg->ll[i] > 0) {
-            size_t start = (size_t)sum_ll - (size_t)seg->ll[i];
-            if (start >= seg->n_lit) {
-                if (!rs_is_stack) zgec_free(runstart);
-                return ZGEC_ERR_LL_SUM;
-            }
-            if (need_rs) {
+        sum_ll = total;
+    }
+    if (sum_ll > (uint64_t)seg->n_lit) {
+        if (!rs_is_stack) zgec_free(runstart);
+        return ZGEC_ERR_LL_SUM; /* V1 */
+    }
+    tail = (uint64_t)seg->n_lit - sum_ll;
+    if (need_rs) {
+        /* Run-start bitmap: a run starts at the prefix sum before every
+         * nonzero ll[i], plus the tail position when literals remain. */
+        uint64_t s = 0;
+        for (i = 0; i < seg->n_seq; i++) {
+            uint64_t l = (uint64_t)seg->ll[i];
+            if (l > 0) {
                 if (runstart == NULL) {
                     if (!rs_is_stack) zgec_free(runstart);
                     return ZGEC_ERR_INTERNAL;
                 }
-                zgec_rs_set(runstart, start);
+                zgec_rs_set(runstart, (size_t)s);
             }
+            s += l;
+        }
+        if (tail > 0) {
+            if ((uint64_t)sum_ll >= (uint64_t)seg->n_lit) {
+                if (!rs_is_stack) zgec_free(runstart);
+                return ZGEC_ERR_LL_SUM;
+            }
+            if (runstart == NULL) {
+                if (!rs_is_stack) zgec_free(runstart);
+                return ZGEC_ERR_LL_SUM;
+            }
+            zgec_rs_set(runstart, (size_t)sum_ll); /* tail run start (9.3) */
         }
     }
     if (sum_ll > (uint64_t)seg->n_lit) {
