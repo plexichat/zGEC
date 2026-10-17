@@ -418,9 +418,6 @@ zgec_err zgec_parse_block(zgec_parse **out,
 #ifndef ZGEC_FAST_INS_ALL
 #define ZGEC_FAST_INS_ALL 1
 #endif
-#ifndef ZGEC_FAST_INS_STRIDE
-#define ZGEC_FAST_INS_STRIDE 1
-#endif
 #ifndef ZGEC_FAST_INS_LONG
 #define ZGEC_FAST_INS_LONG 1
 #endif
@@ -495,11 +492,6 @@ zgec_err zgec_parse_block(zgec_parse **out,
  * latency they hide -- the same result the table-prefetch probe reached. */
 #ifndef ZGEC_FAST_PIPE
 #define ZGEC_FAST_PIPE 0
-#endif
-/* Probe only the first repeat offset, as zstd's dfast does, instead of the
- * whole three-deep chain. */
-#ifndef ZGEC_FAST_ONEREP
-#define ZGEC_FAST_ONEREP 1
 #endif
 /* Extend an accepted match backwards into the pending literals while the byte
  * before it still agrees, as zstd's dfast and lazy accept paths do. */
