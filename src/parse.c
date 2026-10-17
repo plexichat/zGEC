@@ -579,6 +579,17 @@ uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
         len += 32u;
     }
 #endif
+#if defined(__AVX2__) || defined(__SSE2__)
+    while (len + 16u <= cap) {
+        __m128i va16 = _mm_loadu_si128((const __m128i *)(const void *)(a + len));
+        __m128i vb16 = _mm_loadu_si128((const __m128i *)(const void *)(b + len));
+        unsigned m16 = (unsigned)_mm_movemask_epi8(_mm_cmpeq_epi8(va16, vb16));
+        if (m16 != 0xFFFFu) {
+            return (uint32_t)(len + (unsigned)__builtin_ctz(~m16));
+        }
+        len += 16u;
+    }
+#endif
     while (len + 8u <= cap) {
         uint64_t x = zgec_rd64(a + len) ^ zgec_rd64(b + len);
         if (x != 0u) {
@@ -737,47 +748,53 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         uint32_t r2 = reps.rep[2];
 
         if (r0 != 0u && (size_t)r0 <= ip) {
-            uint64_t diff = zgec_rd64(vb + ip - r0) ^ cur8;
-            if ((uint32_t)diff == 0u) {
-                uint32_t len;
-                if (diff == 0u) {
-                    len = 8u + fast_match_len_tail(vb + ip - r0 + 8u, vb + ip + 8u, cap - 8u);
-                } else {
-                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                }
-                if (len > best_len) {
-                    best_len = len;
-                    best_off = r0;
+            if (best_len < 4u || (best_len < cap && vb[ip - r0 + best_len] == vb[ip + best_len])) {
+                uint64_t diff = zgec_rd64(vb + ip - r0) ^ cur8;
+                if ((uint32_t)diff == 0u) {
+                    uint32_t len;
+                    if (diff == 0u) {
+                        len = 8u + fast_match_len_tail(vb + ip - r0 + 8u, vb + ip + 8u, cap - 8u);
+                    } else {
+                        len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                    }
+                    if (len > best_len) {
+                        best_len = len;
+                        best_off = r0;
+                    }
                 }
             }
         }
         if (r1 != 0u && (size_t)r1 <= ip) {
-            uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
-            if ((uint32_t)diff == 0u) {
-                uint32_t len;
-                if (diff == 0u) {
-                    len = 8u + fast_match_len_tail(vb + ip - r1 + 8u, vb + ip + 8u, cap - 8u);
-                } else {
-                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                }
-                if (len > best_len) {
-                    best_len = len;
-                    best_off = r1;
+            if (best_len < 4u || (best_len < cap && vb[ip - r1 + best_len] == vb[ip + best_len])) {
+                uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
+                if ((uint32_t)diff == 0u) {
+                    uint32_t len;
+                    if (diff == 0u) {
+                        len = 8u + fast_match_len_tail(vb + ip - r1 + 8u, vb + ip + 8u, cap - 8u);
+                    } else {
+                        len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                    }
+                    if (len > best_len) {
+                        best_len = len;
+                        best_off = r1;
+                    }
                 }
             }
         }
         if (r2 != 0u && (size_t)r2 <= ip) {
-            uint64_t diff = zgec_rd64(vb + ip - r2) ^ cur8;
-            if ((uint32_t)diff == 0u) {
-                uint32_t len;
-                if (diff == 0u) {
-                    len = 8u + fast_match_len_tail(vb + ip - r2 + 8u, vb + ip + 8u, cap - 8u);
-                } else {
-                    len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                }
-                if (len > best_len) {
-                    best_len = len;
-                    best_off = r2;
+            if (best_len < 4u || (best_len < cap && vb[ip - r2 + best_len] == vb[ip + best_len])) {
+                uint64_t diff = zgec_rd64(vb + ip - r2) ^ cur8;
+                if ((uint32_t)diff == 0u) {
+                    uint32_t len;
+                    if (diff == 0u) {
+                        len = 8u + fast_match_len_tail(vb + ip - r2 + 8u, vb + ip + 8u, cap - 8u);
+                    } else {
+                        len = (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                    }
+                    if (len > best_len) {
+                        best_len = len;
+                        best_off = r2;
+                    }
                 }
             }
         }
