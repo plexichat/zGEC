@@ -568,6 +568,20 @@ static inline __attribute__((always_inline))
 uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
 {
     size_t len = 0;
+    if (cap >= 8u) {
+        uint64_t x = zgec_rd64(a) ^ zgec_rd64(b);
+        if (x != 0u) {
+            return (uint32_t)((unsigned)__builtin_ctzll(x) >> 3);
+        }
+        len = 8u;
+        if (cap >= 16u) {
+            uint64_t x2 = zgec_rd64(a + 8) ^ zgec_rd64(b + 8);
+            if (x2 != 0u) {
+                return (uint32_t)(8u + ((unsigned)__builtin_ctzll(x2) >> 3));
+            }
+            len = 16u;
+        }
+    }
 #if defined(__AVX2__)
     while (len + 32u <= cap) {
         __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(a + len));
@@ -764,7 +778,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 }
             }
         }
-        if (r1 != 0u && (size_t)r1 <= ip) {
+        if (r1 != 0u && r1 != r0 && (size_t)r1 <= ip) {
             if (best_len < 4u || (best_len < cap && vb[ip - r1 + best_len] == vb[ip + best_len])) {
                 uint64_t diff = zgec_rd64(vb + ip - r1) ^ cur8;
                 if ((uint32_t)diff == 0u) {
@@ -781,7 +795,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 }
             }
         }
-        if (r2 != 0u && (size_t)r2 <= ip) {
+        if (r2 != 0u && r2 != r0 && r2 != r1 && (size_t)r2 <= ip) {
             if (best_len < 4u || (best_len < cap && vb[ip - r2 + best_len] == vb[ip + best_len])) {
                 uint64_t diff = zgec_rd64(vb + ip - r2) ^ cur8;
                 if ((uint32_t)diff == 0u) {
