@@ -629,7 +629,7 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
     __m256i tagmask = _mm256_set1_epi32((int)(ZGEC_MF_TAG_MASK << ZGEC_MF_TAG_SHIFT));
     __m256i zero = _mm256_setzero_si256();
     for (; lane + 8u <= nlanes; lane += 8u) {
-        __m256i v = _mm256_load_si256((const __m256i *)(const void *)(b + lane));
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(b + lane));
         __m256i eq = _mm256_cmpeq_epi32(_mm256_and_si256(v, tagmask), tagv);
         __m256i nz = _mm256_cmpeq_epi32(v, zero);
         __m256i hit = _mm256_andnot_si256(nz, eq);
