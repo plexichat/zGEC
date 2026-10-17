@@ -14,10 +14,6 @@
 #include <string.h>
 #include <stdint.h>
 
-#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
-#include <immintrin.h>
-#endif
-
 /* Format limits per section 3.3: dictionary at most 2^26 bytes.
  * P24 profile limit (2^24) is warn-only: larger dictionaries within the
  * format limit remain decodable, so no error is raised for them. */
@@ -193,52 +189,7 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
         if (n > 0) memcpy(dst, src, n);
         return;
     }
-    size_t i = 0;
-#if defined(__AVX2__)
-    if ((uint64_t)rep0 <= (uint64_t)pos && rep0 >= 32) {
-        size_t back_base = pos - (size_t)rep0;
-        while (i + 32 <= n) {
-            __m256i v_res = _mm256_loadu_si256((const __m256i *)(src + i));
-            __m256i v_pred = _mm256_loadu_si256((const __m256i *)(vb + back_base + i));
-            __m256i v_sum = _mm256_add_epi8(v_res, v_pred);
-            _mm256_storeu_si256((__m256i *)(dst + i), v_sum);
-            i += 32;
-        }
-    }
-#endif
-#if defined(__AVX2__) || defined(__SSE2__)
-    if ((uint64_t)rep0 <= (uint64_t)pos && rep0 >= 16) {
-        size_t back_base = pos - (size_t)rep0;
-        while (i + 16 <= n) {
-            __m128i v_res = _mm_loadu_si128((const __m128i *)(src + i));
-            __m128i v_pred = _mm_loadu_si128((const __m128i *)(vb + back_base + i));
-            __m128i v_sum = _mm_add_epi8(v_res, v_pred);
-            _mm_storeu_si128((__m128i *)(dst + i), v_sum);
-            i += 16;
-        }
-    } else if (rep0 == 1) {
-        uint8_t pred = 0;
-        if ((uint64_t)rep0 <= (uint64_t)pos) {
-            pred = vb[pos - 1];
-        }
-        while (i + 16 <= n) {
-            __m128i v = _mm_loadu_si128((const __m128i *)(src + i));
-            __m128i v1 = _mm_slli_si128(v, 1);
-            v = _mm_add_epi8(v, v1);
-            __m128i v2 = _mm_slli_si128(v, 2);
-            v = _mm_add_epi8(v, v2);
-            __m128i v4 = _mm_slli_si128(v, 4);
-            v = _mm_add_epi8(v, v4);
-            __m128i v8 = _mm_slli_si128(v, 8);
-            v = _mm_add_epi8(v, v8);
-            v = _mm_add_epi8(v, _mm_set1_epi8((char)pred));
-            _mm_storeu_si128((__m128i *)(dst + i), v);
-            pred = (uint8_t)(_mm_extract_epi16(v, 7) >> 8);
-            i += 16;
-        }
-    }
-#endif
-    for (; i < n; i++) {
+    for (size_t i = 0; i < n; i++) {
         size_t cur = pos + i;
         uint8_t pred = 0;
         if ((uint64_t)rep0 <= (uint64_t)cur) pred = vb[cur - (size_t)rep0];
@@ -259,72 +210,6 @@ static void zgec_dict_copy_match(uint8_t *dst, size_t off, size_t len)
         if (len > 0) memcpy(dst, src, len);
         return;
     }
-    if (off == 1) {
-        memset(dst, src[0], len);
-        return;
-    }
-#if defined(__AVX2__)
-    if (off == 2 && len >= 8) {
-        uint16_t p16 = zgec_rd16(src);
-        __m256i v256 = _mm256_set1_epi16((short)p16);
-        size_t i = 0;
-        while (i + 32 <= len) {
-            _mm256_storeu_si256((__m256i *)(dst + i), v256);
-            i += 32;
-        }
-        while (i + 8 <= len) {
-            zgec_wr64(dst + i, (uint64_t)p16 * 0x0001000100010001ULL);
-            i += 8;
-        }
-        for (; i < len; i++) dst[i] = src[i % 2];
-        return;
-    }
-    if (off == 4 && len >= 8) {
-        uint32_t p32 = zgec_rd32(src);
-        __m256i v256 = _mm256_set1_epi32((int)p32);
-        size_t i = 0;
-        while (i + 32 <= len) {
-            _mm256_storeu_si256((__m256i *)(dst + i), v256);
-            i += 32;
-        }
-        while (i + 8 <= len) {
-            zgec_wr64(dst + i, (uint64_t)p32 | ((uint64_t)p32 << 32));
-            i += 8;
-        }
-        for (; i < len; i++) dst[i] = src[i % 4];
-        return;
-    }
-    if (off == 8 && len >= 8) {
-        uint64_t p64 = zgec_rd64(src);
-        __m256i v256 = _mm256_set1_epi64x((long long)p64);
-        size_t i = 0;
-        while (i + 32 <= len) {
-            _mm256_storeu_si256((__m256i *)(dst + i), v256);
-            i += 32;
-        }
-        while (i + 8 <= len) {
-            zgec_wr64(dst + i, p64);
-            i += 8;
-        }
-        for (; i < len; i++) dst[i] = src[i % 8];
-        return;
-    }
-    if (off == 16 && len >= 16) {
-        __m128i v128 = _mm_loadu_si128((const __m128i *)src);
-        __m256i v256 = _mm256_broadcastsi128_si256(v128);
-        size_t i = 0;
-        while (i + 32 <= len) {
-            _mm256_storeu_si256((__m256i *)(dst + i), v256);
-            i += 32;
-        }
-        if (i + 16 <= len) {
-            _mm_storeu_si128((__m128i *)(dst + i), v128);
-            i += 16;
-        }
-        _mm_storeu_si128((__m128i *)(dst + len - 16), v128);
-        return;
-    }
-#endif
     for (size_t i = 0; i < len; i++) dst[i] = src[i];
 }
 
@@ -443,83 +328,34 @@ static zgec_err zgec_dict_seq_cond(uint32_t *out, size_t n,
     state = zgec_br_read(&br, (unsigned)al);
     if (br.overflow) return ZGEC_ERR_BITSTREAM;
     if (state >= S) return ZGEC_ERR_BITSTREAM;
-
-    uint8_t stack_clsbuf[1024];
-    uint8_t *clsbuf = NULL;
-    int clsbuf_allocated = 0;
-    if (n <= sizeof(stack_clsbuf)) {
-        clsbuf = stack_clsbuf;
-    } else {
-        clsbuf = (uint8_t *)zgec_alloc(n, _Alignof(uint8_t));
-        if (!clsbuf) return ZGEC_ERR_NOMEM;
-        clsbuf_allocated = 1;
-    }
-    if (use_prev) {
-        clsbuf[0] = 0;
-        i = 1;
-#if defined(__AVX2__)
-        __m256i v_six = _mm256_set1_epi32(6);
-        __m256i v_eighteen = _mm256_set1_epi32(18);
-        for (; i + 8 <= n; i += 8) {
-            __m256i v_ml = _mm256_loadu_si256((const __m256i *)(const void *)&ml[i - 1]);
-            __m256i v_gt6 = _mm256_cmpgt_epi32(v_ml, v_six);
-            __m256i v_gt18 = _mm256_cmpgt_epi32(v_ml, v_eighteen);
-            __m256i v_cls32 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(v_gt6, v_gt18));
-            __m128i v_low = _mm256_castsi256_si128(v_cls32);
-            __m128i v_high = _mm256_extracti128_si256(v_cls32, 1);
-            __m128i v16 = _mm_packs_epi32(v_low, v_high);
-            __m128i v8 = _mm_packus_epi16(v16, v16);
-            zgec_wr64(clsbuf + i, (uint64_t)_mm_cvtsi128_si64(v8));
-        }
-#endif
-        for (; i < n; i++)
-            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
-    } else {
-        i = 0;
-#if defined(__AVX2__)
-        __m256i v_six = _mm256_set1_epi32(6);
-        __m256i v_eighteen = _mm256_set1_epi32(18);
-        for (; i + 8 <= n; i += 8) {
-            __m256i v_ml = _mm256_loadu_si256((const __m256i *)(const void *)&ml[i]);
-            __m256i v_gt6 = _mm256_cmpgt_epi32(v_ml, v_six);
-            __m256i v_gt18 = _mm256_cmpgt_epi32(v_ml, v_eighteen);
-            __m256i v_cls32 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(v_gt6, v_gt18));
-            __m128i v_low = _mm256_castsi256_si128(v_cls32);
-            __m128i v_high = _mm256_extracti128_si256(v_cls32, 1);
-            __m128i v16 = _mm_packs_epi32(v_low, v_high);
-            __m128i v8 = _mm_packus_epi16(v16, v16);
-            zgec_wr64(clsbuf + i, (uint64_t)_mm_cvtsi128_si64(v8));
-        }
-#endif
-        for (; i < n; i++)
-            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
-    }
-
     for (i = 0; i < n; i++) {
-        unsigned cls = clsbuf[i];
+        unsigned cls;
         const zgec_fse_dec_entry *en;
         int sym;
         uint32_t extra = 0;
         uint32_t bits = 0;
         int32_t next = 0;
-        if (cls > 2u) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_INTERNAL; }
+        if (use_prev)
+            cls = (i == 0) ? 0u : zgec_mlclass(ml[i - 1]);
+        else
+            cls = zgec_mlclass(ml[i]);
+        if (cls > 2u) return ZGEC_ERR_INTERNAL;
         en = &t[cls]->e[state];
         sym = (int)en->symbol;
-        if (sym < 0 || sym >= ZGEC_NSYM_SEQ) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
+        if (sym < 0 || sym >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL;
         if (zgec_seq_nbits[sym] > 0) {
             extra = zgec_br_read(&br, (unsigned)zgec_seq_nbits[sym]);
-            if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+            if (br.overflow) return ZGEC_ERR_BITSTREAM;
         }
         out[i] = zgec_seq_base[(unsigned)sym] + extra;
         if (i + 1 < n) {
             bits = zgec_br_read(&br, (unsigned)en->nb_bits);
-            if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+            if (br.overflow) return ZGEC_ERR_BITSTREAM;
             next = en->baseline + (int32_t)bits;
-            if (next < 0 || (unsigned)next >= S) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
+            if (next < 0 || (unsigned)next >= S) return ZGEC_ERR_BITSTREAM;
             state = (unsigned)next;
         }
     }
-    if (clsbuf_allocated) zgec_free(clsbuf);
     if (!zgec_br_done(&br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
     return ZGEC_OK;
 }
