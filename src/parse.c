@@ -1077,8 +1077,8 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
     if (!p) return ZGEC_ERR_NOMEM;
     memset(p, 0, sizeof(*p));
 
-    p->seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
-    if (!p->seq) { zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
+    /* p->seq allocation is deferred past the ZGEC_TIER_FAST check because
+     * fast_parse allocates its own seq array and would immediately free p->seq. */
 
     /* Checked before allocating: a wrapped size allocates short, and the
      * literal copies below then run past its end. */
@@ -1148,6 +1148,9 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
         return ZGEC_OK;
     }
 #endif
+
+    p->seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
+    if (!p->seq) { zgec_free(vb); zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
 
     m = zgec_matcher_create(tier, vb_size);
     if (!m) {
@@ -1299,7 +1302,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                          * The test is exact, so the choice is unchanged. */
                         if ((float)rep_len[ri] * lbar > cur_score) {
                             uint32_t rlen = rep_len[ri];
-                            uint32_t roffbase = parse_offbase(roff, &reps);
+                            uint32_t roffbase = ri + 1u;
                             float rscore = parse_score_fast(rlen, ll_cost, roffbase,
                                                              l2tot, ml_base, of_base,
                                                              lbar, lscale);
@@ -1360,7 +1363,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                         if (ncap >= 4u && nrep_len[ri] >= 4u) {
                             if ((float)nrep_len[ri] * lbar > base) {
                                 uint32_t rlen = nrep_len[ri];
-                                uint32_t roffbase = parse_offbase(roff, &reps);
+                                uint32_t roffbase = ri + 1u;
                                 float rscore = parse_score_fast(rlen, nll_cost, roffbase,
                                                                 l2tot, ml_base, of_base,
                                                                 lbar, lscale);
