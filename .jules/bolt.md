@@ -225,3 +225,14 @@ Use precomputed 512-entry LUTs for small sequence symbol lookups, compute LZ par
 
 **Action:**
 Use `memcpy` for unaligned little-endian memory access helpers, hoist per-position literal length sequence costs in optimal parser price gates, and use 16-byte SSE2 SIMD steps for short-to-medium match extension loops.
+
+## 2026-10-16 - Encoder AVX2 SIMD Gather, Stack-Allocated rANS Words and Tracked Lane Boundaries
+
+**Learning:**
+1. In `src/rans.c` (`zgec_rans_encode`), allocating the output words buffer on the stack for small literal counts (`words_cap <= 2048`) completely eliminates per-call heap allocation (`zgec_alloc`/`zgec_free`) overhead on hot rANS literal encoding paths.
+2. In `src/encode.c` (`zgec_ctx_body_bits`), replacing an 8-way per-byte equality comparison chain (`j == start[0] || ... || j == start[7]`) with a single monotonically advancing lane index check (`j == start[next_lane_idx]`) and guarding `zgec_rs_get` with `zgec_rs_is_empty` reduces inner loop branch instructions per literal byte from up to 8 down to 1.
+3. In `src/encode.c` (`zgec_seg_prep_build`), using 256-bit AVX2 gather SIMD (`_mm256_i32gather_epi32`) loads sequence fields (`ll`, `ml`, `offbase`) 8-at-a-time directly into SIMD registers.
+4. In `src/rans.c` (`zgec_rans_histograms`), expanding single-table literal histogram counting to 8-wide unrolled accumulators combined with 256-bit AVX2 SIMD additions reduces store-forwarding stalls during entropy model generation.
+
+**Action:**
+Stack-allocate small scratch buffers in hot entropy coders, track monotonically advancing lane indices instead of multi-way equality checks, and use AVX2 gather SIMD for sequence array preparation.
