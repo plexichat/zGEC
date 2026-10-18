@@ -658,6 +658,18 @@ uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
     return (uint32_t)len;
 }
 
+/* Lean-core table entries carry a hash tag above the 24-bit position:
+ * entry = (tag << 24) | pos, with tag >= 1 (0 marks an empty slot). The tag
+ * holds the hash bits the bucket index does not use, so a bucket hit whose
+ * full hash differs is rejected with a register compare instead of the random
+ * (cache-missing) candidate load. It cannot change the parse: equal 8-byte
+ * keys hash equally, so a tag mismatch implies different bytes, which the
+ * byte compare would have rejected anyway. */
+static inline uint32_t fast_lite_tag(uint32_t h, unsigned tagbits)
+{
+    return (uint32_t)(((h & ((1u << tagbits) - 1u)) << (8u - tagbits)) | 1u);
+}
+
 /* Sparse interior inserts for the lean core's accept path: a few positions at
  * fixed offsets, constant work per sequence instead of the O(best_len) walk in
  * fast_parse (which, at the fast rung, touched nearly as many positions as the
@@ -666,24 +678,24 @@ uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
  * hot-path code shape they had before this option existed. */
 __attribute__((noinline))
 static void fast_insert_sparse_long(uint32_t *tl, const uint8_t *vb, size_t end,
-                                    size_t ip, uint32_t best_len, uint32_t gen,
-                                    unsigned lshift)
+                                    size_t ip, uint32_t best_len,
+                                    unsigned lshift, unsigned tagbits)
 {
-    size_t i2 = ip + 2u;
     size_t ie = ip + (size_t)best_len;
-    if (i2 + 8u <= end) {
-        uint64_t iv = zgec_rd64(vb + i2);
-        tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i2);
+    if (ip + 2u + 8u <= end) {
+        size_t p = ip + 2u;
+        uint32_t h = fast_hash_l_v(zgec_rd64(vb + p));
+        tl[h >> lshift] = (fast_lite_tag(h, tagbits) << 24) | (uint32_t)p;
     }
     if (ie >= 2u && ie - 2u + 8u <= end) {
-        size_t i1 = ie - 2u;
-        uint64_t iv = zgec_rd64(vb + i1);
-        tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i1);
+        size_t p = ie - 2u;
+        uint32_t h = fast_hash_l_v(zgec_rd64(vb + p));
+        tl[h >> lshift] = (fast_lite_tag(h, tagbits) << 24) | (uint32_t)p;
     }
     if (ie >= 1u && ie - 1u + 8u <= end) {
-        size_t i1 = ie - 1u;
-        uint64_t iv = zgec_rd64(vb + i1);
-        tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i1);
+        size_t p = ie - 1u;
+        uint32_t h = fast_hash_l_v(zgec_rd64(vb + p));
+        tl[h >> lshift] = (fast_lite_tag(h, tagbits) << 24) | (uint32_t)p;
     }
 }
 
@@ -1153,7 +1165,7 @@ static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
     size_t pos;
     unsigned fbits = fast_table_bits(end - prefix, 4u);
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
-    uint32_t gen = 1u;
+    unsigned tagbits = (lshift < 8u) ? lshift : 8u;
     int tl_owned = 0;
 
     if (fbits <= ZGEC_FAST_SCRATCH_BITS) {
@@ -1173,8 +1185,8 @@ static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
 
     /* Seed with the dictionary / literal-reference prefix, sparsely. */
     for (pos = 0; pos + 8u <= prefix; pos += 4u) {
-        uint64_t sv = zgec_rd64(vb + pos);
-        tl[fast_hash_l_v(sv) >> lshift] = fast_pack(gen, pos);
+        uint32_t h = fast_hash_l_v(zgec_rd64(vb + pos));
+        tl[h >> lshift] = (fast_lite_tag(h, tagbits) << 24) | (uint32_t)pos;
     }
 
     zgec_reps_init(&reps);
@@ -1185,18 +1197,21 @@ static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
 
     while (ip + 8u <= end) {
         uint64_t cur8 = zgec_rd64(vb + ip);
-        uint32_t hl = fast_hash_l_v(cur8) >> lshift;
-        uint32_t cl = tl[hl];
-        tl[hl] = fast_pack(gen, ip);
+        uint32_t h = fast_hash_l_v(cur8);
+        uint32_t hl = h >> lshift;
+        uint32_t tag = fast_lite_tag(h, tagbits);
+        uint32_t e = tl[hl];
+        tl[hl] = (tag << 24) | (uint32_t)ip;
 
         uint32_t best_len = 0u;
         uint32_t best_off = 0u;
         size_t cap = end - ip;
-        /* The long table promises an 8-byte key, so a candidate is only a
-         * match when the full word agrees; a collision (diff != 0) is dropped
-         * without a length scan, which is the whole probe. */
-        if (fast_live(cl, gen)) {
-            size_t cpos = fast_pos_of(cl);
+        /* The tag covers the hash bits the bucket index does not, so a hit
+         * whose tag differs cannot be an 8-byte match: skip the candidate
+         * load. On a tag match the full word is still compared, which also
+         * absorbs the rare same-bucket hash collision. */
+        if (e != 0u && (e >> 24) == tag) {
+            size_t cpos = (size_t)(e & 0xFFFFFFu);
             if (cpos < ip) {
                 size_t d = ip - cpos;
                 if (zgec_rd64(vb + ip - d) == cur8) {
@@ -1238,7 +1253,7 @@ static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
             seq[p->n_seq].ml = best_len;
             seq[p->n_seq].offbase = ob;
             p->n_seq++;
-            fast_insert_sparse_long(tl, vb, end, ip, best_len, gen, lshift);
+            fast_insert_sparse_long(tl, vb, end, ip, best_len, lshift, tagbits);
             ip += best_len;
             anchor = ip;
         } else {

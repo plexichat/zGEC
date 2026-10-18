@@ -315,3 +315,16 @@ SHA-256 unchanged; ctest 4/4; l1-l3 round-trip and `-T 1` == `-T 4`.
 ladder is now 1 = dial 4 (lean core), 2 = dial 3, 3 = dial 2, 4 = dial 0. The
 `fast_insert_sparse_long` helper is out-of-line so no pinned level pays for it.
 The remaining gap to zstd -1 is entropy-bound, not parser-bound.
+
+### Follow-up: hash tag in the lean-core table entry
+
+Storing `(tag << 24) | pos` in the lean core's single table (tag = the hash
+bits the bucket index does not use, 0 marks empty) lets a bucket hit whose full
+hash differs be rejected by a register compare instead of the random candidate
+load the probe would otherwise issue. It is provably output-neutral -- equal
+8-byte keys hash equally, so a tag mismatch implies different bytes, which the
+byte compare rejects anyway (l1 stays 80,567,687 B).
+
+Interleaved A/B (min of 9): l1 -0.8% (med -1.1%). Small: the 2 MiB input buffer
+is L2-resident, so the skipped load was not the bottleneck. Kept because it is
+free of ratio and correctness risk.
