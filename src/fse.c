@@ -329,10 +329,19 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                     covered[byte] = (uint8_t)(covered[byte] | bit);
                     covered_cells++;
                     idx = (size_t)s * (size_t)S + (size_t)stprev;
-                    full->e[idx].nb_bits = nb;
-                    full->e[idx].new_state = st;
-                    full->e[idx].baseline = bl;
-                    full->e[idx].pad = (uint16_t)1;   /* symbol is present */
+                    /* Write the whole 8-byte entry as one store instead of
+                     * four narrow field stores (the cells tile densely, so
+                     * this is the inner term of the build). Byte order is
+                     * the struct's: nb_bits at 0, new_state at 2, baseline
+                     * at 4, pad at 6; the byte at 1 is struct padding and
+                     * is never read. */
+                    {
+                        uint64_t ent = (uint64_t)nb
+                                     | ((uint64_t)st << 16)
+                                     | ((uint64_t)bl << 32)
+                                     | ((uint64_t)1u << 48);
+                        memcpy(&full->e[idx], &ent, sizeof(ent));
+                    }
                 }
             }
             /* Only a symbol that occurs has a partition to be complete: the
