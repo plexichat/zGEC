@@ -1776,20 +1776,25 @@ static zgec_err exec_block(zgec_block_arrays *ba)
      * >n_lit check, and out_pos arithmetic must not wrap either. */
     uint64_t out_pos = 0;
     size_t LdLl;
+    size_t raw_size;
     size_t s;
     if (ba == NULL || (ba->n_seg > 0 && ba->segs == NULL)) return ZGEC_ERR_INVAL;
     if (ba->n_seg > 0 && (ba->out == NULL || ba->vb == NULL))
         return ZGEC_ERR_INTERNAL;
     LdLl = ba->ld + ba->llref;
+    /* The byte stores below cannot change raw_size (it is the caller's
+     * buffer length), but from the compiler's point of view a uint8_t
+     * store can alias it, so it is held in a local for the whole call. */
+    raw_size = ba->raw_size;
     for (s = 0; s < ba->n_seg; s++) {
         zgec_segment_arrays *seg = &ba->segs[s];
-        /* Explicit cursor: NULL exactly when n_lit == 0; every
-         * advance is range-checked (no NULL + offset, no overrun). */
+        /* Explicit cursor: NULL exactly when n_lit == 0; it advances by
+         * the already-validated ll sums (no NULL + offset, no overrun). */
         const uint8_t *lit_cur = seg->lit;
-        size_t lit_rem = seg->n_lit;
         uint64_t sum_ll = 0;
         uint64_t tail = 0;
         size_t j;
+        int lit_form = seg->lit_form;
         if (seg->n_lit > 0 && lit_cur == NULL) return ZGEC_ERR_INTERNAL;
         if (seg->n_seq > 0 &&
             (seg->ll == NULL || seg->ml == NULL || seg->of == NULL ||
@@ -1800,24 +1805,25 @@ static zgec_err exec_block(zgec_block_arrays *ba)
             uint32_t ml = seg->ml[j];
             uint32_t off = seg->of[j];
             zgec_err me;
-            if (off < 1) return ZGEC_ERR_OFFSET;
+            /* No ll/off bounds checks here: decode_segment_streams proved
+             * the total ll sum <= n_lit (so every running prefix and the
+             * tail stay inside the literal slice) and its rep pass proved
+             * off >= 1, so the checks this loop used to carry could not
+             * fire. sum_ll itself is kept for the tail length below. */
             sum_ll += (uint64_t)ll;
-            if (sum_ll > (uint64_t)seg->n_lit) return ZGEC_ERR_LL_SUM;
-            if (out_pos + (uint64_t)ll + (uint64_t)ml >
-                (uint64_t)ba->raw_size)
+            if (out_pos + (uint64_t)ll + (uint64_t)ml > (uint64_t)raw_size)
                 return ZGEC_ERR_RAW_LEN;
-            if ((size_t)ll > lit_rem) return ZGEC_ERR_LL_SUM;
-            if (seg->lit_form != 0) {
+            if (lit_form != 0) {
                 exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)ll,
                                   seg->rep0_before[j], (size_t)out_pos,
                                   LdLl);
-            } else if (ll <= 4 && ba->raw_size > 64 &&
-                       out_pos + (uint64_t)ll <= (uint64_t)ba->raw_size - 64) {
+            } else if (ll <= 4 && raw_size > 64 &&
+                       out_pos + (uint64_t)ll <= (uint64_t)raw_size - 64) {
                 /* 0..4 literal bytes (the common case): one branch-free
                  * 4-byte write. The index clamps keep every source read
                  * inside the literal slice (no overread), and a NULL
-                 * lit_cur (n_lit == 0, hence lit_rem == 0) is only
-                 * reachable with ll == 0, which reads the dummy. For
+                 * lit_cur (n_lit == 0) is only reachable with ll == 0,
+                 * which reads the dummy. For
                  * ll < 4 the bytes past the literals are garbage that a
                  * later write always replaces before the buffer is read
                  * (same argument as the match arm below). */
@@ -1830,28 +1836,26 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                           b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
             } else if (ll > 0) {
                 me = exec_literals_plain(ba->out, lit_cur, (size_t)ll,
-                                    (size_t)out_pos, ba->raw_size);
+                                    (size_t)out_pos, raw_size);
                 if (me != ZGEC_OK) return me;
             }
             lit_cur = (ll > 0) ? lit_cur + (size_t)ll : lit_cur;
-            lit_rem -= (size_t)ll;
             out_pos += (uint64_t)ll;
-            /* Inlined match (was exec_match call): one assert-style offset
-             * check per seq; length bounds already proven by the
-             * out_pos + ll + ml check above, full validation lives at the
-             * segment boundaries. */
+            /* Inlined match (was exec_match call): the batched V2/V3 pass
+             * in decode_segment_streams already validated this exact
+             * array (off >= 1, off <= Ld + Ll + pos, ml >= 3) with the
+             * same position trajectory, so the copy only has to stay
+             * inside the output buffer, which the out_pos + ll + ml
+             * check above guarantees. */
             if (ml > 0) {
                 uint8_t *d = ba->out + (size_t)out_pos;
                 const uint8_t *msrc;
                 size_t mlen = (size_t)ml;
                 size_t moff = (size_t)off;
                 size_t k;
-                if (moff < 1 ||
-                    (uint64_t)moff > (uint64_t)LdLl + out_pos)
-                    return ZGEC_ERR_OFFSET;
                 msrc = d - moff; /* off <= LdLl + pos: at/after VB start */
-                if (ba->raw_size > 64 &&
-                    out_pos + (uint64_t)ml > (uint64_t)ba->raw_size - 64) {
+                if (raw_size > 64 &&
+                    out_pos + (uint64_t)ml > (uint64_t)raw_size - 64) {
                     if (moff == 1) {
                         memset(d, msrc[0], mlen);
                     } else if (moff >= 32 && mlen >= 32) {
@@ -1868,7 +1872,7 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * before the match, so the byte-at-a-time order is
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
-                } else if (moff >= 8 && mlen <= 32 && ba->raw_size > 64) {
+                } else if (moff >= 8 && mlen <= 32 && raw_size > 64) {
                     /* 1..32 bytes with off >= 8: four 8-byte chunks,
                      * branch-free. Chunk k reads [d-off+8k, d-off+8k+8)
                      * and writes [d+8k, d+8k+8): off >= 8 puts the source
@@ -1931,18 +1935,19 @@ static zgec_err exec_block(zgec_block_arrays *ba)
             }
             out_pos += (uint64_t)ml;
         }
-        /* Tail literals always copied (n_lit - sumLL). */
-        if (sum_ll > (uint64_t)seg->n_lit) return ZGEC_ERR_LL_SUM;
+        /* Tail literals always copied (n_lit - sumLL). sum_ll <= n_lit was
+         * proven by the V1 pass over this same array, and lit_cur
+         * advances exactly with sum_ll, so tail > 0 implies the
+         * remaining bytes are inside seg->lit (that also means lit_cur
+         * is non-NULL: n_lit > 0 was checked above). */
         tail = (uint64_t)seg->n_lit - sum_ll;
         if (tail > 0) {
             zgec_err te;
-            if (out_pos + tail > (uint64_t)ba->raw_size)
+            if (out_pos + tail > (uint64_t)raw_size)
                 return ZGEC_ERR_RAW_LEN;
-            if (lit_cur == NULL || (size_t)tail > lit_rem)
-                return ZGEC_ERR_LL_SUM;
-            if (seg->lit_form == 0) {
+            if (lit_form == 0) {
                 te = exec_literals_plain(ba->out, lit_cur, (size_t)tail,
-                                    (size_t)out_pos, ba->raw_size);
+                                    (size_t)out_pos, raw_size);
                 if (te != ZGEC_OK) return te;
             } else
                 exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)tail,
