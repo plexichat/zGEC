@@ -424,10 +424,22 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
     return err;
 }
 
+/* Branchless per-symbol encode step.
+ *
+ * The renormalisation test (x >= f<<21) is a data-dependent coin flip that
+ * mispredicts far too often to branch on: the decoder made the same change
+ * long ago (see zgec_rans_renorm). Here the word store is unconditional and
+ * the commit is a conditional add, and the reciprocal correction is a cmov.
+ * This requires the caller to reserve one word of slack past the commit
+ * point (the uncommitted store lands in that slack and is overwritten); the
+ * caller sizes `words` with that slack, so no per-write bound test is needed
+ * (a committed word can only appear once per symbol, and there are n_lit
+ * symbols, so nwords <= n_lit <= words_cap). */
 static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_t s,
                                           uint32_t *state_ptr, uint16_t *words,
                                           size_t *nwords_ptr, size_t words_cap)
 {
+    (void)words_cap;
     uint32_t f = tab->f[s];
     if (f == 0u) return -1;
     /* A single-symbol table (f == ZGEC_RANS_M, c == 0, probability 1)
@@ -438,25 +450,23 @@ static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_
      * depends on xmax. */
     if (f == (uint32_t)ZGEC_RANS_M) return 0;
     uint32_t x = *state_ptr;
-    while (x >= tab->xmax[s]) {
-        if (*nwords_ptr >= words_cap) return -1;
-        words[(*nwords_ptr)++] = (uint16_t)(x & 0xFFFFu);
-        x >>= 16;
-    }
-    uint32_t recip = tab->f_recip[s];
+    uint32_t need = (x >= tab->xmax[s]) ? 1u : 0u;
+    size_t nw = *nwords_ptr;
+    words[nw] = (uint16_t)x;
+    *nwords_ptr = nw + (size_t)need;
+    x = need ? (x >> 16) : x;
     uint32_t quo;
     uint32_t rems;
     if (f == 1u) {
         quo = x;
         rems = 0u;
     } else {
-        uint64_t prod = (uint64_t)x * (uint64_t)recip;
+        uint64_t prod = (uint64_t)x * (uint64_t)tab->f_recip[s];
         quo = (uint32_t)(prod >> 32);
         rems = x - quo * f;
-        if (rems >= f) {
-            quo--;
-            rems += f;
-        }
+        uint32_t adj = (rems >= f) ? 1u : 0u;
+        quo -= adj;
+        rems += adj * f;
     }
     *state_ptr = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
     return 0;
@@ -491,10 +501,13 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
 
     /* At most one renormalisation word is emitted per symbol: after the
      * single shift x < 2^16, and 2^16 <= f << 21 = xmax for every f >= 1,
-     * so one shift always restores the invariant. n_lit words are
-     * therefore enough; the bound test in the loop still refuses to write
-     * past the end if that reasoning is ever broken. */
-    size_t words_cap = n_lit;
+     * so one shift always restores the invariant. The branchless encoder
+     * also performs one uncommitted store at the current position for every
+     * symbol, so eight words of slack are reserved past the n_lit committed
+     * words: the slack absorbs the store that a symbol with no
+     * renormalisation does at index nwords, and is then overwritten. */
+    if (n_lit > SIZE_MAX - 8u) return 0;
+    size_t words_cap = n_lit + 8u;
     uint16_t stack_words[2048];
     uint16_t *words = NULL;
     int words_owned = 0;
