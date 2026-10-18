@@ -361,3 +361,75 @@ blocks of the FSE enc table (instead of one big memset) was *slower* (l1
 +4.3%) -- the many small memsets lose to the single call. A branchless FSE
 bitwriter flush (unconditional store + conditional advance, with slack) was
 within noise on l1/l4 and adds an unchecked store, so it was dropped.
+
+## 2026-10-18 - Encoder allocation churn (FSE tables, block cache) and the FSE bitwriter
+
+After the branchless encoders the profile showed the sequence FSE *table
+build* at ~8% of level 1 and ~5% of level 4 -- far more than its fill loop
+could explain. The fill loop, a range-fill variant and an absent-symbols-only
+memset had all already been tried and moved nothing. The real cost was the
+allocate/free of the ~540 KiB encoder table (`nsym * 2^al * 8` bytes at
+al = 10) once per stream per segment: the system allocator returns such a
+block to the OS on free, so the next build re-faults every page.
+
+Three changes landed, all bitstream-identical:
+
+1. `fse.c`: `zgec_fse_build_enc` rents its table from a thread-local free list
+   (`zgec_fse_enc_rent` / `zgec_fse_enc_return`) instead of malloc/free. The
+   list is threaded through the tables' own `e` field while `al`/`nsym` stay
+   intact, so a slot's size is recovered on reuse. No double-free is possible:
+   every encoder-table pointer is NULL-initialised and cleared after its one
+   free, so `seg_fail_tables` only ever frees NULLs after the success path
+   already freed them. (commit 7890ba9)
+2. `common.c`: `zgec_alloc`/`zgec_free` gained a per-thread cache of *any*
+   freed block in [128 KiB, 4 MiB], at most 8, best-fit reuse. The word before
+   the saved malloc pointer now records the block's requested total, a safe
+   lower bound on its physical size. This subsumes the same churn in the
+   sequence-prep arrays, the stream temp block, the per-block sequence array
+   and the decoder tables. (commit 4a2e714)
+3. `fse.c` `zgec_fse_bw_write_local`: the `*bw_nacc >= 32` drain is now
+   branchless (unconditional store, conditional advance), matching the rANS
+   renormalisation treatment, with the rare second completed word keeping the
+   bound-checked path. The caller reserves 16 bytes past the three contiguous
+   stream regions so the uncommitted store stays inside the allocation.
+   (commit d058f97)
+
+Interleaved A/B (min of 7). The box was cleaned up mid-session and the noise
+floor fell to ~0.3% (self-A/B), so small effects became measurable again:
+   FSE table pool:        l1 -6.3%, l2 -5.5%, l3 -4.5%, l4 ~0%, l7 -2.0%
+   block cache on top:    l1 -2.2%, l4 -2.3%
+   FSE bitwriter on top:  l1 -0.6%, l4 -0.2%
+Pins 4-10, l7 SHA-256, ctest 4/4 and a -T 4 round-trip are unchanged.
+
+Negative result: vectorising the rANS output reverse-copy (SSE `pshufb` over
+16-byte blocks) was neutral-to-worse (l1 +0.4%), so it was reverted -- that
+copy is memory-bound, not instruction-bound.
+
+## Remote agent branches (origin/*, 2026-10-17..18) -- what is worth taking
+
+Reviewed all 13 bolt/jules/vise branches. Most content is already in main or
+superseded: the context LUT inlining (`zgec_ctx_text_lut`), `next_lane_idx` in
+`zgec_ctx_body_bits`, the AVX2 merge in `zgec_cluster_greedy`, the 8-way unroll
+in `zgec_select_contexts`, AVX2 rANS decode and the decode stack fallbacks are
+all present already.
+
+Still absent from main and now imported (all bitstream-identical, pins + SHA +
+ctest unchanged; interleaved A/B min of 7 on the quiet box: l4 -0.6%, l7/l9
+within noise):
+  - `zgec_cluster_greedy` initial copy+sum loop vectorised (AVX2 load/store/add,
+    exact 32-bit sum since the total is <= n_lit).
+  - `zgec_select_coder`: break out of the `rep0_before[t] < 32` scan as soon as
+    one is found (`slow_sublit` is a flag, so the rest of the scan is dead work).
+  - `mf_bucket_hits`: explicit `nlanes == 8` / `== 16` AVX2 paths (no loop, no
+    lane shift); these are exactly the main/high tier widths, so it is the one
+    that shows on l4.
+
+Do NOT take without a byte-identity gate:
+  - the entropy `clogc` refactor (bolt/entropy-encode-opt): regrouping
+    `sum c*log2(c)` versus `total*log2(total) - sum` reassociates floating point
+    and can move coder selection;
+  - the parse candidate pre-filter branches (jules-210087, bolt-fast-parse-*,
+    bolt-opt-inline-match-helpers): they reorder/short-circuit probes and must
+    be proven output-neutral before landing.
+  - `bolt/fuzz-leak-and-enc-perf` commits compiled binaries to the repo and
+    changes no source; ignore it.

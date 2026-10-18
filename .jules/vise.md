@@ -20,3 +20,31 @@ Action: Align consolidated array section offsets to 64-byte boundaries, and eval
 2026-10-17 - Elimination of Hot-Path Encoder Allocations and Deferral of Fast-Tier Parser Sequences
 Learning: Allocating temporary rANS output word buffers (`words`), class histograms (`hist4`), context selection scratch arrays (`scratch_cls`, `scratch_cond`), and granule cost arrays (`gcost`) dynamically on the heap during block and segment encoding caused significant memory churn, RSS fragmentation, and allocator mutex contention across multi-threaded encoding loops. Providing stack fallback buffers (`stack_words[2048]`, `stack_rs[8192]`, `stack_gcost[64]`) and thread-local scratch buffers (`tls_hist4`, `tls_scratch_cls`, `tls_scratch_cond`) completely eliminates heap allocations on hot entropy encoding paths. Furthermore, in `zgec_parse_block_ex`, deferring `p->seq` allocation until after checking `tier == ZGEC_TIER_FAST` avoids a redundant heap allocation and immediate free cycle per block during fast-tier parsing.
 Action: Prefer bounded stack fallbacks for per-segment symbol/word buffers and thread-local storage for large per-worker histogram scratch buffers, and defer parser array allocations until after tier selection.
+
+2026-10-18 - Large-block reuse in the allocator (churn as a memory cost) and FSE table pooling
+
+Learning: Repeatedly allocating and freeing the same multi-hundred-KiB block
+is a memory cost, not only a speed one: the system allocator decommits such a
+block on free, so the next allocation re-faults every page. The encoder
+entropy tables (`nsym * 2^al * 8` bytes, ~540 KiB for the sequence alphabet)
+and the per-segment scratch (sequence-prep arenas ~5 * n_seq * 4 B, the stream
+temp block, the per-block sequence array, the decoder tables) were all
+churning this way. `zgec_alloc`/`zgec_free` now keep a bounded per-thread cache
+of freed blocks in [128 KiB, 4 MiB] (at most 8, best fit), and
+`zgec_fse_build_enc` rents its table from a thread-local free list. The header
+now records the block's *requested* total beside the saved malloc pointer --
+always a safe lower bound on the physical size, so a reused block is never
+written past what it owns.
+
+Action: When a hot path allocates and frees a large transient block in a loop,
+reuse it from a thread-local pool rather than malloc/free. Keep the pool
+explicitly bounded; make a released block's size recoverable from the block
+itself; and prove no double-free can reach it (NULL-initialise every pooled
+pointer and clear it after its single free). Blocks held at thread exit are
+still reachable from the thread-local pointer, so they are not unreachable
+leaks -- but the pools are deliberate retention, so they must stay capped.
+
+Also verified for this change: no encoder-table free can double-free --
+`enc_ll/ml/of` and the `enc_ll3/of3` clusters are NULLed after their one free,
+so the `seg_fail_tables` error path only frees NULLs when the success path
+already freed them. A -T 4 encode/decode round-trip and ASan-clean ctest pass.

@@ -935,7 +935,31 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
 
     for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
         uint64_t t = 0;
-        for (s = 0; s < ZGEC_NSYM_LIT; s++) {
+        s = 0;
+#if defined(__AVX2__)
+        {
+            /* Copy the class row and total it in one pass. The total is an
+             * exact 32-bit sum: it is at most n_lit, so no lane can reach
+             * 2^32 and the horizontal add cannot wrap. */
+            __m256i vsum = _mm256_setzero_si256();
+            const uint32_t *src = cls_hist + (size_t)c * 256u;
+            uint32_t *dst = work[(size_t)c];
+            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+                __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + s));
+                _mm256_storeu_si256((__m256i *)(void *)(dst + s), v);
+                vsum = _mm256_add_epi32(vsum, v);
+            }
+            {
+                __m128i lo = _mm256_castsi256_si128(vsum);
+                __m128i hi = _mm256_extracti128_si256(vsum, 1);
+                lo = _mm_add_epi32(lo, hi);
+                lo = _mm_hadd_epi32(lo, lo);
+                lo = _mm_hadd_epi32(lo, lo);
+                t = (uint64_t)(uint32_t)_mm_cvtsi128_si32(lo);
+            }
+        }
+#endif
+        for (; s < ZGEC_NSYM_LIT; s++) {
             work[(size_t)c][(size_t)s] = cls_hist[(size_t)c * 256u + (uint32_t)s];
             t += (uint64_t)work[(size_t)c][(size_t)s];
         }
@@ -1706,7 +1730,8 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                                  vb_seg_start);
         }
         for (t = 0; t < n; t++) {
-            if (rep0_before[t] < 32u) slow_sublit = 1;
+            /* slow_sublit is a flag, so the scan can stop at the first hit. */
+            if (rep0_before[t] < 32u) { slow_sublit = 1; break; }
         }
         {
             uint32_t rhist[ZGEC_NSYM_LIT];
