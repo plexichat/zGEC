@@ -2684,12 +2684,11 @@ efail:
  */
 
 typedef struct {
-    zgec_mu  mu;      /* held while this slot is being exported */
+    volatile uint32_t state; /* 0: UNINIT, 1: EXPORTING, 2: READY */
     uint8_t *lit;     /* exported literals; NULL when empty or released */
     size_t   len;
     size_t   refs;    /* consumers that still have to copy the bytes */
     zgec_err err;     /* export error, valid once ready */
-    unsigned ready;   /* 1 once lit/len/err are settled */
     unsigned alias;   /* 1 when lit points into the frame, not owned */
 } zgec_export_slot;
 
@@ -2750,7 +2749,6 @@ static void zgec_export_cache_free(zgec_export_cache *c)
     if (c == NULL) return;
     if (c->slot != NULL) {
         for (i = 0; i < c->nblk; i++) {
-            zgec_mu_destroy(&c->slot[i].mu);
             /* An alias points into the frame: releasing it would free a
              * pointer that was never allocated. */
             if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
@@ -2797,16 +2795,6 @@ static void zgec_export_cache_init(zgec_export_cache *c,
         return;
     }
     memset(c->slot, 0, c->nblk * sizeof(*c->slot));
-    for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
-    for (i = 0; i < c->nblk; i++) {
-        if (c->slot[i].mu.ok == 0) {
-            /* Without the slot locks the exporters could not agree on a
-             * result, so the frame has to go without the cache rather
-             * than risk a duplicated export. */
-            zgec_export_cache_free(c);
-            return;
-        }
-    }
     for (i = 0; i < c->nblk; i++) {
         const zgec_footer_block_entry *be = &f->blocks[i];
         uint8_t D = be->lit_ref_depth;
@@ -2904,29 +2892,36 @@ static zgec_err zgec_export_slot_acquire(zgec_export_cache *c, uint32_t idx,
                                          const uint8_t **lit, size_t *len)
 {
     zgec_export_slot *s;
-    zgec_err e;
+    uint32_t st;
 
     *lit = NULL;
     *len = 0u;
     if (c == NULL || idx >= c->nblk) return ZGEC_ERR_INTERNAL;
     s = &c->slot[idx];
-    zgec_mu_lock(&s->mu);
-    if (s->ready != 0u) {
+    st = zgec_atomic_load_u32(&s->state);
+    if (st == 2u) {
         *lit = s->lit;
         *len = s->len;
-        e = s->err;
-        zgec_mu_unlock(&s->mu);
-        return e;
+        return s->err;
     }
-    /* Claimed by this worker, and still locked: publish the export
-     * before anybody else can look at it. */
-    e = zgec_export_block(c, idx, s);
-    s->ready = 1u;
-    zgec_mu_unlock(&s->mu);
-    if (e != ZGEC_OK) return e;
+    if (st == 0u) {
+        uint32_t expected = 0u;
+        if (zgec_atomic_cas_u32(&s->state, &expected, 1u)) {
+            /* Claimed by this worker: perform the export and set state to 2 (READY). */
+            s->err = zgec_export_block(c, idx, s);
+            zgec_atomic_store_u32(&s->state, 2u);
+            *lit = s->lit;
+            *len = s->len;
+            return s->err;
+        }
+    }
+    /* Another worker is exporting right now: spin wait until state is 2 (READY). */
+    while (zgec_atomic_load_u32(&s->state) != 2u) {
+        zgec_pause();
+    }
     *lit = s->lit;
     *len = s->len;
-    return ZGEC_OK;
+    return s->err;
 }
 
 /* Local LITREF predecessor: parse and export one predecessor record,

@@ -94,6 +94,47 @@ static inline size_t zgec_atomic_fetch_add_size(volatile size_t *ptr, size_t val
 #endif
 }
 
+static inline uint32_t zgec_atomic_load_u32(volatile uint32_t *ptr)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+    return (uint32_t)InterlockedCompareExchange((LONG volatile *)ptr, 0, 0);
+#else
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static inline void zgec_atomic_store_u32(volatile uint32_t *ptr, uint32_t val)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+    InterlockedExchange((LONG volatile *)ptr, (LONG)val);
+#else
+    __atomic_store_n(ptr, val, __ATOMIC_RELEASE);
+#endif
+}
+
+static inline int zgec_atomic_cas_u32(volatile uint32_t *ptr, uint32_t *expected, uint32_t desired)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+    LONG old = InterlockedCompareExchange((LONG volatile *)ptr, (LONG)desired, (LONG)*expected);
+    if (old == (LONG)*expected) return 1;
+    *expected = (uint32_t)old;
+    return 0;
+#else
+    return __atomic_compare_exchange_n(ptr, expected, desired, 0, __ATOMIC_ACQUIRE, __ATOMIC_RELAXED);
+#endif
+}
+
+static inline void zgec_pause(void)
+{
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#if defined(__GNUC__) || defined(__clang__)
+    __asm__ __volatile__("pause" ::: "memory");
+#elif defined(_MSC_VER)
+    _mm_pause();
+#endif
+#endif
+}
+
 static inline unsigned zgec_cpu_count(void)
 {
 #if defined(_WIN32)
