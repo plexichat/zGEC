@@ -328,3 +328,36 @@ byte compare rejects anyway (l1 stays 80,567,687 B).
 Interleaved A/B (min of 9): l1 -0.8% (med -1.1%). Small: the 2 MiB input buffer
 is L2-resident, so the skipped load was not the bottleneck. Kept because it is
 free of ratio and correctness risk.
+
+### Branchless entropy encoders (rANS literals + FSE sequences)
+
+With the parser at its floor the fast rung's time is entropy-bound, so a
+phase profile was taken (temporary `ZGEC_ENC_PROFILE` rdtsc instrumentation,
+since removed). At level 1 the encode splits roughly parse 28%, granule
+segmentation 14%, literal stream 18-26%, sequence FSE build 8%, sequence FSE
+streams 10-12%, prep 6%. The two entropy encoders dominated the fast tiers.
+
+Both encoders tested a renormalisation condition with a data-dependent branch
+that mispredicts far too often to keep:
+
+1. `rans.c` `zgec_rans_encode_symbol`: the `while (x >= f<<21)` is provably a
+   single shift (`x < 2^32` so one `>>16` lands below `2^16 <= f<<21`), so it
+   is now an unconditional word store plus a conditional commit, with the
+   reciprocal correction as a cmov. The caller reserves 8 words of slack and
+   the per-write bound test is dropped. The decoder made the same change long
+   ago (see `zgec_rans_renorm`).
+2. `fse.c` `zgec_fse_encode`: the `if (nb > 0)` gate around the extra-bits
+   field becomes a width mask (`extra & mask`, `cn += nb`), since a symbol
+   with no extra bits stands for exactly `base[s]` and the symbol is derived
+   from the value. The two range checks are unchanged for `nb > 0`.
+
+**Measurement (211,938,580 B, -T 1, interleaved A/B, min of 7):** rANS gives
+level 1 **-11.1%** and level 4 -1.7%; FSE gives a further level 1 -2.2% and
+level 4 -2.3%. Both are bitstream-identical by construction; pins 4-10 and the
+l7 SHA-256 are unchanged and ctest is 4/4.
+
+**Negative results (measured, reverted):** zeroing only the absent symbols'
+blocks of the FSE enc table (instead of one big memset) was *slower* (l1
++4.3%) -- the many small memsets lose to the single call. A branchless FSE
+bitwriter flush (unconditional store + conditional advance, with slack) was
+within noise on l1/l4 and adds an unchecked store, so it was dropped.

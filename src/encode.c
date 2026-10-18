@@ -723,11 +723,11 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
 
     for (gi = 0; gi < n_gran; gi++) {
         zgec_granule *g = &grans[gi];
+        size_t llo, lhi;
         for (i = gstart[gi]; i < gstart[gi + 1]; i++) {
             const zgec_sequence *q = &parse->seq[i];
             uint8_t nb = 0;
             uint8_t c;
-            size_t t;
             uint32_t mlv = (q->ml >= 3) ? (q->ml - 3u) : 0u;
             uint32_t ofv = (q->offbase >= 1) ? (q->offbase - 1u) : 0u;
             c = zgec_seq_code_of(q->ll, &nb);
@@ -740,19 +740,41 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
             g->of[c]++;
             g->extra_bits += (uint64_t)nb;
             g->n_seq++;
-            /* Greedy litpos (PR #3): the literal start of every sequence is a
-             * prefix sum of LL, so it is computed once in a pre-pass instead of
-             * being re-derived per granule with a clamp on each iteration. */
-            for (t = lit_of_seq[i]; t < lit_of_seq[i + 1]; t++) {
-                if (t < parse->n_lit) {
-                    g->lit[parse->lit[t]]++;
-                    g->lit_total++;
-                }
+        }
+        /* Granule literal histogram. Greedy litpos (PR #3): the literal range
+         * of a granule is the LL prefix-sum span of its sequences, so it is
+         * read straight from lit_of_seq instead of being spliced per sequence.
+         * Split into eight accumulators so consecutive equal literals do not
+         * serialise on store-to-load forwarding (same trick as
+         * zgec_rans_histograms). Output is the same counts in g->lit[]. */
+        llo = lit_of_seq[gstart[gi]];
+        lhi = lit_of_seq[gstart[gi + 1]];
+        if (lhi > parse->n_lit) lhi = parse->n_lit;
+        if (lhi > llo) {
+            uint32_t c0[ZGEC_NSYM_LIT] = {0};
+            uint32_t c1[ZGEC_NSYM_LIT] = {0};
+            uint32_t c2[ZGEC_NSYM_LIT] = {0};
+            uint32_t c3[ZGEC_NSYM_LIT] = {0};
+            uint32_t c4[ZGEC_NSYM_LIT] = {0};
+            uint32_t c5[ZGEC_NSYM_LIT] = {0};
+            uint32_t c6[ZGEC_NSYM_LIT] = {0};
+            uint32_t c7[ZGEC_NSYM_LIT] = {0};
+            const uint8_t *lt = parse->lit;
+            size_t t = llo;
+            int s;
+            for (; t + 8 <= lhi; t += 8) {
+                c0[lt[t]]++;     c1[lt[t + 1]]++; c2[lt[t + 2]]++; c3[lt[t + 3]]++;
+                c4[lt[t + 4]]++; c5[lt[t + 5]]++; c6[lt[t + 6]]++; c7[lt[t + 7]]++;
             }
-            lit_pos = lit_of_seq[i + 1];
+            for (; t < lhi; t++) c0[lt[t]]++;
+            for (s = 0; s < ZGEC_NSYM_LIT; s++)
+                g->lit[s] = c0[s] + c1[s] + c2[s] + c3[s] + c4[s]
+                          + c5[s] + c6[s] + c7[s];
+            g->lit_total = lhi - llo;
         }
     }
     /* Tail literals belong to the last granule. */
+    lit_pos = lit_of_seq[parse->n_seq];
     for (i = lit_pos; i < parse->n_lit; i++) {
         grans[n_gran - 1].lit[parse->lit[i]]++;
         grans[n_gran - 1].lit_total++;
