@@ -1273,7 +1273,33 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                  * total from the values it stores, which removes the
                  * second pass over ml[] entirely. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
+                i = 0;
+#if defined(__AVX2__)
+                __m256i v3 = _mm256_set1_epi32(3);
+                __m256i v0_s = _mm256_setzero_si256();
+                __m256i v1_s = _mm256_set1_epi32(1);
+                __m256i v2_s = _mm256_set1_epi32(2);
+                __m256i vbad = _mm256_setzero_si256();
+                while (i + 8 <= seg->n_seq) {
+                    __m256i vml = _mm256_loadu_si256((const __m256i *)(const void *)(seg->ml + i));
+                    __m256i vres = _mm256_add_epi32(vml, v3);
+                    _mm256_storeu_si256((__m256i *)(void *)(seg->ml + i), vres);
+                    __m256i veq0 = _mm256_cmpeq_epi32(vres, v0_s);
+                    __m256i veq1 = _mm256_cmpeq_epi32(vres, v1_s);
+                    __m256i veq2 = _mm256_cmpeq_epi32(vres, v2_s);
+                    __m256i vcmp = _mm256_or_si256(veq0, _mm256_or_si256(veq1, veq2));
+                    vbad = _mm256_or_si256(vbad, vcmp);
+                    __m128i vlow = _mm256_castsi256_si128(vres);
+                    __m128i vhigh = _mm256_extracti128_si256(vres, 1);
+                    __m128i vsum128 = _mm_add_epi32(vlow, vhigh);
+                    vsum128 = _mm_hadd_epi32(vsum128, vsum128);
+                    vsum128 = _mm_hadd_epi32(vsum128, vsum128);
+                    sum_ml += (uint64_t)(uint32_t)_mm_cvtsi128_si32(vsum128);
+                    i += 8;
+                }
+                if (!_mm256_testz_si256(vbad, vbad)) bad = 1;
+#endif
+                for (; i < seg->n_seq; i++) {
                     uint32_t v = seg->ml[i] + 3u;
                     seg->ml[i] = v;
                     sum_ml += (uint64_t)v;
@@ -1306,7 +1332,22 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                  * bound (ob < 1 impossible, ob > 0xFFFFFFFF) could reject
                  * is 0xFFFFFFFF, and that add wraps it to a stored zero. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
+                i = 0;
+#if defined(__AVX2__)
+                __m256i v1_of = _mm256_set1_epi32(1);
+                __m256i vbad_of = _mm256_setzero_si256();
+                while (i + 8 <= seg->n_seq) {
+                    __m256i vof = _mm256_loadu_si256((const __m256i *)(const void *)(seg->of + i));
+                    __m256i vres = _mm256_add_epi32(vof, v1_of);
+                    _mm256_storeu_si256((__m256i *)(void *)(seg->of + i), vres);
+                    __m256i vzero = _mm256_setzero_si256();
+                    __m256i vcmp = _mm256_cmpeq_epi32(vres, vzero);
+                    vbad_of = _mm256_or_si256(vbad_of, vcmp);
+                    i += 8;
+                }
+                if (!_mm256_testz_si256(vbad_of, vbad_of)) bad = 1;
+#endif
+                for (; i < seg->n_seq; i++) {
                     uint32_t ob = seg->of[i] + 1u;
                     seg->of[i] = ob;
                     bad |= (ob == 0u);
@@ -1707,11 +1748,45 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
     if ((uint64_t)rep0 <= (uint64_t)(LdLl + pos) && rep0 >= 32) {
         size_t back_base = (LdLl + pos) - (size_t)rep0;
         while (t + 32 <= n) {
-            __m256i v_res = _mm256_loadu_si256((const __m256i *)(res + t));
-            __m256i v_pred = _mm256_loadu_si256((const __m256i *)(vb + back_base + t));
+            __m256i v_res = _mm256_loadu_si256((const __m256i *)(const void *)(res + t));
+            __m256i v_pred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + back_base + t));
             __m256i v_sum = _mm256_add_epi8(v_res, v_pred);
-            _mm256_storeu_si256((__m256i *)(dst + pos + t), v_sum);
+            _mm256_storeu_si256((__m256i *)(void *)(dst + pos + t), v_sum);
+            if (vb + LdLl != dst) {
+                _mm256_storeu_si256((__m256i *)(void *)(vb + LdLl + pos + t), v_sum);
+            }
             t += 32;
+        }
+    }
+#endif
+#if defined(__x86_64__) || defined(_M_X64) || defined(__AVX2__)
+    if ((uint64_t)rep0 <= (uint64_t)(LdLl + pos) && rep0 >= 16) {
+        size_t back_base = (LdLl + pos) - (size_t)rep0;
+        while (t + 16 <= n) {
+            __m128i v_res = _mm_loadu_si128((const __m128i *)(const void *)(res + t));
+            __m128i v_pred = _mm_loadu_si128((const __m128i *)(const void *)(vb + back_base + t));
+            __m128i v_sum = _mm_add_epi8(v_res, v_pred);
+            _mm_storeu_si128((__m128i *)(void *)(dst + pos + t), v_sum);
+            if (vb + LdLl != dst) {
+                _mm_storeu_si128((__m128i *)(void *)(vb + LdLl + pos + t), v_sum);
+            }
+            t += 16;
+        }
+    } else if (rep0 == 1u && (LdLl + pos) >= 1u) {
+        uint8_t last = vb[LdLl + pos - 1u];
+        while (t + 16 <= n) {
+            __m128i vec = _mm_loadu_si128((const __m128i *)(const void *)(res + t));
+            vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 1));
+            vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 2));
+            vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 4));
+            vec = _mm_add_epi8(vec, _mm_slli_si128(vec, 8));
+            vec = _mm_add_epi8(vec, _mm_set1_epi8((char)last));
+            _mm_storeu_si128((__m128i *)(void *)(dst + pos + t), vec);
+            if (vb + LdLl != dst) {
+                _mm_storeu_si128((__m128i *)(void *)(vb + LdLl + pos + t), vec);
+            }
+            last = dst[pos + t + 15];
+            t += 16;
         }
     }
 #endif
@@ -1722,7 +1797,11 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
             size_t back = (size_t)((uint64_t)vbpos - (uint64_t)rep0);
             pred = vb[back];
         }
-        dst[pos + t] = (uint8_t)(res[t] + pred);
+        uint8_t b = (uint8_t)(res[t] + pred);
+        dst[pos + t] = b;
+        if (vb + LdLl != dst) {
+            vb[vbpos] = b;
+        }
     }
 }
 

@@ -14,6 +14,10 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 /* Format limits per section 3.3: dictionary at most 2^26 bytes.
  * P24 profile limit (2^24) is warn-only: larger dictionaries within the
  * format limit remain decodable, so no error is raised for them. */
@@ -189,7 +193,32 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
         if (n > 0) memcpy(dst, src, n);
         return;
     }
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+#if defined(__AVX2__)
+    if ((uint64_t)rep0 <= (uint64_t)pos && rep0 >= 32) {
+        size_t back_base = pos - (size_t)rep0;
+        while (i + 32 <= n) {
+            __m256i v_res = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            __m256i v_pred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + back_base + i));
+            __m256i v_sum = _mm256_add_epi8(v_res, v_pred);
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), v_sum);
+            i += 32;
+        }
+    }
+#endif
+#if defined(__x86_64__) || defined(_M_X64) || defined(__AVX2__)
+    if ((uint64_t)rep0 <= (uint64_t)pos && rep0 >= 16) {
+        size_t back_base = pos - (size_t)rep0;
+        while (i + 16 <= n) {
+            __m128i v_res = _mm_loadu_si128((const __m128i *)(const void *)(src + i));
+            __m128i v_pred = _mm_loadu_si128((const __m128i *)(const void *)(vb + back_base + i));
+            __m128i v_sum = _mm_add_epi8(v_res, v_pred);
+            _mm_storeu_si128((__m128i *)(void *)(dst + i), v_sum);
+            i += 16;
+        }
+    }
+#endif
+    for (; i < n; i++) {
         size_t cur = pos + i;
         uint8_t pred = 0;
         if ((uint64_t)rep0 <= (uint64_t)cur) pred = vb[cur - (size_t)rep0];
@@ -208,6 +237,47 @@ static void zgec_dict_copy_match(uint8_t *dst, size_t off, size_t len)
      * the bytes just written, which neither a snapshot nor a bulk copy gives. */
     if (off >= len) {
         if (len > 0) memcpy(dst, src, len);
+        return;
+    }
+    if (off == 1) {
+        memset(dst, src[0], len);
+        return;
+    }
+#if defined(__AVX2__)
+    if (off == 2 && len >= 8) {
+        uint16_t p16 = zgec_rd16(src);
+        __m256i v256 = _mm256_set1_epi16((short)p16);
+        size_t i = 0;
+        while (i + 32 <= len) {
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), v256);
+            i += 32;
+        }
+        while (i + 8 <= len) {
+            zgec_wr64(dst + i, (uint64_t)p16 * 0x0001000100010001ULL);
+            i += 8;
+        }
+        for (; i < len; i++) dst[i] = src[i % 2];
+        return;
+    }
+    if (off == 4 && len >= 8) {
+        uint32_t p32 = zgec_rd32(src);
+        __m256i v256 = _mm256_set1_epi32((int)p32);
+        size_t i = 0;
+        while (i + 32 <= len) {
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), v256);
+            i += 32;
+        }
+        while (i + 8 <= len) {
+            zgec_wr64(dst + i, (uint64_t)p32 | ((uint64_t)p32 << 32));
+            i += 8;
+        }
+        for (; i < len; i++) dst[i] = src[i % 4];
+        return;
+    }
+#endif
+    if (off >= 4 && len >= 4 && len <= 8) {
+        memcpy(dst, src, 4);
+        memcpy(dst + len - 4, src + len - 4, 4);
         return;
     }
     for (size_t i = 0; i < len; i++) dst[i] = src[i];
