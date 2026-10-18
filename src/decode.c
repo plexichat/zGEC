@@ -1069,7 +1069,7 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         en = &t[cls]->e[state];
         if (en->symbol < 0 || en->symbol >= ZGEC_NSYM_SEQ) goto bad_symbol;
         sym = (unsigned)en->symbol;
-        xb = (unsigned)zgec_seq_nbits[sym];
+        xb = (unsigned)en->pad;
         if (xb > 32u) goto bad_symbol;
         if (nacc < 56u) {
             nb = (63u - nacc) >> 3;
@@ -1110,9 +1110,9 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         en = &t[cls]->e[state];
         sym = (int)en->symbol;
         if (sym < 0 || sym >= ZGEC_NSYM_SEQ) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
-        if (zgec_seq_nbits[sym] > 32u) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
-        if (zgec_seq_nbits[sym] > 0) {
-            extra = zgec_br_read(&br, (unsigned)zgec_seq_nbits[sym]);
+        if (en->pad > 32u) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_FSE_SYMBOL; }
+        if (en->pad > 0) {
+            extra = zgec_br_read(&br, (unsigned)en->pad);
             if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM; }
         }
         out[i] = zgec_seq_base[sym] + extra;

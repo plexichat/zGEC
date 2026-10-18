@@ -343,8 +343,8 @@ static zgec_err zgec_dict_seq_cond(uint32_t *out, size_t n,
         en = &t[cls]->e[state];
         sym = (int)en->symbol;
         if (sym < 0 || sym >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL;
-        if (zgec_seq_nbits[sym] > 0) {
-            extra = zgec_br_read(&br, (unsigned)zgec_seq_nbits[sym]);
+        if (en->pad > 0) {
+            extra = zgec_br_read(&br, (unsigned)en->pad);
             if (br.overflow) return ZGEC_ERR_BITSTREAM;
         }
         out[i] = zgec_seq_base[(unsigned)sym] + extra;

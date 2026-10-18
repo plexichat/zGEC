@@ -2,6 +2,7 @@
 #include <immintrin.h>
 #endif
 #include "zgec_fse.h"
+#include "zgec_seq.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -156,6 +157,18 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
     for (int i = 0; i < S; i++) {
         int s = t->e[i].symbol;
         if (t->first_state[s] < 0) t->first_state[s] = i;
+    }
+
+    if (nsym == ZGEC_NSYM_SEQ) {
+        /* Bake each entry's extra-bits width into the spare pad byte: the
+         * steady sequence decode loops read it from the entry load they
+         * already perform, instead of a second dependent load from
+         * zgec_seq_nbits[] on the per-symbol state chain. Every sequence
+         * table in the process is built here or copied whole from one
+         * that was, so the byte is current whenever those loops run. */
+        for (int i = 0; i < S; i++) {
+            t->e[i].pad = zgec_seq_nbits[(unsigned)t->e[i].symbol];
+        }
     }
 
     *out = t;
@@ -703,6 +716,12 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
         if (!zgec_br_done(br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
         return ZGEC_OK;
     }
+    /* Widths come from the entry pad bytes: zgec_fse_build_dec bakes
+     * zgec_seq_nbits into every sequence table. The array parameter is
+     * fixed by the signature; no other width table is used with these
+     * streams, so reject anything else instead of decoding from stale
+     * entries. */
+    if (nbits != NULL && nbits != zgec_seq_nbits) return ZGEC_ERR_INVAL;
     S = (unsigned)1 << (unsigned)t->al;
     acc = br->acc;
     nacc = br->nacc;
@@ -738,7 +757,7 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
         while (i + 1 < n && left > 16u) {
             const zgec_fse_dec_entry *e = &te[state];
             unsigned sym = (unsigned)e->symbol;
-            unsigned xb = (unsigned)nbits[sym];
+            unsigned xb = (unsigned)e->pad;
             uint32_t extra;
             unsigned nbq;
             uint32_t bits;
@@ -795,7 +814,7 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             unsigned nb;
             uint64_t w;
 
-            if (nbits != NULL) xb = (unsigned)nbits[sym];
+            if (nbits != NULL) xb = (unsigned)e->pad;
 
             /* refill to 56..63 bits, branchless (mask as above) */
             w = zgec_rd64(ptr - 7);
@@ -966,7 +985,7 @@ bad:
 #define ZGEC_FSE2_STEP(_TE, _ACC, _NACC, _PTR, _LEFT, _ST, _OUT, _S) do { \
         const zgec_fse_dec_entry *_e2 = &(_TE)[(_ST)]; \
         unsigned _sym2 = (unsigned)_e2->symbol; \
-        unsigned _xb2 = (unsigned)nbits[_sym2]; \
+        unsigned _xb2 = (unsigned)_e2->pad; \
         uint32_t _extra2; \
         unsigned _nbq2; \
         uint32_t _bits2; \
@@ -1031,6 +1050,10 @@ zgec_err zgec_fse_decode2(const zgec_fse_dec_table *t1, zgec_br *br1,
     if (t2->al < ZGEC_MIN_AL || t2->al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
     if (t2->nsym <= 0 || t2->nsym > 256) return ZGEC_ERR_FSE_COUNTS;
     if (t2->e == NULL) return ZGEC_ERR_FSE_COUNTS;
+    /* The per-symbol extra-bits width comes from the entry pad bytes (see
+     * zgec_fse_build_dec); only the canonical sequence width array is ever
+     * used with these streams. */
+    if (nbits != zgec_seq_nbits) return ZGEC_ERR_INVAL;
     if (n == 0) {
         if (!zgec_br_done(br1) || !zgec_br_done(br2))
             return ZGEC_ERR_BITSTREAM_UNCONSUMED;
