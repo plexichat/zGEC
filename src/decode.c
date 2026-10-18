@@ -1819,21 +1819,17 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                                   LdLl);
             } else if (ll <= 4 && raw_size > 64 &&
                        out_pos + (uint64_t)ll <= (uint64_t)raw_size - 64) {
-                /* 0..4 literal bytes (the common case): one branch-free
-                 * 4-byte write. The index clamps keep every source read
-                 * inside the literal slice (no overread), and a NULL
-                 * lit_cur (n_lit == 0) is only reachable with ll == 0,
-                 * which reads the dummy. For
-                 * ll < 4 the bytes past the literals are garbage that a
-                 * later write always replaces before the buffer is read
-                 * (same argument as the match arm below). */
+                /* 0..4 literal bytes (the common case): one 4-byte copy.
+                 * Reads past this sequence's literals stay inside the
+                 * allocation: lit_cur + ll <= seg->lit + n_lit (V1
+                 * prefix bound) and the slice carries ZGEC_LIT_SLACK
+                 * zeroed bytes; a NULL lit_cur (n_lit == 0) is only
+                 * reachable with ll == 0, which reads the 4-byte dummy.
+                 * For ll < 4 the extra bytes are garbage that a later
+                 * write always replaces before the buffer is read (same
+                 * argument as the match arm below). */
                 const uint8_t *ls = (ll > 0) ? lit_cur : zgec_lit_dummy;
-                uint32_t b0 = ls[0];
-                uint32_t b1 = ls[(ll > 1u) ? 1u : 0u];
-                uint32_t b2 = ls[(ll > 2u) ? 2u : 0u];
-                uint32_t b3 = ls[(ll > 3u) ? 3u : 0u];
-                zgec_wr32(ba->out + (size_t)out_pos,
-                          b0 | (b1 << 8) | (b2 << 16) | (b3 << 24));
+                zgec_wr32(ba->out + (size_t)out_pos, zgec_rd32(ls));
             } else if (ll > 0) {
                 me = exec_literals_plain(ba->out, lit_cur, (size_t)ll,
                                     (size_t)out_pos, raw_size);
