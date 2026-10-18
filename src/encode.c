@@ -2456,7 +2456,10 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
             ml_tmp = NULL;
             of_tmp = NULL;
             if (tb_cap > SIZE_MAX / 3) { err = ZGEC_ERR_NOMEM; goto seg_fail_tables; }
-            tb_blk = (uint8_t *)zgec_alloc(tb_cap * 3, 1);
+            /* +16: the branchless FSE bitwriter does one uncommitted 32-bit
+             * store per field, so each stream needs a few bytes of slack past
+             * its declared end (see zgec_fse_bw_write_local). */
+            tb_blk = (uint8_t *)zgec_alloc(tb_cap * 3 + 16, 1);
             if (!tb_blk) {
                 err = ZGEC_ERR_NOMEM;
                 goto seg_fail_tables;

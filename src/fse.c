@@ -1193,23 +1193,36 @@ void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
 {
     if (n == 0) return;
     uint64_t mask = (n == 32u) ? 0xFFFFFFFFu : ((1ull << n) - 1ull);
-    *bw_acc |= (val & mask) << *bw_nacc;
-    *bw_nacc += n;
-    /* n can exceed 32 when a caller fuses a transition field with its
-     * extra bits into one write, so more than one 32-bit word may be
-     * complete. Draining all of them here is bit-identical to draining
-     * one per write: the emitted byte sequence depends only on the order
-     * the bits were accumulated. */
-    while (*bw_nacc >= 32u) {
-        if (*bw_ptr + 4 > bw_end) {
+    uint64_t acc = *bw_acc | ((val & mask) << *bw_nacc);
+    unsigned nacc = *bw_nacc + n;
+    uint8_t *p = *bw_ptr;
+    /* Whether a word completes is a data-dependent coin flip (roughly every
+     * second-to-third field), so the drain is branchless: the store is
+     * unconditional and only the advance is conditional. When no word
+     * completes the store lands at the position the next committed word will
+     * use and is overwritten; the caller keeps a few bytes of slack past the
+     * stream, so the store never runs off the end. A second completed word
+     * (n can exceed 32 when a caller fuses a transition field with its extra
+     * bits into one write) is rare and keeps the bound-checked path. */
+    unsigned flush = (nacc >= 32u) ? 1u : 0u;
+    zgec_wr32(p, (uint32_t)acc);
+    p += (size_t)flush * 4u;
+    acc = flush ? (acc >> 32u) : acc;
+    nacc -= flush * 32u;
+    if (nacc >= 32u) {
+        if (p + 4 > bw_end) {
+            *bw_acc = acc; *bw_nacc = nacc; *bw_ptr = p;
             *overflow = 1;
             return;
         }
-        zgec_wr32(*bw_ptr, (uint32_t)*bw_acc);
-        *bw_ptr += 4;
-        *bw_acc >>= 32;
-        *bw_nacc -= 32;
+        zgec_wr32(p, (uint32_t)acc);
+        p += 4;
+        acc >>= 32u;
+        nacc -= 32u;
     }
+    *bw_acc = acc;
+    *bw_nacc = nacc;
+    *bw_ptr = p;
 }
 
 zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
