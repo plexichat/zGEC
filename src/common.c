@@ -80,14 +80,82 @@ const char *zgec_strerror(zgec_err e)
     }
 }
 
+/* Portable thread-local storage, mirroring src/crc32c.c (MSVC's C11 mode
+   historically lacks _Thread_local). */
+#if defined(_MSC_VER)
+#define ZGEC_ALLOC_TLS __declspec(thread)
+#else
+#define ZGEC_ALLOC_TLS _Thread_local
+#endif
+
+/* Large transient blocks -- hash tables, sequence arrays and, above all, the
+   entropy transition tables -- are allocated and released many times over a
+   single (de)compression. The system allocator typically returns a large
+   block to the OS on free, so the next identical allocation faults every
+   page in again; that refaulting, not the work between alloc and free,
+   dominates some of these sites. Keep a few recently freed large blocks per
+   thread and hand them back out instead.
+
+   Only blocks in [ZGEC_POOL_MIN, ZGEC_POOL_MAX_BLOCK] are kept, at most
+   ZGEC_POOL_SLOTS of them, and the best (smallest) fit wins so the retained
+   bytes stay bounded. A block is reused when it is at least as big as the
+   request; the requested size, not the physical size, is what gets recorded,
+   which is always a safe lower bound because a block is only ever written up
+   to its requested size. Blocks still held at thread exit are reachable from
+   this thread-local array. */
+#define ZGEC_POOL_MIN       (128u * 1024u)
+#define ZGEC_POOL_MAX_BLOCK (4u * 1024u * 1024u)
+#define ZGEC_POOL_SLOTS     8u
+
+struct zgec_pool_slot {
+    void  *raw;
+    size_t total;
+};
+
+static ZGEC_ALLOC_TLS struct zgec_pool_slot zgec_pool[ZGEC_POOL_SLOTS];
+static ZGEC_ALLOC_TLS unsigned zgec_pool_n;
+
+/* Smallest cached block that can hold `total`, removed from the cache, or
+   NULL if none fits. */
+static void *zgec_pool_take(size_t total)
+{
+    unsigned i;
+    unsigned best = ZGEC_POOL_SLOTS;
+    for (i = 0; i < zgec_pool_n; i++) {
+        if (zgec_pool[i].total >= total &&
+            (best == ZGEC_POOL_SLOTS ||
+             zgec_pool[i].total < zgec_pool[best].total)) {
+            best = i;
+        }
+    }
+    if (best == ZGEC_POOL_SLOTS) return NULL;
+    {
+        void *raw = zgec_pool[best].raw;
+        zgec_pool[best] = zgec_pool[--zgec_pool_n];
+        return raw;
+    }
+}
+
+/* Offer a block to the cache; returns 0 if it was not taken (caller frees). */
+static int zgec_pool_put(void *raw, size_t total)
+{
+    if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
+    zgec_pool[zgec_pool_n].raw = raw;
+    zgec_pool[zgec_pool_n].total = total;
+    zgec_pool_n++;
+    return 1;
+}
+
 /* Aligned allocation via over-allocation: the block
-   is [ original pointer ][ padding ][ aligned data ].
+   is [ original pointer ][ total size ][ padding ][ aligned data ].
    The original pointer is stored immediately before
-   the aligned data so zgec_free can recover it.
+   the aligned data so zgec_free can recover it, and the
+   total size next to it so zgec_free can decide whether
+   the block is worth caching.
    Works for any alignment that is a power of two.
 
    Both size computations are guarded. The prefix
-   (sizeof(void *) + align - 1) and the total (n + prefix) can each
+   (2 * sizeof(void *) + align - 1) and the total (n + prefix) can each
    wrap size_t for attacker-influenced sizes, and a wrapped total
    would hand the caller a block smaller than the n bytes it believes
    it owns -- heap corruption on the next write. The addition of the
@@ -114,12 +182,15 @@ void *zgec_alloc(size_t n, size_t align)
     if (align <= sizeof(void *)) align = sizeof(void *);
     /* align must be a power of two for the mask */
     if ((align & (align - 1)) != 0) return NULL;
-    if (zgec_add_overflows(sizeof(void *), align - 1)) return NULL;
-    prefix = sizeof(void *) + align - 1;
+    if (zgec_add_overflows(2u * sizeof(void *), align - 1)) return NULL;
+    prefix = 2u * sizeof(void *) + align - 1;
     if (zgec_add_overflows(n, prefix)) return NULL;
     total = n + prefix;
-    raw = malloc(total);
-    if (!raw) return NULL;
+    raw = zgec_pool_take(total);
+    if (!raw) {
+        raw = malloc(total);
+        if (!raw) return NULL;
+    }
     base = (uintptr_t)raw;
     if (__builtin_add_overflow(base, prefix, &sum)) {
         free(raw);
@@ -127,20 +198,27 @@ void *zgec_alloc(size_t n, size_t align)
     }
     aligned = sum & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
+    ((size_t *)aligned)[-2] = total;
     return (void *)aligned;
 }
 
 /* Paired with zgec_alloc, and valid only for NULL or a pointer that
    zgec_alloc returned. The original malloc pointer lives in the word
-   immediately before p, so any other argument -- including a pointer
-   from plain malloc -- reads out of bounds and then frees a garbage
-   address. Such a pointer must not be passed to free() either:
-   zgec_alloc over-allocates and returns an interior pointer, not the
-   malloc result. Do not mix the two allocators. */
+   immediately before p and the recorded total in the word before that,
+   so any other argument -- including a pointer from plain malloc -- reads
+   out of bounds and then frees a garbage address. Such a pointer must not
+   be passed to free() either: zgec_alloc over-allocates and returns an
+   interior pointer, not the malloc result. Do not mix the two allocators.
+   Large blocks are offered to the per-thread cache before being released. */
 void zgec_free(void *p)
 {
     if (!p) return;
     void *raw = ((void **)p)[-1];
+    size_t total = ((size_t *)p)[-2];
+    if (total >= ZGEC_POOL_MIN && total <= ZGEC_POOL_MAX_BLOCK &&
+        zgec_pool_put(raw, total)) {
+        return;
+    }
     free(raw);
 }
 
