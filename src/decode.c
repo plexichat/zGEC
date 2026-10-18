@@ -2271,17 +2271,25 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
         return ZGEC_ERR_CTX_MODE; /* V7 */
     if (sc < 1 || sc > ZGEC_MAX_SEGMENTS) return ZGEC_ERR_SEGMENT_COUNT;
     if (psz < params_len + (size_t)sc * 8) return ZGEC_ERR_TRUNCATED; /* V8 */
-    dir = (zgec_seg_dir_entry *)zgec_alloc((size_t)sc * sizeof(*dir),
-                                           _Alignof(zgec_seg_dir_entry));
-    if (!dir) return ZGEC_ERR_NOMEM;
+    zgec_seg_dir_entry stack_dir[64];
+    int dir_owned = 0;
+
+    if (sc <= 64) {
+        dir = stack_dir;
+    } else {
+        dir = (zgec_seg_dir_entry *)zgec_alloc((size_t)sc * sizeof(*dir),
+                                               _Alignof(zgec_seg_dir_entry));
+        if (!dir) return ZGEC_ERR_NOMEM;
+        dir_owned = 1;
+    }
     e = zgec_seg_dir_parse(dir, sc, payload + params_len, psz - params_len);
     if (e != ZGEC_OK) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return e;
     }
     for (i = 0; i < sc; i++) {
         if (dir[i].comp_len == 0) {
-            zgec_free(dir);
+            if (dir_owned) zgec_free(dir);
             return ZGEC_ERR_SEGMENT_SIZE; /* V8 */
         }
         comp_sum += (uint64_t)dir[i].comp_len;
@@ -2289,12 +2297,12 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
     }
     /* V8 tiling: params + dir + segments == payload. */
     if (params_len + (size_t)sc * 8 + comp_sum != (uint64_t)psz) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return ZGEC_ERR_SEGMENT_SIZE;
     }
     /* V4: segment raw lengths sum to the block raw size. */
     if (raw_sum != (uint64_t)expect_raw) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return ZGEC_ERR_RAW_LEN;
     }
 
@@ -2307,18 +2315,18 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
                                 (uint64_t)expect_raw, (uint64_t)Ld,
                                 (uint64_t)litref_len);
     if (e != ZGEC_OK) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return e;
     }
     vb_total = (uint64_t)Ld + (uint64_t)litref_len + (uint64_t)expect_raw;
     if (vb_total > 0xFFFFFFFFu) { /* format limit 2^32-1 (V9) */
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return ZGEC_ERR_OUTPUT_SIZE;
     }
 
     ba = (zgec_block_arrays *)zgec_alloc(sizeof(*ba), _Alignof(zgec_block_arrays));
     if (!ba) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return ZGEC_ERR_NOMEM;
     }
     memset(ba, 0, sizeof(*ba));
@@ -2329,27 +2337,27 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
     ba->segs = (zgec_segment_arrays *)zgec_alloc(
         (size_t)sc * sizeof(zgec_segment_arrays), _Alignof(zgec_segment_arrays));
     if (!ba->segs) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         zgec_block_arrays_free(ba);
         return ZGEC_ERR_NOMEM;
     }
     memset(ba->segs, 0, (size_t)sc * sizeof(zgec_segment_arrays));
     if (vb_total > (uint64_t)SIZE_MAX - (uint64_t)ZGEC_OUTPUT_SLACK) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         zgec_block_arrays_free(ba);
         return ZGEC_ERR_NOMEM;
     }
     ba->vb = (uint8_t *)zgec_alloc(
         (size_t)vb_total + ZGEC_OUTPUT_SLACK, 64);
     if (!ba->vb) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         zgec_block_arrays_free(ba);
         return ZGEC_ERR_NOMEM;
     }
     memset(ba->vb + (size_t)vb_total, 0, ZGEC_OUTPUT_SLACK);
     if (Ld > 0) {
         if (dict == NULL || dict->data == NULL) {
-            zgec_free(dir);
+            if (dir_owned) zgec_free(dir);
             zgec_block_arrays_free(ba);
             return ZGEC_ERR_INTERNAL;
         }
@@ -2357,7 +2365,7 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
     }
     if (litref_len > 0) {
         if (litref == NULL) {
-            zgec_free(dir);
+            if (dir_owned) zgec_free(dir);
             zgec_block_arrays_free(ba);
             return ZGEC_ERR_INVAL;
         }
@@ -2407,7 +2415,7 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
         seg_tables_free(&prev);
         seg_tables_free(&cur);
     }
-    zgec_free(dir);
+    if (dir_owned) zgec_free(dir);
     dir = NULL;
 
     e = exec_block(ba);
@@ -2441,7 +2449,7 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
 fail:
     seg_tables_free(&prev);
     seg_tables_free(&cur);
-    zgec_free(dir);
+    if (dir_owned) zgec_free(dir);
     zgec_block_arrays_free(ba);
     return e;
 }
@@ -2469,12 +2477,20 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         return ZGEC_ERR_CTX_MODE;
     if (sc < 1 || sc > ZGEC_MAX_SEGMENTS) return ZGEC_ERR_SEGMENT_COUNT;
     if (psz < params_len + (size_t)sc * 8) return ZGEC_ERR_TRUNCATED;
-    dir = (zgec_seg_dir_entry *)zgec_alloc((size_t)sc * sizeof(*dir),
-                                           _Alignof(zgec_seg_dir_entry));
-    if (!dir) return ZGEC_ERR_NOMEM;
+    zgec_seg_dir_entry stack_dir[64];
+    int dir_owned = 0;
+
+    if (sc <= 64) {
+        dir = stack_dir;
+    } else {
+        dir = (zgec_seg_dir_entry *)zgec_alloc((size_t)sc * sizeof(*dir),
+                                               _Alignof(zgec_seg_dir_entry));
+        if (!dir) return ZGEC_ERR_NOMEM;
+        dir_owned = 1;
+    }
     e = zgec_seg_dir_parse(dir, sc, payload + params_len, psz - params_len);
     if (e != ZGEC_OK) {
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         return e;
     }
     seg_tables_init(&prev);
@@ -2642,7 +2658,7 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
     }
     seg_tables_free(&prev);
     seg_tables_free(&cur);
-    zgec_free(dir);
+    if (dir_owned) zgec_free(dir);
     if (lit == NULL) {
         lit = (uint8_t *)zgec_alloc(1, 64);
         if (!lit) return ZGEC_ERR_NOMEM;
@@ -2655,7 +2671,7 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
 efail:
     seg_tables_free(&prev);
     seg_tables_free(&cur);
-    zgec_free(dir);
+    if (dir_owned) zgec_free(dir);
     zgec_free(lit);
     return e;
 }
@@ -3951,6 +3967,8 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 if (have_footer) zgec_footer_free(&footer);
                 return ZGEC_ERR_LITREF_EXPORT; /* V9 gating */
             }
+            uint8_t stack_lits[8192];
+            int lits_owned = 0;
             if (D > 0) {
                 size_t need = 0;
                 uint8_t k8;
@@ -3971,11 +3989,16 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 }
                 if (need > 0) {
                     size_t pp = 0;
-                    lits = (uint8_t *)zgec_alloc(need, 64);
-                    if (!lits) {
-                        zgec_free(out);
-                        if (have_footer) zgec_footer_free(&footer);
-                        return ZGEC_ERR_NOMEM;
+                    if (need <= sizeof(stack_lits)) {
+                        lits = stack_lits;
+                    } else {
+                        lits = (uint8_t *)zgec_alloc(need, 64);
+                        if (!lits) {
+                            zgec_free(out);
+                            if (have_footer) zgec_footer_free(&footer);
+                            return ZGEC_ERR_NOMEM;
+                        }
+                        lits_owned = 1;
                     }
                     for (k8 = 0; k8 < D; k8++) {
                         unsigned slot =
@@ -3995,7 +4018,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 err = fetch_dict(d, &fh, &footer, have_footer, rh.dict_id,
                                  src, src_size, &dict);
                 if (err != ZGEC_OK) {
-                    zgec_free(lits);
+                    if (lits_owned) zgec_free(lits);
                     zgec_free(out);
                     if (have_footer) zgec_footer_free(&footer);
                     return err; /* V9 */
@@ -4003,7 +4026,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
             }
             if ((fh.flags & ZGEC_FLAG_BLOCK_CHECKSUMS) != 0 &&
                 (rh.rflags & ZGEC_RFLAG_HAS_CHECKSUM) == 0) {
-                zgec_free(lits);
+                if (lits_owned) zgec_free(lits);
                 zgec_free(out);
                 if (have_footer) zgec_footer_free(&footer);
                 return ZGEC_ERR_CHECKSUM; /* V10 */
@@ -4019,7 +4042,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                     if (D != 0 ||
                         (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0 ||
                         cpsz < 2u) {
-                        zgec_free(lits);
+                        if (lits_owned) zgec_free(lits);
                         zgec_free(out);
                         if (have_footer) zgec_footer_free(&footer);
                         return ZGEC_ERR_RESERVED; /* V11 */
@@ -4028,7 +4051,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                     fparam = (int)payload[1];
                     if (zgec_filter_validate((unsigned)fmode,
                                              (unsigned)fparam) != ZGEC_OK) {
-                        zgec_free(lits);
+                        if (lits_owned) zgec_free(lits);
                         zgec_free(out);
                         if (have_footer) zgec_footer_free(&footer);
                         return ZGEC_ERR_RESERVED; /* V11 */
@@ -4043,7 +4066,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                     (rh.rflags & ZGEC_RFLAG_HAS_CHECKSUM) != 0,
                     &exp_ok, fmode, fparam);
             }
-            zgec_free(lits);
+            if (lits_owned) zgec_free(lits);
             if (err != ZGEC_OK) {
                 zgec_free(out);
                 if (have_footer) zgec_footer_free(&footer);

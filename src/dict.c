@@ -1038,25 +1038,34 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
         (size_t)segment_count > (comp_size - params_len) / 8u)
         return ZGEC_ERR_TRUNCATED;
 
-    zgec_seg_dir_entry *dir = (zgec_seg_dir_entry *)zgec_alloc(
-        (size_t)segment_count * sizeof(*dir), _Alignof(zgec_seg_dir_entry));
-    if (!dir) return ZGEC_ERR_NOMEM;
+    zgec_seg_dir_entry stack_dir[64];
+    zgec_seg_dir_entry *dir = NULL;
+    int dir_owned = 0;
+
+    if (segment_count <= 64) {
+        dir = stack_dir;
+    } else {
+        dir = (zgec_seg_dir_entry *)zgec_alloc(
+            (size_t)segment_count * sizeof(*dir), _Alignof(zgec_seg_dir_entry));
+        if (!dir) return ZGEC_ERR_NOMEM;
+        dir_owned = 1;
+    }
     zgec_err err = zgec_seg_dir_parse(dir, segment_count, comp + params_len, comp_size - params_len);
-    if (err != ZGEC_OK) { zgec_free(dir); return err; }
+    if (err != ZGEC_OK) { if (dir_owned) zgec_free(dir); return err; }
 
     zgec_dict *d = (zgec_dict *)zgec_alloc(sizeof(*d), _Alignof(zgec_dict));
-    if (!d) { zgec_free(dir); return ZGEC_ERR_NOMEM; }
+    if (!d) { if (dir_owned) zgec_free(dir); return ZGEC_ERR_NOMEM; }
     memset(d, 0, sizeof(*d));
     if (raw_size == 0) {
         d->data = (uint8_t *)zgec_alloc(ZGEC_OUTPUT_SLACK, 64);
-        if (!d->data) { zgec_free(dir); zgec_free(d); return ZGEC_ERR_NOMEM; }
+        if (!d->data) { if (dir_owned) zgec_free(dir); zgec_free(d); return ZGEC_ERR_NOMEM; }
         d->raw_size = 0;
-        zgec_free(dir);
+        if (dir_owned) zgec_free(dir);
         *out = d;
         return ZGEC_OK;
     }
     d->data = (uint8_t *)zgec_alloc((size_t)raw_size + ZGEC_OUTPUT_SLACK, 64);
-    if (!d->data) { zgec_free(dir); zgec_free(d); return ZGEC_ERR_NOMEM; }
+    if (!d->data) { if (dir_owned) zgec_free(dir); zgec_free(d); return ZGEC_ERR_NOMEM; }
     d->raw_size = raw_size;
 
     size_t seg_offset = params_len + (size_t)segment_count * 8;
@@ -1067,7 +1076,8 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
         if (dir[i].comp_len == 0 || seg_offset > comp_size ||
             (size_t)dir[i].comp_len > comp_size - seg_offset) {
             zgec_dict_prev_free(&prev);
-            zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_SEGMENT_SIZE;
+            if (dir_owned) zgec_free(dir);
+            zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_SEGMENT_SIZE;
         }
         zgec_dict_seg seg;
         memset(&seg, 0, sizeof(seg));
@@ -1075,31 +1085,33 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
          * inner record; repeats never cross a record boundary. */
         err = zgec_dict_decode_segment(&seg, comp + seg_offset, dir[i].comp_len,
                                        &bp, &prev, (i == 0) ? 1 : 0);
-        if (err != ZGEC_OK) { zgec_dict_prev_free(&prev); zgec_free(dir); zgec_dict_free(d); zgec_free(d); return err; }
+        if (err != ZGEC_OK) { zgec_dict_prev_free(&prev); if (dir_owned) zgec_free(dir); zgec_dict_free(d); zgec_free(d); return err; }
         if (dir[i].raw_len != seg.raw_len) {
             zgec_dict_seg_release(&seg);
             zgec_dict_prev_free(&prev);
-            zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_RAW_LEN;
+            if (dir_owned) zgec_free(dir);
+            zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_RAW_LEN;
         }
         if ((uint64_t)out_pos + seg.raw_len > raw_size) {
             zgec_dict_seg_release(&seg);
             zgec_dict_prev_free(&prev);
-            zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_DICT_SIZE;
+            if (dir_owned) zgec_free(dir);
+            zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_DICT_SIZE;
         }
         const uint8_t *lit_cur = seg.lit;
         for (size_t j = 0; j < seg.n_seq; j++) {
             uint32_t ll = seg.ll[j];
             uint32_t ml = seg.ml[j];
             uint32_t off = seg.of[j];
-            if (ml < 3) { zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_MATCH_LENGTH; }
+            if (ml < 3) { zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); if (dir_owned) zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_MATCH_LENGTH; }
             if (off == 0 || off > out_pos) {
                 if (!(out_pos == 0 && ll == 0)) {
-                    zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_OFFSET;
+                    zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); if (dir_owned) zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_OFFSET;
                 }
             }
             if (ll > 0) {
                 if ((uint64_t)(lit_cur - seg.lit) + ll > seg.n_lit) {
-                    zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_LL_SUM;
+                    zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); if (dir_owned) zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_LL_SUM;
                 }
                 zgec_dict_store_literals(d->data, out_pos, lit_cur, ll,
                                          seg.lit_form, seg.rep0_before[j]);
@@ -1108,7 +1120,7 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
             out_pos += ll;
             if (ml > 0) {
                 if (off == 0 || off > out_pos) {
-                    zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_OFFSET;
+                    zgec_dict_seg_release(&seg); zgec_dict_prev_free(&prev); if (dir_owned) zgec_free(dir); zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_OFFSET;
                 }
                 zgec_dict_copy_match(d->data + out_pos, off, ml);
             }
@@ -1131,7 +1143,7 @@ static zgec_err zgec_dict_inner_compressed(zgec_dict **out,
         seg_offset += dir[i].comp_len;
     }
     zgec_dict_prev_free(&prev);
-    zgec_free(dir);
+    if (dir_owned) zgec_free(dir);
     if (out_pos != raw_size) { zgec_dict_free(d); zgec_free(d); return ZGEC_ERR_DICT_SIZE; }
     *out = d;
     return ZGEC_OK;
