@@ -370,13 +370,15 @@ static int mf_classify_binary(const uint8_t *vb, size_t vb_size)
  * entry is the empty sentinel. Positions at or above
  * 2^24 - 1 cannot be packed distinctly and are
  * rejected by the caller. */
-static uint32_t mf_pack(uint32_t pos, uint32_t tag)
+static inline __attribute__((always_inline))
+uint32_t mf_pack(uint32_t pos, uint32_t tag)
 {
     return ((pos + 1u) & ZGEC_MF_POS_MASK) | ((tag & ZGEC_MF_TAG_MASK) << ZGEC_MF_TAG_SHIFT);
 }
 
 /* Unpack the position from a non-empty entry. */
-static uint32_t mf_pos(uint32_t entry)
+static inline __attribute__((always_inline))
+uint32_t mf_pos(uint32_t entry)
 {
     return (entry & ZGEC_MF_POS_MASK) - 1u;
 }
@@ -384,7 +386,8 @@ static uint32_t mf_pos(uint32_t entry)
 
 /* Issue the hint a step ahead of the lookup, so the write-allocate fetch
  * overlaps the position's own work (section 11.3 step 1). */
-static void mf_prefetch_bucket(const void *line)
+static inline __attribute__((always_inline))
+void mf_prefetch_bucket(const void *line)
 {
     __builtin_prefetch(line, 0, 3);
 }
@@ -392,7 +395,8 @@ static void mf_prefetch_bucket(const void *line)
 /* Insert pos into the short bucket. The lanes are a ring: the next
  * write slot is short_head[bucket], so an insert is two stores rather
  * than an nlanes-wide shift. Lookup walks the ring newest first. */
-static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
+static inline __attribute__((always_inline))
+void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
     uint32_t *b = &m->short_tab[(size_t)bucket << m->nlanes_shift];
     uint32_t h = (uint32_t)m->short_head[bucket];
@@ -406,12 +410,14 @@ static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 
 /* Insert pos into the long table: one entry per
  * bucket, newest overwrites. */
-static void mf_insert_long(zgec_matcher *m, uint32_t bucket, uint32_t entry)
+static inline __attribute__((always_inline))
+void mf_insert_long(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
     m->long_tab[(size_t)bucket] = entry;
 }
 
-static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int long_ok)
+static inline __attribute__((always_inline))
+void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int long_ok)
 {
     uint32_t h;
     uint32_t bucket;
@@ -601,7 +607,8 @@ uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
  * `newest` is the newest-lane index ((head - 1) & (nlanes - 1)): both
  * only gate work, the accessed range stays b[0 .. nlanes) and the hit
  * semantics are unchanged. */
-static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
+static inline __attribute__((always_inline))
+uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
                                uint32_t want, uint32_t newest)
 {
     uint32_t e0;
@@ -673,7 +680,8 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
  * best->offset only changes on an assignment, so updating the flag
  * there yields the same value re-deriving it would while making each
  * candidate three compares cheaper. */
-static inline void mf_update_best(uint32_t d, uint32_t len, zgec_match *best,
+static inline __attribute__((always_inline))
+void mf_update_best(uint32_t d, uint32_t len, zgec_match *best,
                                   uint32_t rep0, uint32_t rep1, uint32_t rep2,
                                   int *best_is_rep)
 {
@@ -1440,17 +1448,22 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
          * faster than the fully dense walk for +0.22% of corpus size. The
          * earlier first/last-only long-table writes are gone with it: they
          * left the long table starved near a match's tail. */
-        if (len <= (size_t)ZGEC_MF_MATCH_DENSE || nsamp > len) {
-            nsamp = len;
-        }
-        if (nsamp < 1u) nsamp = 1u;
-        /* Sample offsets are floor((len-1) * t / (nsamp-1)), the same grid
-         * the old per-sample 64-bit division produced. The stride is
-         * carried as a quotient and a remainder (the classic exact
-         * rational walk) so the loop contains no division at all:
-         * nsamp-1 > 0 whenever nsamp > 1, and when nsamp == 1 the single
-         * sample is at offset 0 either way. */
-        {
+        if (len <= (size_t)ZGEC_MF_MATCH_DENSE) {
+            size_t end_pos = start + len;
+            for (size_t pos = start; pos < end_pos; pos++) {
+                if (pos < m->vb_size && need <= m->vb_size - pos) {
+                    mf_insert_pos(m, vb, pos, 1);
+                }
+            }
+        } else {
+            /* Sample offsets are floor((len-1) * t / (nsamp-1)), the same grid
+             * the old per-sample 64-bit division produced. The stride is
+             * carried as a quotient and a remainder (the classic exact
+             * rational walk) so the loop contains no division at all:
+             * nsamp-1 > 0 whenever nsamp > 1, and when nsamp == 1 the single
+             * sample is at offset 0 either way. */
+            if (nsamp > len) nsamp = len;
+            if (nsamp < 1u) nsamp = 1u;
             size_t num = (len > 1u) ? (len - 1u) : 0u;
             size_t den = (nsamp > 1u) ? (nsamp - 1u) : 1u;
             size_t q = num / den;

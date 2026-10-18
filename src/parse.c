@@ -283,7 +283,8 @@ static uint32_t parse_offbase(uint32_t off, const zgec_reps *reps)
  * entries of a cost table on every accepted sequence cost three
  * 66-iteration log loops to move two numbers -- one histogram bin and
  * one total -- so the tables are updated at those two points instead. */
-static inline float parse_ll_cost(uint32_t ll, float l2tot0, const float *ll_base)
+static inline __attribute__((always_inline))
+float parse_ll_cost(uint32_t ll, float l2tot0, const float *ll_base)
 {
     uint8_t nb_ll = 0;
     uint8_t c_ll = zgec_seq_code_of(ll, &nb_ll);
@@ -294,7 +295,8 @@ static inline float parse_ll_cost(uint32_t ll, float l2tot0, const float *ll_bas
  * score = len * Lbar - cost(LL, ML, OF) * lscale.
  * Positive means the match saves bits over coding its len bytes as
  * literals. */
-static inline float parse_score_fast(uint32_t len, float ll_cost, uint32_t offbase,
+static inline __attribute__((always_inline))
+float parse_score_fast(uint32_t len, float ll_cost, uint32_t offbase,
                                      const float *l2tot,
                                      const float *ml_base, const float *of_base,
                                      float lbar, float lscale)
@@ -314,7 +316,8 @@ static inline float parse_score_fast(uint32_t len, float ll_cost, uint32_t offba
     return (float)len * lbar - cost * lscale;
 }
 
-static inline float parse_score_rep_fast(uint32_t len, float ll_cost, unsigned ri,
+static inline __attribute__((always_inline))
+float parse_score_rep_fast(uint32_t len, float ll_cost, unsigned ri,
                                          const float *l2tot,
                                          const float *ml_base, const float *of_base,
                                          float lbar, float lscale)
