@@ -1180,13 +1180,18 @@ zgec_err zgec_fse_symbol_extra(unsigned sym, uint32_t value,
 static inline ZGEC_FSE_BW_INLINE
 void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
                              uint8_t **bw_ptr, const uint8_t *bw_end,
-                             int *overflow, uint32_t val, unsigned n)
+                             int *overflow, uint64_t val, unsigned n)
 {
     if (n == 0) return;
     uint64_t mask = (n == 32u) ? 0xFFFFFFFFu : ((1ull << n) - 1ull);
-    *bw_acc |= (uint64_t)(val & mask) << *bw_nacc;
+    *bw_acc |= (val & mask) << *bw_nacc;
     *bw_nacc += n;
-    if (*bw_nacc >= 32u) {
+    /* n can exceed 32 when a caller fuses a transition field with its
+     * extra bits into one write, so more than one 32-bit word may be
+     * complete. Draining all of them here is bit-identical to draining
+     * one per write: the emitted byte sequence depends only on the order
+     * the bits were accumulated. */
+    while (*bw_nacc >= 32u) {
         if (*bw_ptr + 4 > bw_end) {
             *overflow = 1;
             return;
@@ -1245,6 +1250,8 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             uint32_t bits;
             uint32_t val = values[i - 1];
             unsigned nb = (unsigned)nbits[s];
+            uint64_t comb;
+            unsigned cn;
 
             if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
             row = t->e + ((size_t)s << t->al);
@@ -1254,14 +1261,24 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
 
-            zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, bits, (unsigned)entry.nb_bits);
+            /* The transition field and the value's extra bits are
+             * adjacent in the bitstream, so one accumulate-and-flush of
+             * the concatenation is bit-identical to writing them
+             * separately: the byte order is fixed by the accumulation
+             * order, not by where the flushes land. Halving the number of
+             * write sites is the point -- this loop is throughput-bound. */
+            comb = (uint64_t)bits;
+            cn = (unsigned)entry.nb_bits;
             if (nb > 0u) {
                 uint32_t lo = base[s];
+                uint32_t extra;
                 if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
-                uint32_t extra = val - lo;
+                extra = val - lo;
                 if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-                zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, extra, nb);
+                comb |= (uint64_t)extra << cn;
+                cn += nb;
             }
+            zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, comb, cn);
             if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
             state = entry.new_state;
         }

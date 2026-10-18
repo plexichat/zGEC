@@ -2355,9 +2355,11 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
         } else {
             int16_t c[ZGEC_NSYM_SEQ];
             size_t nw;
-            err = zgec_seq_build_tables(&dec_ml, &enc_ml, hist_ml, 10);
+            /* _counts variant: the normalised counts are the ones the table
+             * was built from, so the descriptor cannot diverge from it and
+             * the histogram is normalised once instead of twice. */
+            err = zgec_seq_build_tables_counts(&dec_ml, &enc_ml, hist_ml, 10, c);
             if (err != ZGEC_OK) goto seg_fail_tables;
-            (void)zgec_normalize_counts(c, hist_ml, 66, 10);
             nw = zgec_fse_write_counts(desc + desc_size,
                                        sizeof(desc) - desc_size, c, 66, 10);
             if (nw == 0) {
@@ -2386,10 +2388,9 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
             for (c2 = 0; c2 < 3; c2++) {
                 int16_t cc[ZGEC_NSYM_SEQ];
                 size_t nw;
-                err = zgec_seq_build_tables(&dec_of3[c2], &enc_of3[c2],
-                                            hc[c2], 10);
+                err = zgec_seq_build_tables_counts(&dec_of3[c2], &enc_of3[c2],
+                                                   hc[c2], 10, cc);
                 if (err != ZGEC_OK) goto seg_fail_tables;
-                (void)zgec_normalize_counts(cc, hc[c2], 66, 10);
                 nw = zgec_fse_write_counts(desc + desc_size,
                                            sizeof(desc) - desc_size, cc, 66, 10);
                 if (nw == 0) {
@@ -2401,9 +2402,9 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
         } else {
             int16_t c[ZGEC_NSYM_SEQ];
             size_t nw;
-            err = zgec_seq_build_tables(&dec_of, &enc_of, hist_of, 10);
+            /* _counts variant: see the ML branch above. */
+            err = zgec_seq_build_tables_counts(&dec_of, &enc_of, hist_of, 10, c);
             if (err != ZGEC_OK) goto seg_fail_tables;
-            (void)zgec_normalize_counts(c, hist_of, 66, 10);
             nw = zgec_fse_write_counts(desc + desc_size,
                                        sizeof(desc) - desc_size, c, 66, 10);
             if (nw == 0) {
