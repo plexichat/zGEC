@@ -328,6 +328,12 @@ static zgec_err zgec_payload_grow(uint8_t **buf, size_t *cap, size_t used, size_
 /* Histogram normalisation lives in seq.c (zgec_normalize_counts,
  * see zgec_internal.h); the former byte-identical copy here was removed. */
 
+static inline double zgec_clogc_val(uint32_t c)
+{
+    if (c < 2u) return 0.0;
+    return (double)c * zgec_fast_log2_u32(c);
+}
+
 /* Shannon entropy estimate in bits of a histogram. P4: callers that
  * already know the symbol total pass it so the accumulation loop over
  * nsym entries is skipped; pass ZGEC_ENC_TOTAL_UNKNOWN to accumulate.
@@ -365,14 +371,14 @@ static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym,
     if (total == 0) return 0.0;
     {
         double tlog = zgec_fast_log2_u64(total);
-        double bits = 0.0;
+        double sum_clogc = 0.0;
         for (int s = 0; s < nsym; s++) {
-            if (hist[s] > 0) {
-                bits += (double)(uint64_t)hist[s] *
-                        (tlog - zgec_fast_log2_u64((uint64_t)hist[s]));
+            uint32_t c = hist[s];
+            if (c > 0) {
+                sum_clogc += zgec_clogc_val(c);
             }
         }
-        return bits;
+        return (double)total * tlog - sum_clogc;
     }
 }
 
@@ -1398,8 +1404,8 @@ static double zgec_seq_coded_bits_desc(const uint32_t *hist,
         int c;
         if (hist[s] == 0) continue;
         c = (counts[s] < 0) ? 1 : (int)counts[s];
-        bits += (double)(uint64_t)hist[s] *
-                (10.0 - zgec_fast_log2_u64((uint64_t)(uint32_t)c));
+        bits += (double)hist[s] *
+                (10.0 - zgec_fast_log2_u32((uint32_t)c));
     }
     nw = zgec_fse_write_counts(tmp, sizeof(tmp), counts, ZGEC_NSYM_SEQ, 10);
     if (desc_bytes_out) *desc_bytes_out = nw;
