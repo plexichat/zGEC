@@ -37,11 +37,14 @@ zgec: level 6, 12582912 -> 4210812 bytes (2.9884x)  210.5 ms  57.0 MiB/s
 A level is a preset; any explicit flag overrides its column. Every preset
 uses `--block-log2 21` (2 MiB blocks) and `lambda 0`.
 
-Slots 1-3 and 11 are reserved and rejected with `level N is not implemented`; the implemented ladder is 4-10 and 12-25.
+Slots 4-10 and 12-25 are the implemented ratio ladder; slot 11 is reserved and rejected with `level N is not implemented`. Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and largest, and each step up trades the parser's speed dials back toward the pinned parser that level 4 uses (smaller hash tables, and at level 1 no repeat-offset or short-table probes). They are byte-stream compatible with level 4 but compress less.
 Levels 13-14 add epoch dictionaries and pre-filtering; levels 15-25 progressively increase block window sizes up to 16 MiB (`block-log2` 24) for maximum compression ratio.
 
 | level | tier | contexts | sub-lit | conditioning | litref | dicts | filter | checksums | block_log2 |
 |------:|------|----------|---------|--------------|--------|-------|--------|-----------|------------|
+| 1 | fast | - | - | - | - | - | - | - | 21 (2 MiB) |
+| 2 | fast | - | - | - | - | - | - | - | 21 (2 MiB) |
+| 3 | fast | - | - | - | - | - | - | - | 21 (2 MiB) |
 | 4 | fast | - | - | - | - | - | - | - | 21 (2 MiB) |
 | 5 | fast | x | - | - | - | - | - | - | 21 (2 MiB) |
 | 6 | fast | x | x | - | - | - | - | - | 21 (2 MiB) |
@@ -57,7 +60,8 @@ Levels 13-14 add epoch dictionaries and pre-filtering; levels 15-25 progressivel
 | 19..25 | high | x | x | x | x | x | x | x | 24 (16 MiB) |
 
 ```sh
-zgec c -l 4 big.log big.zgec      # fastest implemented
+zgec c -l 1 big.log big.zgec      # fastest implemented
+zgec c -l 4 big.log big.zgec      # fast tier, pinned parser
 zgec c -l 25 src.tar src.tar.zgec # maximum ratio level
 ```
 

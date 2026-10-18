@@ -246,3 +246,37 @@ Stack-allocate small scratch buffers in hot entropy coders, track monotonically 
 
 **Action:**
 Always expose classification LUTs in public internal headers to allow direct array indexing in entropy context selection loops.
+
+## 2026-10-18 - Fast-Tier Speed Ladder: Runtime Parser Dial (Levels 1-3)
+
+**Context:** The fast parser was the encode bottleneck (58% of level 4 encode:
+2.44 s of a 2.33 s run on the 211.9 MB reference corpus, ~6.7 ns/byte). Shedding
+its optional passes at compile time was not where its time goes; the cost is the
+mandatory per-position body (two hashes, two table loads, two table stores, three
+repeat-offset probes) and the working set is latency-bound on the two hash tables.
+
+**Learning:**
+1. The two compile-time levers that actually move throughput are the table size
+   (`ZGEC_FAST_BITS_SHIFT`): one bucket per 16 positions (2^15 buckets, 128 KiB
+   per table, fits L2) gave -17% encode for +4.5% size; and dropping the
+   per-position passes (repeat-offset probes, short table) gave -21% for +14%.
+   Optional-pass shedding measured -6.8%/+1.7% (reps only) and -12%/+8.5%
+   (short table only) - the short table carries most of the ratio.
+2. A runtime dial reproduces the compile-time envelopes exactly with no measured
+   cost to the pinned levels: interleaved A/B (min of 9) put level 4 at -0.7% and
+   level 6 at -0.3% versus the pinned binary - the loop-invariant branches the
+   dial adds are fully predicted.
+3. Surfacing the dial required no public-API break: `zgec_parse_block_ex` stays
+   the byte-identical entry (it now wraps a new `zgec_parse_block_dial` with
+   dial 0), and `zgec_params.fast_dial` threads the value from the CLI preset.
+
+**Measurement (reference corpus, 211,938,580 B, -T 1, min of 4):**
+`l1 79,091,618 / 1,629 ms` `l2 68,006,258 / 1,990 ms` `l3 66,061,264 / 2,100 ms`
+`l4 65,059,955 / 2,306 ms`. All pinned rungs 4-10 unchanged; level 7 SHA-256
+unchanged.
+
+**Action:** New fast levels 1-3 set `zgec_params.fast_dial` (1..3) through
+`zgec_parse_block_dial`: dial 1 shrinks the fast hash tables, 2 shrinks them
+further, 3 also drops the repeat-offset and short-table probes. Never set by the
+pinned levels. A from-scratch single-table parser remains the only path to close
+the remaining gap to zstd's fast tier.

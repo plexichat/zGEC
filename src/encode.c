@@ -220,6 +220,7 @@ void zgec_params_default(zgec_params *p)
     p->use_conditioning = 0;
     p->block_checksums = 0;
     p->lambda = 0.0;
+    p->fast_dial = 0;
 }
 
 /* ---- encoder state ---- */
@@ -3074,11 +3075,11 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
      * block references neither (7.5 permits a dictionary but this
      * encoder does not combine one with the filter, and V11 forbids
      * FILTERED together with literal references). */
-    err = zgec_parse_block_ex(&parse, parse_src, raw_size, parse_dict,
+    err = zgec_parse_block_dial(&parse, parse_src, raw_size, parse_dict,
                               parse_dict_size,
                               filtered ? NULL : litref,
                               filtered ? 0 : litref_size,
-                              params.tier, params.lambda);
+                              params.tier, params.lambda, params.fast_dial);
     zgec_free(filt); /* parse copied the literals it needs */
     filt = NULL;
     if (err != ZGEC_OK) return err;

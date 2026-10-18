@@ -216,8 +216,10 @@ static void cli_usage(FILE *f, const char *argv0)
         "\n"
         "options:\n"
         "  -l, --level N       1 (fastest) .. 25 (best ratio); default 6.\n"
-        "                      Levels 4-10 and 12-25 are implemented; 1-3 and\n"
-        "                      11 are reserved and rejected.\n"
+        "                      Levels 1-10 and 12-25 are implemented; 11 is\n"
+        "                      reserved. Rungs 1-3 are the fast tier's speed\n"
+        "                      ladder (1 fastest and largest, each step below\n"
+        "                      level 4 adds a cheaper parser core).\n"
         "  -T, --threads N     worker threads (0 = one per core); default 0\n"
         "      --tier T        match finder tier: fast, main, high\n"
         "      --block-log2 N  block size log2, 16..26 (default: the level\n"
@@ -302,8 +304,8 @@ typedef struct {
  * stay available as flags for the input where they do pay (binary, columnar
  * and heterogeneous data), and a caller that wants a dictionary prefix on a
  * small block is the reason --block-log2 is still an option. */
-/* Level slots 1..25. Rungs 1-3 and 11 are reserved (impl == 0) and 13-25 are
- * not implemented yet; only 4-10 and 12 are usable today. The handful below
+/* Level slots 1..25. Rung 11 is reserved (impl == 0); rungs 1-3 are the
+ * fast tier's speed ladder. The handful below
  * carries the whole ladder: level 4 is the old level 1, and each implemented
  * level maps to the preset that used to sit one number lower, except that the
  * old levels 7 and 8 (which produced byte-identical output on the reference
@@ -326,9 +328,9 @@ typedef struct {
  * (fast+ctx+sub+cond, 63,055,806 B at 4.7 s) stays reachable as level 6
  * plus --conditioning. */
 static const cli_level cli_levels[CLI_LEVEL_MAX] = {
-    /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
-    /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
-    /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0 },
+    /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
+    /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
     /*  6 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 0, 0, 0, 0, 0, 21, 1 },
@@ -369,6 +371,10 @@ static void cli_apply_level(zgec_params *p, int level)
     p->use_dicts = l->dicts;
     p->use_filter = l->filter;
     p->block_checksums = l->ck;
+    /* Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and
+     * largest (dial 3), 2 and 3 step the parser back toward the pinned
+     * default (dial 0) that level 4 uses. See zgec_parse_block_dial. */
+    p->fast_dial = (level >= 1 && level <= 3) ? (4 - level) : 0;
 }
 
 static int cli_tier(const char *s, zgec_tier *out)
@@ -513,7 +519,7 @@ int main(int argc, char **argv)
                  * learns the number is valid and simply not built yet. */
                 if (!cli_levels[(int)num - 1].impl) {
                     fprintf(stderr, "zgec: level %ld is not implemented "
-                                    "(implemented levels: 4-10 and 12-25)\n",
+                                    "(implemented levels: 1-10 and 12-25)\n",
                             num);
                     return 1;
                 }

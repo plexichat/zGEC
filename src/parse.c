@@ -550,10 +550,10 @@ zgec_err zgec_parse_block(zgec_parse **out,
  * 0.9-1.6% for 3-11% (the two measured within noise of each other on the
  * source tree and only text separated them), and a 2^22 table gained 0.02%
  * of ratio and cost 27% of throughput. */
-static unsigned fast_table_bits(size_t positions)
+static unsigned fast_table_bits(size_t positions, unsigned extra_bits)
 {
     unsigned bits = ZGEC_FAST_SHORT_BITS;
-    size_t want = positions >> ZGEC_FAST_BITS_SHIFT;
+    size_t want = positions >> (ZGEC_FAST_BITS_SHIFT + extra_bits);
     if (ZGEC_FAST_LONG_BITS < (unsigned)bits) bits = ZGEC_FAST_LONG_BITS;
     while (bits > ZGEC_FAST_BITS_MIN && ((size_t)1u << bits) > want) bits--;
     return bits;
@@ -658,7 +658,8 @@ uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
     return (uint32_t)len;
 }
 
-static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size_t vb_size)
+static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size_t vb_size,
+                           int dial)
 {
     uint32_t *ts;
     uint32_t *tl;
@@ -669,7 +670,17 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     size_t end = vb_size;
     zgec_reps reps;
     size_t pos;
-    unsigned fbits = fast_table_bits(end - prefix);
+    /* Speed dial (fast_dial): 0 is the pinned default. 1..2 shrink the two
+     * hash tables (extra_bits doubles the bucket-per-position stride), which
+     * is the single biggest envelope win because the working set is
+     * table-latency bound; 3 additionally drops the repeat-offset probes and
+     * the short-table probe, the two optional per-position passes. Every
+     * rung trades ratio for throughput and is only ever set by the new fast
+     * levels 1-3. */
+    unsigned extra_bits = (dial >= 2) ? 4u : ((dial >= 1) ? 2u : 0u);
+    const int no_short = (dial >= 3);
+    const int no_reps  = (dial >= 3);
+    unsigned fbits = fast_table_bits(end - prefix, extra_bits);
     unsigned sshift = (unsigned)ZGEC_FAST_SHORT_BITS - fbits;
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
     uint32_t gen = 1u;      /* validity tag written into every entry */
@@ -762,7 +773,15 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             }
         }
 #endif
-        uint32_t cs = ts[hs];
+        uint32_t cs;
+        if (no_short) {
+            /* A dead tag no live entry can carry, so every short-table probe
+             * below short-circuits: fast_live(~0u, gen) is false for every
+             * gen. Output is exactly the long-table-only parse. */
+            cs = ~0u;
+        } else {
+            cs = ts[hs];
+        }
         size_t cap = end - ip;
         size_t step = ((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u;
 #if ZGEC_FAST_PIPE
@@ -789,6 +808,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
          * byte among the first four already means the match cannot reach the
          * 4-byte repeat minimum, so the length scan and the update branches
          * run only when the probe can actually win. Output is unchanged. */
+        if (!no_reps) {
         uint32_t r0 = reps.rep[0];
         uint32_t r1 = reps.rep[1];
         uint32_t r2 = reps.rep[2];
@@ -843,6 +863,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                     }
                 }
             }
+        }
         }
 
         /* 2 & 3. Table probes (short table cs and long table cl).
@@ -910,7 +931,9 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             }
         }
         /* Insert the visited position. */
-        ts[hs] = fast_pack(gen, ip);
+        if (!no_short) {
+            ts[hs] = fast_pack(gen, ip);
+        }
         tl[hl] = fast_pack(gen, ip);
 #if ZGEC_FAST_PIPE
         /* The lookahead read above may have taken this very bucket before the
@@ -1079,15 +1102,17 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
 }
 #endif /* ZGEC_FASTDFAST_OFF */
 
-zgec_err zgec_parse_block_ex(zgec_parse **out,
+zgec_err zgec_parse_block_dial(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
                           const uint8_t *dict, size_t dict_size,
                           const uint8_t *litref, size_t litref_size,
-                          zgec_tier tier, double lambda)
+                          zgec_tier tier, double lambda, int fast_dial)
 {
     if (!out) return ZGEC_ERR_INVAL;
     /* Never leave a stale pointer behind on the failure paths below. */
     *out = NULL;
+    if (fast_dial < 0) fast_dial = 0;
+    else if (fast_dial > 3) fast_dial = 3;
     if ((!src && raw_size > 0)) return ZGEC_ERR_INVAL;
     /* A size without a pointer would leave the [dict) region of the
      * virtual buffer below uninitialised and exposed to the matcher, so
@@ -1196,7 +1221,7 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
 
 #ifndef ZGEC_FASTDFAST_OFF
     if (tier == ZGEC_TIER_FAST) {
-        zgec_err fe = fast_parse(p, vb, prefix, vb_size);
+        zgec_err fe = fast_parse(p, vb, prefix, vb_size, fast_dial);
         zgec_free(vb);
         if (fe != ZGEC_OK) { zgec_parse_free(p); return fe; }
         *out = p;
@@ -1558,4 +1583,17 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
 
     *out = p;
     return ZGEC_OK;
+}
+
+/* Public form (section 6.1): the pinned fast parser, byte-identical to every
+ * level the ladder shipped with. New levels 1-3 call zgec_parse_block_dial
+ * with a non-zero dial instead. */
+zgec_err zgec_parse_block_ex(zgec_parse **out,
+                          const uint8_t *src, size_t raw_size,
+                          const uint8_t *dict, size_t dict_size,
+                          const uint8_t *litref, size_t litref_size,
+                          zgec_tier tier, double lambda)
+{
+    return zgec_parse_block_dial(out, src, raw_size, dict, dict_size,
+                                 litref, litref_size, tier, lambda, 0);
 }

@@ -43,6 +43,12 @@ typedef struct {
     int          use_filter;       /* 0 = never, 1 = sampled block pre-filter */
     int          block_checksums;  /* 0 = off, 1 = on */
     double       lambda;         /* speed/ratio dial (section 11.7) */
+    int          fast_dial;      /* fast-tier parser speed dial (0..3). 0 is
+                                  * the byte-identical default every pinned
+                                  * level uses; 1..3 shrink the fast-tier hash
+                                  * tables and, at 3, drop the repeat-offset
+                                  * and short-table probes. Only new levels
+                                  * 1-3 set it. */
 } zgec_params;
 
 /* Default parameters. */
