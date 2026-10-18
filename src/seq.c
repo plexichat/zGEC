@@ -33,7 +33,7 @@ const uint8_t zgec_seq_nbits[ZGEC_NSYM_SEQ] = {
     [64] = 30, [65] = 30
 };
 
-const uint16_t zgec_seq_lut512[512] = {
+const uint16_t zgec_seq_lut512[513] = {
     0x0000, 0x0100, 0x0200, 0x0300, 0x0400, 0x0500, 0x0600, 0x0700,
     0x0802, 0x0802, 0x0802, 0x0802, 0x0902, 0x0902, 0x0902, 0x0902,
     0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03,
@@ -98,6 +98,7 @@ const uint16_t zgec_seq_lut512[512] = {
     0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307,
     0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307,
     0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307,
+    0x1307
 };
 
 /* ---- stream decode (tANS section 8.4, RLE section 8.5) ---- */
@@ -227,14 +228,11 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
     while (i + 8 <= n) {
         __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
         if (_mm256_testz_si256(vv, vmask)) {
-            syms[i + 0] = (uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8);
-            syms[i + 1] = (uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8);
-            syms[i + 2] = (uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8);
-            syms[i + 3] = (uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8);
-            syms[i + 4] = (uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8);
-            syms[i + 5] = (uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8);
-            syms[i + 6] = (uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8);
-            syms[i + 7] = (uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8);
+            __m256i vg = _mm256_i32gather_epi32((const int *)(const void *)zgec_seq_lut512, vv, 2);
+            __m256i vs = _mm256_and_si256(_mm256_srli_epi32(vg, 8), _mm256_set1_epi32(0xFF));
+            __m128i v16 = _mm_packus_epi32(_mm256_castsi256_si128(vs), _mm256_extracti128_si256(vs, 1));
+            __m128i v8 = _mm_packus_epi16(v16, v16);
+            *(uint64_t *)(void *)(syms + i) = (uint64_t)_mm_cvtsi128_si64(v8);
         } else {
             for (size_t k = 0; k < 8; k++) {
                 uint8_t nb_dummy;
@@ -270,7 +268,7 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
                                    const uint32_t *base,
                                    const uint8_t *nbits)
 {
-    size_t i;
+    size_t i = 0;
     int al;
     unsigned S;
     int nsym;
@@ -314,17 +312,45 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         if (!syms) return 0;
         syms_allocated = 1;
     }
-    for (i = 0; i < n; i++) {
+#if defined(__AVX2__)
+    __m256i vmask = _mm256_set1_epi32((int)~511u);
+    while (i + 8 <= n) {
+        __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
+        if (_mm256_testz_si256(vv, vmask)) {
+            __m256i vg = _mm256_i32gather_epi32((const int *)(const void *)zgec_seq_lut512, vv, 2);
+            __m256i vs = _mm256_and_si256(_mm256_srli_epi32(vg, 8), _mm256_set1_epi32(0xFF));
+            __m128i v16 = _mm_packus_epi32(_mm256_castsi256_si128(vs), _mm256_extracti128_si256(vs, 1));
+            __m128i v8 = _mm_packus_epi16(v16, v16);
+            uint64_t pack8 = (uint64_t)_mm_cvtsi128_si64(v8);
+            *(uint64_t *)(void *)(syms + i) = pack8;
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t code = (uint8_t)(pack8 >> (k * 8));
+                uint32_t extra;
+                if ((int)code >= nsym || !zgec_seq_get_extra(values[i + k], code, base, nbits, &extra)) {
+                    if (syms_allocated) zgec_free(syms);
+                    return 0;
+                }
+            }
+        } else {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t nb;
+                uint8_t code = zgec_seq_code_of(values[i + k], &nb);
+                uint32_t extra;
+                if ((int)code >= nsym || !zgec_seq_get_extra(values[i + k], code, base, nbits, &extra)) {
+                    if (syms_allocated) zgec_free(syms);
+                    return 0;
+                }
+                syms[i + k] = code;
+            }
+        }
+        i += 8;
+    }
+#endif
+    for (; i < n; i++) {
         uint8_t nb;
         uint8_t code = zgec_seq_code_of(values[i], &nb);
         uint32_t extra;
         if ((int)code >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
-        /* Bound the value against its symbol's range here too, not only in
-           the write loop below: the range test can reject for a custom
-           base/nbits pair, and doing it here is what keeps the promise that
-           a failed encode leaves the bitstream untouched (finding 3). The
-           accepted set is identical to the loop's, so this rejects nothing
-           the loop would have accepted. */
         if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra)) {
             if (syms_allocated) zgec_free(syms);
             return 0;

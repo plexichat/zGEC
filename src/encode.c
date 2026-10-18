@@ -1510,24 +1510,41 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        size_t next_lane_idx = 0;
         int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
-        for (j = 0; j < n_z; j++) {
-            if (has_rs && zgec_rs_get(runstart, j)) {
-                rs_hist[z[j]]++;
+        if (!has_rs) {
+            size_t len[ZGEC_NLANES];
+            zgec_lit_lane_geom(NULL, len, n_z);
+            for (unsigned lane = 0; lane < ZGEC_NLANES; lane++) {
+                size_t l_start = start[lane];
+                size_t l_end = l_start + len[lane];
+                if (l_start >= l_end) continue;
+                rs_hist[z[l_start]]++;
                 rs_total++;
-                continue;
+                for (j = l_start + 1; j < l_end; j++) {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
-            if (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) {
-                while (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) next_lane_idx++;
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
-            }
-            {
-                unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                grp_total[grp]++;
+        } else {
+            size_t next_lane_idx = 0;
+            for (j = 0; j < n_z; j++) {
+                if (zgec_rs_get(runstart, j)) {
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    continue;
+                }
+                if (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) {
+                    while (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) next_lane_idx++;
+                    rs_hist[z[j]]++;
+                    rs_total++;
+                    continue;
+                }
+                {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
         }
     }
@@ -1735,13 +1752,35 @@ static zgec_err zgec_select_coder(const zgec_params *params,
         }
         {
             uint32_t rhist[ZGEC_NSYM_LIT];
-            size_t r;
+            size_t r = 0;
             double cyc =
                 slow_sublit ? ZGEC_ENC_CYC_SUBLIT_SLOW_PER_SYM
                             : (ZGEC_ENC_CYC_RANS_PER_SYM +
                                ZGEC_ENC_CYC_SUBLIT_FAST_PER_SYM);
             memset(rhist, 0, sizeof(rhist));
-            for (r = 0; r < n_lit_slice; r++) rhist[resid[r]]++;
+#if defined(__AVX2__)
+            if (n_lit_slice >= 32) {
+                uint32_t c0[ZGEC_NSYM_LIT] = {0};
+                uint32_t c1[ZGEC_NSYM_LIT] = {0};
+                uint32_t c2[ZGEC_NSYM_LIT] = {0};
+                uint32_t c3[ZGEC_NSYM_LIT] = {0};
+                for (; r + 4 <= n_lit_slice; r += 4) {
+                    c0[resid[r]]++;
+                    c1[resid[r + 1]]++;
+                    c2[resid[r + 2]]++;
+                    c3[resid[r + 3]]++;
+                }
+                for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+                    __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+                    __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+                    __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+                    __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+                    __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+                    _mm256_storeu_si256((__m256i *)(rhist + s), sum);
+                }
+            }
+#endif
+            for (; r < n_lit_slice; r++) rhist[resid[r]]++;
             /* NOTE (D9): raw residuals are never scored: bytewise they
              * are exactly n_lit_slice bytes like raw plain, with no
              * better model, so raw plain always ties-or-beats them. */

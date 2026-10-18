@@ -1309,51 +1309,40 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     }
 
     if (base != NULL && nbits != NULL) {
+        struct zgec_fse_base_info {
+            uint32_t base;
+            uint32_t nbits;
+        } binfo[256];
+        int max_s = (t->nsym < 256) ? t->nsym : 256;
+        for (int s = 0; s < max_s; s++) {
+            binfo[s].base = base[s];
+            binfo[s].nbits = nbits[s];
+        }
+
+        /* Pre-validate all symbols and table presence up-front */
+        for (size_t i = 0; i < n; i++) {
+            uint8_t s = syms[i];
+            if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
+            if ((t->e + ((size_t)s << t->al))[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
+        }
+
         for (size_t i = n - 1; i > 0; i--) {
             uint8_t s = syms[i - 1];
-            const zgec_fse_enc_entry *row;
-            zgec_fse_enc_entry entry;
-            uint32_t bits;
-            uint32_t val = values[i - 1];
-            unsigned nb = (unsigned)nbits[s];
-            uint64_t comb;
-            unsigned cn;
-            uint32_t lo;
-            uint32_t extra;
-            uint32_t mask;
-
-            if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-            row = t->e + ((size_t)s << t->al);
-            if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
-            entry = row[(size_t)state];
-            bits = (state >= (uint32_t)entry.baseline)
+            const zgec_fse_enc_entry *row = t->e + ((size_t)s << t->al);
+            zgec_fse_enc_entry entry = row[(size_t)state];
+            uint32_t bits = (state >= (uint32_t)entry.baseline)
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
-
-            /* The transition field and the value's extra bits are
-             * adjacent in the bitstream, so one accumulate-and-flush of
-             * the concatenation is bit-identical to writing them
-             * separately: the byte order is fixed by the accumulation
-             * order, not by where the flushes land. Halving the number of
-             * write sites is the point -- this loop is throughput-bound.
-             *
-             * The nb == 0 case is folded in rather than branched: a symbol
-             * with no extra bits stands for exactly base[s] and the code
-             * above derives s from val, so extra is 0 and the mask is 0,
-             * contributing nothing while still paying one branch per
-             * symbol (bit widths vary enough that the branch mispredicts).
-             * The two range checks below are unchanged for nb > 0; for
-             * nb == 0 they only reject a value that is not base[s], which
-             * the symbol derivation already rules out. */
-            comb = (uint64_t)bits;
-            cn = (unsigned)entry.nb_bits;
-            lo = base[s];
+            uint32_t val = values[i - 1];
+            uint32_t lo = binfo[s].base;
+            uint32_t nb = binfo[s].nbits;
             if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
-            extra = val - lo;
+            uint32_t extra = val - lo;
             if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-            mask = (nb >= 32u) ? 0xFFFFFFFFu : ((1u << nb) - 1u);
-            comb |= (uint64_t)(extra & mask) << cn;
-            cn += nb;
+            uint32_t mask = (nb >= 32u) ? 0xFFFFFFFFu : ((1u << nb) - 1u);
+            uint64_t comb = (uint64_t)bits | ((uint64_t)(extra & mask) << (unsigned)entry.nb_bits);
+            unsigned cn = (unsigned)entry.nb_bits + nb;
+
             zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, comb, cn);
             if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
             state = entry.new_state;
