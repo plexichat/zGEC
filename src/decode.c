@@ -1054,6 +1054,7 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
      * checks branch, never taken on a valid stream. nacc is at most 59
      * on entry and never exceeds 63 after, so `w >> nacc` never shifts
      * by 64. Hands over with reader state fully up to date. */
+    const zgec_fse_dec_entry *et[3] = { t[0]->e, t[1]->e, t[2]->e };
     while (i + 1 < n && left > 16u) {
         unsigned cls = clsbuf[i];
         const zgec_fse_dec_entry *en;
@@ -1066,11 +1067,9 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         unsigned nb;
         uint64_t w;
         if (cls > 2u) goto bad_internal;
-        en = &t[cls]->e[state];
-        if (en->symbol < 0 || en->symbol >= ZGEC_NSYM_SEQ) goto bad_symbol;
+        en = &et[cls][state];
         sym = (unsigned)en->symbol;
         xb = (unsigned)en->pad;
-        if (xb > 32u) goto bad_symbol;
         if (nacc < 56u) {
             nb = (63u - nacc) >> 3;
             w = zgec_rd64(ptr - 7);
@@ -1090,7 +1089,7 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         acc <<= nbq;
         nacc -= nbq;
         next = en->baseline + (int32_t)bits;
-        if (next < 0 || (unsigned)next >= S) goto bad_stream;
+        if ((unsigned)next >= S) goto bad_stream;
         state = (unsigned)next;
         i++;
     }
@@ -1134,13 +1133,6 @@ bad_internal:
     br.left = left;
     if (clsbuf_allocated) zgec_free(clsbuf);
     return ZGEC_ERR_INTERNAL;
-bad_symbol:
-    br.acc = acc;
-    br.nacc = nacc;
-    br.ptr = ptr;
-    br.left = left;
-    if (clsbuf_allocated) zgec_free(clsbuf);
-    return ZGEC_ERR_FSE_SYMBOL;
 bad_stream:
     br.acc = acc;
     br.nacc = nacc;
@@ -1868,63 +1860,69 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * before the match, so the byte-at-a-time order is
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
-                } else if (moff >= 8 && mlen <= 32 && raw_size > 64) {
-                    /* 1..32 bytes with off >= 8: four 8-byte chunks,
-                     * branch-free. Chunk k reads [d-off+8k, d-off+8k+8)
-                     * and writes [d+8k, d+8k+8): off >= 8 puts the source
-                     * before the destination of the same chunk, and the
-                     * bytes above d come from the earlier chunks, so the
-                     * result matches the byte-at-a-time order. Bytes past
-                     * the match end are written but never read: outside
-                     * the last-64 window every position below raw_size is
-                     * claimed and rewritten by a later sequence before
-                     * the buffer is read (the near-end guard above keeps
-                     * the last 64 exact, and raw_size > 64 is checked
-                     * here because that guard is what proves the slack). */
-                    zgec_wr64(d, zgec_rd64(msrc));
-                    zgec_wr64(d + 8, zgec_rd64(msrc + 8));
-                    zgec_wr64(d + 16, zgec_rd64(msrc + 16));
-                    zgec_wr64(d + 24, zgec_rd64(msrc + 24));
-                } else if (moff >= 32 && mlen >= 32) {
-                    exec_match_wide(d, msrc, mlen, 32);
-                } else if (moff >= 16 && mlen >= 16) {
-                    exec_match_wide(d, msrc, mlen, 16);
-                } else if (moff >= 8 && mlen > 8) {
-                    exec_match_wide(d, msrc, mlen, 8);
-                /* The periodic-offset replicators below are reachable
-                 * only for moff < 8 now (2/4); moff 8/16 fall through
-                 * to the wide copies above with identical output. */
-#if defined(__AVX2__)
-                } else if (moff == 2 && mlen >= 8) {
+                } else if (moff >= 8) {
+                    if (mlen <= 8) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                    } else if (mlen <= 16) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                        zgec_wr64(d + mlen - 8, zgec_rd64(msrc + mlen - 8));
+                    } else if (mlen <= 32) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                        zgec_wr64(d + 8, zgec_rd64(msrc + 8));
+                        zgec_wr64(d + 16, zgec_rd64(msrc + 16));
+                        zgec_wr64(d + mlen - 8, zgec_rd64(msrc + mlen - 8));
+                    } else if (moff >= 32) {
+                        exec_match_wide(d, msrc, mlen, 32);
+                    } else if (moff >= 16) {
+                        exec_match_wide(d, msrc, mlen, 16);
+                    } else {
+                        exec_match_wide(d, msrc, mlen, 8);
+                    }
+                } else if (moff >= 4) {
+                    if (mlen <= 4) {
+                        memcpy(d, msrc, 4);
+                    } else if (mlen <= 8) {
+                        memcpy(d, msrc, 4);
+                        memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                    } else {
+                        exec_match_wide(d, msrc, mlen, 4);
+                    }
+                } else if (moff == 2) {
                     uint16_t p16 = zgec_rd16(msrc);
-                    __m256i v256 = _mm256_set1_epi16((short)p16);
-                    size_t i = 0;
-                    while (i + 32 <= mlen) {
-                        _mm256_storeu_si256((__m256i *)(d + i), v256);
-                        i += 32;
-                    }
-                    while (i + 8 <= mlen) {
-                        zgec_wr64(d + i, (uint64_t)p16 * 0x0001000100010001ULL);
-                        i += 8;
-                    }
-                    for (; i < mlen; i++) d[i] = msrc[i % 2];
-                } else if (moff == 4 && mlen >= 8) {
-                    uint32_t p32 = zgec_rd32(msrc);
-                    __m256i v256 = _mm256_set1_epi32((int)p32);
-                    size_t i = 0;
-                    while (i + 32 <= mlen) {
-                        _mm256_storeu_si256((__m256i *)(d + i), v256);
-                        i += 32;
-                    }
-                    while (i + 8 <= mlen) {
-                        zgec_wr64(d + i, (uint64_t)p32 | ((uint64_t)p32 << 32));
-                        i += 8;
-                    }
-                    for (; i < mlen; i++) d[i] = msrc[i % 4];
+                    uint64_t v64 = (uint64_t)p16 * 0x0001000100010001ULL;
+                    if (mlen <= 8) {
+                        zgec_wr64(d, v64);
+                    } else {
+#if defined(__AVX2__)
+                        __m256i v256 = _mm256_set1_epi16((short)p16);
+                        size_t i = 0;
+                        while (i + 32 <= mlen) {
+                            _mm256_storeu_si256((__m256i *)(d + i), v256);
+                            i += 32;
+                        }
+                        while (i + 8 <= mlen) {
+                            zgec_wr64(d + i, v64);
+                            i += 8;
+                        }
+                        zgec_wr64(d + mlen - 8, v64);
+#else
+                        size_t i = 0;
+                        while (i + 8 <= mlen) {
+                            zgec_wr64(d + i, v64);
+                            i += 8;
+                        }
+                        zgec_wr64(d + mlen - 8, v64);
 #endif
-                } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
-                    memcpy(d, msrc, 4);
-                    memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                    }
+                } else if (moff == 3) {
+                    uint8_t s0 = msrc[0], s1 = msrc[1], s2 = msrc[2];
+                    for (k = 0; k + 3 <= mlen; k += 3) {
+                        d[k] = s0;
+                        d[k + 1] = s1;
+                        d[k + 2] = s2;
+                    }
+                    if (k < mlen) d[k] = s0;
+                    if (k + 1 < mlen) d[k + 1] = s1;
                 } else {
                     for (k = 0; k < mlen; k++) d[k] = msrc[k];
                 }

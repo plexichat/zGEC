@@ -262,20 +262,69 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
          * bounds (a round consumes at most 16), so the cursor bound test
          * and the clamped-load select of zgec_rans_renorm are dead here
          * and are dropped; the guarded loop below covers the tail. */
+        uint32_t x0 = state[0], x1 = state[1], x2 = state[2], x3 = state[3];
+        uint32_t x4 = state[4], x5 = state[5], x6 = state[6], x7 = state[7];
+        size_t s0 = start[0], s1 = start[1], s2 = start[2], s3 = start[3];
+        size_t s4 = start[4], s5 = start[5], s6 = start[6], s7 = start[7];
         for (; round < full && remaining > 15u; round++) {
-            for (unsigned lane = 0; lane < 8; lane++) {
-                size_t j = start[lane] + round;
-                uint32_t x = state[lane];
-                uint32_t e = packed0[x & (uint32_t)(ZGEC_RANS_M - 1)];
-                uint32_t f = (e >> 8) & 0xFFFu;
-                if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
-                Z[j] = (uint8_t)e;
-                x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
-                state[lane] = x;
-            }
-            if (err != ZGEC_OK) break;
+            uint32_t e0 = packed0[x0 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f0 = (e0 >> 8) & 0xFFFu;
+            if (f0 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s0 + round] = (uint8_t)e0;
+            x0 = f0 * (x0 >> ZGEC_RANS_L) + (e0 >> 20);
+            x0 = zgec_rans_renorm_unguarded(x0, &cursor, &remaining);
+
+            uint32_t e1 = packed0[x1 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f1 = (e1 >> 8) & 0xFFFu;
+            if (f1 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s1 + round] = (uint8_t)e1;
+            x1 = f1 * (x1 >> ZGEC_RANS_L) + (e1 >> 20);
+            x1 = zgec_rans_renorm_unguarded(x1, &cursor, &remaining);
+
+            uint32_t e2 = packed0[x2 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f2 = (e2 >> 8) & 0xFFFu;
+            if (f2 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s2 + round] = (uint8_t)e2;
+            x2 = f2 * (x2 >> ZGEC_RANS_L) + (e2 >> 20);
+            x2 = zgec_rans_renorm_unguarded(x2, &cursor, &remaining);
+
+            uint32_t e3 = packed0[x3 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f3 = (e3 >> 8) & 0xFFFu;
+            if (f3 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s3 + round] = (uint8_t)e3;
+            x3 = f3 * (x3 >> ZGEC_RANS_L) + (e3 >> 20);
+            x3 = zgec_rans_renorm_unguarded(x3, &cursor, &remaining);
+
+            uint32_t e4 = packed0[x4 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f4 = (e4 >> 8) & 0xFFFu;
+            if (f4 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s4 + round] = (uint8_t)e4;
+            x4 = f4 * (x4 >> ZGEC_RANS_L) + (e4 >> 20);
+            x4 = zgec_rans_renorm_unguarded(x4, &cursor, &remaining);
+
+            uint32_t e5 = packed0[x5 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f5 = (e5 >> 8) & 0xFFFu;
+            if (f5 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s5 + round] = (uint8_t)e5;
+            x5 = f5 * (x5 >> ZGEC_RANS_L) + (e5 >> 20);
+            x5 = zgec_rans_renorm_unguarded(x5, &cursor, &remaining);
+
+            uint32_t e6 = packed0[x6 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f6 = (e6 >> 8) & 0xFFFu;
+            if (f6 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s6 + round] = (uint8_t)e6;
+            x6 = f6 * (x6 >> ZGEC_RANS_L) + (e6 >> 20);
+            x6 = zgec_rans_renorm_unguarded(x6, &cursor, &remaining);
+
+            uint32_t e7 = packed0[x7 & (uint32_t)(ZGEC_RANS_M - 1)];
+            uint32_t f7 = (e7 >> 8) & 0xFFFu;
+            if (f7 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+            Z[s7 + round] = (uint8_t)e7;
+            x7 = f7 * (x7 >> ZGEC_RANS_L) + (e7 >> 20);
+            x7 = zgec_rans_renorm_unguarded(x7, &cursor, &remaining);
         }
+        state[0] = x0; state[1] = x1; state[2] = x2; state[3] = x3;
+        state[4] = x4; state[5] = x5; state[6] = x6; state[7] = x7;
         for (; round < max_rounds && err == ZGEC_OK; round++) {
             unsigned m = (round < full) ? 8u : rem;
             for (unsigned lane = 0; lane < m; lane++) {
@@ -373,25 +422,93 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                 }
             } else {
                 size_t round = 1;
+                uint32_t x0 = state[0], x1 = state[1], x2 = state[2], x3 = state[3];
+                uint32_t x4 = state[4], x5 = state[5], x6 = state[6], x7 = state[7];
+                size_t s0 = start[0], s1 = start[1], s2 = start[2], s3 = start[3];
+                size_t s4 = start[4], s5 = start[5], s6 = start[6], s7 = start[7];
                 for (; round < full && remaining > 15u; round++) {
-                    for (unsigned lane = 0; lane < 8; lane++) {
-                        size_t j = start[lane] + round;
-                        const uint32_t *tp = ctx_tab[Z[j - 1]];
-                        uint32_t x;
-                        uint32_t e;
-                        uint32_t f;
-                        if (tp == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
-                        x = state[lane];
-                        e = tp[x & (uint32_t)(ZGEC_RANS_M - 1)];
-                        f = (e >> 8) & 0xFFFu;
-                        if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
-                        Z[j] = (uint8_t)e;
-                        x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                        x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
-                        state[lane] = x;
-                    }
-                    if (err != ZGEC_OK) break;
+                    size_t j0 = s0 + round;
+                    const uint32_t *tp0 = ctx_tab[Z[j0 - 1]];
+                    if (tp0 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e0 = tp0[x0 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f0 = (e0 >> 8) & 0xFFFu;
+                    if (f0 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j0] = (uint8_t)e0;
+                    x0 = f0 * (x0 >> ZGEC_RANS_L) + (e0 >> 20);
+                    x0 = zgec_rans_renorm_unguarded(x0, &cursor, &remaining);
+
+                    size_t j1 = s1 + round;
+                    const uint32_t *tp1 = ctx_tab[Z[j1 - 1]];
+                    if (tp1 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e1 = tp1[x1 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f1 = (e1 >> 8) & 0xFFFu;
+                    if (f1 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j1] = (uint8_t)e1;
+                    x1 = f1 * (x1 >> ZGEC_RANS_L) + (e1 >> 20);
+                    x1 = zgec_rans_renorm_unguarded(x1, &cursor, &remaining);
+
+                    size_t j2 = s2 + round;
+                    const uint32_t *tp2 = ctx_tab[Z[j2 - 1]];
+                    if (tp2 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e2 = tp2[x2 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f2 = (e2 >> 8) & 0xFFFu;
+                    if (f2 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j2] = (uint8_t)e2;
+                    x2 = f2 * (x2 >> ZGEC_RANS_L) + (e2 >> 20);
+                    x2 = zgec_rans_renorm_unguarded(x2, &cursor, &remaining);
+
+                    size_t j3 = s3 + round;
+                    const uint32_t *tp3 = ctx_tab[Z[j3 - 1]];
+                    if (tp3 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e3 = tp3[x3 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f3 = (e3 >> 8) & 0xFFFu;
+                    if (f3 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j3] = (uint8_t)e3;
+                    x3 = f3 * (x3 >> ZGEC_RANS_L) + (e3 >> 20);
+                    x3 = zgec_rans_renorm_unguarded(x3, &cursor, &remaining);
+
+                    size_t j4 = s4 + round;
+                    const uint32_t *tp4 = ctx_tab[Z[j4 - 1]];
+                    if (tp4 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e4 = tp4[x4 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f4 = (e4 >> 8) & 0xFFFu;
+                    if (f4 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j4] = (uint8_t)e4;
+                    x4 = f4 * (x4 >> ZGEC_RANS_L) + (e4 >> 20);
+                    x4 = zgec_rans_renorm_unguarded(x4, &cursor, &remaining);
+
+                    size_t j5 = s5 + round;
+                    const uint32_t *tp5 = ctx_tab[Z[j5 - 1]];
+                    if (tp5 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e5 = tp5[x5 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f5 = (e5 >> 8) & 0xFFFu;
+                    if (f5 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j5] = (uint8_t)e5;
+                    x5 = f5 * (x5 >> ZGEC_RANS_L) + (e5 >> 20);
+                    x5 = zgec_rans_renorm_unguarded(x5, &cursor, &remaining);
+
+                    size_t j6 = s6 + round;
+                    const uint32_t *tp6 = ctx_tab[Z[j6 - 1]];
+                    if (tp6 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e6 = tp6[x6 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f6 = (e6 >> 8) & 0xFFFu;
+                    if (f6 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j6] = (uint8_t)e6;
+                    x6 = f6 * (x6 >> ZGEC_RANS_L) + (e6 >> 20);
+                    x6 = zgec_rans_renorm_unguarded(x6, &cursor, &remaining);
+
+                    size_t j7 = s7 + round;
+                    const uint32_t *tp7 = ctx_tab[Z[j7 - 1]];
+                    if (tp7 == NULL) { err = ZGEC_ERR_CLASS_MAP; break; }
+                    uint32_t e7 = tp7[x7 & (uint32_t)(ZGEC_RANS_M - 1)];
+                    uint32_t f7 = (e7 >> 8) & 0xFFFu;
+                    if (f7 == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
+                    Z[j7] = (uint8_t)e7;
+                    x7 = f7 * (x7 >> ZGEC_RANS_L) + (e7 >> 20);
+                    x7 = zgec_rans_renorm_unguarded(x7, &cursor, &remaining);
                 }
+                state[0] = x0; state[1] = x1; state[2] = x2; state[3] = x3;
+                state[4] = x4; state[5] = x5; state[6] = x6; state[7] = x7;
                 for (; round < max_rounds && err == ZGEC_OK; round++) {
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {

@@ -433,3 +433,15 @@ Do NOT take without a byte-identity gate:
     be proven output-neutral before landing.
   - `bolt/fuzz-leak-and-enc-perf` commits compiled binaries to the repo and
     changes no source; ignore it.
+
+## 2026-10-18 - Decompression Match-Copy Branching and rANS ILP Unrolling
+
+**Learning:**
+1. In `src/rans.c` (`zgec_rans_decode`), unrolling the 8-lane inner loop during full unguarded rounds into explicit scalar state updates (`x0..x7`, `s0..s7`) eliminates array indexing overhead and loop control instructions per round, enabling ILP across state transitions.
+2. In `src/decode.c` (`exec_block`), match copies previously fell back to scalar byte loops for small offsets or non-32-byte lengths. Structuring `moff >= 8` with 8-byte/16-byte/32-byte overlapping stores (`mlen <= 8`, `mlen <= 16`, `mlen <= 32`), `4 <= moff < 8` with 4-byte chunked stores (`mlen <= 4`, `mlen <= 8`), `moff == 2` with 16-bit pattern broadcasts, and `moff == 3` with bounded unrolled 3-byte pattern stores eliminates scalar byte loops across all match offsets.
+3. In `src/decode.c` (`seq_decode_cond`), hoisting FSE table pointers (`t[0]->e`, `t[1]->e`, `t[2]->e`) into a local pointer array `et[3]` removes pointer dereferences per sequence byte while preserving strict input validation.
+
+**Measurement (interleaved A/B, N=9, min/med wall time on 96 MB test corpus):**
+- Decompression throughput (`zgec d`): **+9.3%** on level 7 (626 ms vs 690 ms), **+10.7%** on level 10 (586 ms vs 657 ms).
+- Encoding throughput (`zgec c`): within +-1% (no regression).
+- Output byte-identity, pins, l7 SHA-256, ctest 4/4, and threaded round-trip (`-T 4`) are 100% verified.
