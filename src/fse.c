@@ -7,6 +7,49 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Portable thread-local storage, mirroring src/crc32c.c (MSVC's C11 mode
+ * historically lacks _Thread_local). */
+#if defined(_MSC_VER)
+#define ZGEC_FSE_TLS __declspec(thread)
+#else
+#define ZGEC_FSE_TLS _Thread_local
+#endif
+
+/* Encoder transition tables are large -- nsym * 2^al * 8 bytes, about
+ * 540 KiB for the sequence alphabet at al = 10 -- and are built and freed a
+ * few times per segment. Renting them from a thread-local free list avoids
+ * the allocate / touch / free cycle that otherwise repeats for every stream.
+ * The list is threaded through the tables themselves: a released table's `e`
+ * field holds the next pointer while `al` and `nsym` stay intact, so the
+ * slot's capacity is recovered from them on reuse. Slots that survive to
+ * process exit are still reachable from this pointer, so they are not
+ * leaked in the LSan sense. */
+static ZGEC_FSE_TLS zgec_fse_enc_table *zgec_fse_enc_pool;
+
+static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
+{
+    while (zgec_fse_enc_pool) {
+        zgec_fse_enc_table *t = zgec_fse_enc_pool;
+        size_t cap;
+        zgec_fse_enc_pool = (zgec_fse_enc_table *)(void *)t->e;
+        cap = sizeof(*t)
+            + (size_t)t->nsym * ((size_t)1u << (unsigned)t->al)
+            * sizeof(zgec_fse_enc_entry);
+        if (cap >= need) return t;
+        /* Too small for this request and no use to any other (all requests
+         * are for the same few alphabet sizes); really release it. */
+        zgec_free(t);
+    }
+    return (zgec_fse_enc_table *)zgec_alloc(need,
+                                            _Alignof(zgec_fse_enc_table));
+}
+
+static void zgec_fse_enc_return(zgec_fse_enc_table *t)
+{
+    t->e = (zgec_fse_enc_entry *)(void *)zgec_fse_enc_pool;
+    zgec_fse_enc_pool = t;
+}
+
 /* ---- forward bit reader (LSB-first, little-endian words) ---- */
 
 void zgec_fb_init(zgec_fwd_bits *f, const uint8_t *p, size_t size)
@@ -251,7 +294,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
     }
 
     full_size = (size_t)nsym * (size_t)S * sizeof(zgec_fse_enc_entry);
-    full = (zgec_fse_enc_table *)zgec_alloc(sizeof(zgec_fse_enc_table) + full_size, _Alignof(zgec_fse_enc_table));
+    full = zgec_fse_enc_rent(sizeof(zgec_fse_enc_table) + full_size);
     if (!full) return ZGEC_ERR_NOMEM;
     /* Zero-fill is load-bearing, not just hygiene: a symbol with zero
      * occurrences owns a block of S cells that no occurrence writes, and the
@@ -311,7 +354,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                  * finding 4). It is kept so a future builder cannot widen a
                  * cell past its row unnoticed. */
                 if ((unsigned)nb > (unsigned)al) {
-                    zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                    zgec_fse_enc_return(full); return ZGEC_ERR_FSE_COUNTS;
                 }
                 range = 1u << nb;
                 lo = (int)bl;                        /* decoder next-state range is
@@ -324,7 +367,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                     byte = (size_t)stprev >> 3;
                     bit = (uint8_t)(1u << ((unsigned)stprev & 7u));
                     if (covered[byte] & bit) {       /* two occurrences, one cell */
-                        zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                        zgec_fse_enc_return(full); return ZGEC_ERR_FSE_COUNTS;
                     }
                     covered[byte] = (uint8_t)(covered[byte] | bit);
                     covered_cells++;
@@ -349,7 +392,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
              * with counts[s] == 0 runs this loop zero times and covers nothing,
              * which is not a gap -- its block is the zero-fill above. */
             if (counts[s] > 0 && covered_cells != S) {   /* a cell nobody wrote */
-                zgec_free(full); return ZGEC_ERR_FSE_COUNTS;
+                zgec_fse_enc_return(full); return ZGEC_ERR_FSE_COUNTS;
             }
         }
     }
@@ -360,7 +403,8 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
 
 void zgec_fse_free_enc(zgec_fse_enc_table *t)
 {
-    zgec_free(t);
+    if (!t) return;
+    zgec_fse_enc_return(t);
 }
 
 /* ---- normalised-count serialisation (RFC 8878 section 4.1.1) ---- */
