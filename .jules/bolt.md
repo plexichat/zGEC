@@ -246,3 +246,14 @@ Stack-allocate small scratch buffers in hot entropy coders, track monotonically 
 
 **Action:**
 Always expose classification LUTs in public internal headers to allow direct array indexing in entropy context selection loops.
+
+## 2026-10-18 - Optimized Phase B Match Reconstruction Dispatch and AVX2 Conditioned Sequence Classing
+
+**Learning:**
+1. In Phase B match reconstruction (`exec_block` in `src/decode.c`), short matches (`mlen <= 8` and `mlen <= 16`) with offset `moff >= 8` previously triggered four 64-bit unaligned stores (32 bytes). Replacing with a single 64-bit store for `mlen <= 8` and dual overlapping 64-bit stores for `mlen <= 16` reduces memory store operations by up to 75% on common short matches without writing past `d + mlen`.
+2. For offsets `moff >= 4` and lengths `mlen > 8`, using 4-byte chunked wide match copies (`exec_match_wide(d, msrc, mlen, 4)`) eliminates slow scalar byte-by-byte loops for offsets 4, 5, 6, 7.
+3. For `moff == 3`, an unrolled 3-byte pattern loop avoids per-byte modulo index calculations.
+4. In `seq_decode_cond`, vectorizing match length classification (`zgec_mlclass`) 8-at-a-time using AVX2 SIMD (`_mm256_cmpgt_epi32` and `_mm_packus_epi16`) accelerates context class array pre-computation before FSE sequence decoding.
+
+**Action:**
+In LZ77 match reconstructors, use single/dual overlapping 64-bit word stores for short matches (`mlen <= 16`), 4-byte chunked copies for offsets `moff >= 4`, and AVX2 SIMD vectorization for sequence context class pre-computation.
