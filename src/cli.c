@@ -372,9 +372,11 @@ static void cli_apply_level(zgec_params *p, int level)
     p->use_filter = l->filter;
     p->block_checksums = l->ck;
     /* Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and
-     * largest (dial 3), 2 and 3 step the parser back toward the pinned
-     * default (dial 0) that level 4 uses. See zgec_parse_block_dial. */
-    p->fast_dial = (level >= 1 && level <= 3) ? (4 - level) : 0;
+     * largest, running the single-table lean core (dial 4); levels 2 and 3
+     * step the parser back toward the pinned default (dial 0) that level 4
+     * uses, through the two-table fast parser's shed-feature rungs. See
+     * zgec_parse_block_dial. */
+    p->fast_dial = (level >= 1 && level <= 3) ? (5 - level) : 0;
 }
 
 static int cli_tier(const char *s, zgec_tier *out)

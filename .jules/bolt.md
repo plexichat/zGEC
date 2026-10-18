@@ -280,3 +280,38 @@ unchanged.
 further, 3 also drops the repeat-offset and short-table probes. Never set by the
 pinned levels. A from-scratch single-table parser remains the only path to close
 the remaining gap to zstd's fast tier.
+
+## 2026-10-18 - Fast Tier: Single-Table Lean Parser Core (Level 1)
+
+**Context:** The dial ladder left level 1 (dial 3) at 1,629 ms vs level 4's
+2,306 ms, but level 1 still ran the two-table `fast_parse` loop with its short
+hash computed and discarded and a lazy check that cannot fire without the short
+table. The remaining parser cost at the top rung was the short/long fan-out and
+the O(best_len) interior-insert walk, which touched nearly as many table
+positions as the main loop (1.12 M inserts vs 1.00 M loop iterations on one
+2 MiB block).
+
+**Learning:**
+1. Gating the walk / lazy check behind a *runtime* dial in the shared loop cost
+   the pinned path 2% (measured against a self-A/B noise floor of +-0.3%). The
+   fix is structural, not a branch: the lean core is a separate function, so
+   `fast_parse` and the pinned levels keep their exact code shape.
+2. The single-table core keeps only the mandatory per-position body -- one
+   8-byte hash, one table load, one store -- plus a full-word candidate probe
+   (a collision is dropped with no length scan). It drops the short table, the
+   repeat-offset probes, the lazy check and the second hash, and inserts a
+   constant few interior positions per sequence instead of walking the match.
+3. Larger fast hash tables did not help once the short table was gone: fbits
+   13/11 were neutral-to-slower than fbits 15 at the top rung, so the lean core
+   keeps the dial-3 table sizing.
+
+**Measurement (211,938,580 B, -T 1, interleaved A/B, min of 7):** level 1
+(lean core) 80,567,687 B / 1,483 ms against the dial-3 rung it replaces
+(79,091,618 B / 1,751 ms): **-15.3% time, +1.9% size**. Level 4 byte-identical
+(65,059,955 B) and within the self-A/B noise floor. Pins 4-10 and the l7
+SHA-256 unchanged; ctest 4/4; l1-l3 round-trip and `-T 1` == `-T 4`.
+
+**Action:** `fast_parse_lite` is the new dial 4, selected by level 1; the fast
+ladder is now 1 = dial 4 (lean core), 2 = dial 3, 3 = dial 2, 4 = dial 0. The
+`fast_insert_sparse_long` helper is out-of-line so no pinned level pays for it.
+The remaining gap to zstd -1 is entropy-bound, not parser-bound.

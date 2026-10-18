@@ -37,7 +37,7 @@ zgec: level 6, 12582912 -> 4210812 bytes (2.9884x)  210.5 ms  57.0 MiB/s
 A level is a preset; any explicit flag overrides its column. Every preset
 uses `--block-log2 21` (2 MiB blocks) and `lambda 0`.
 
-Slots 4-10 and 12-25 are the implemented ratio ladder; slot 11 is reserved and rejected with `level N is not implemented`. Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and largest, and each step up trades the parser's speed dials back toward the pinned parser that level 4 uses (smaller hash tables, and at level 1 no repeat-offset or short-table probes). They are byte-stream compatible with level 4 but compress less.
+Slots 4-10 and 12-25 are the implemented ratio ladder; slot 11 is reserved and rejected with `level N is not implemented`. Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and largest and runs a single-table lean parser core (one hash table, no repeat-offset or short-table probes, sparse interior inserts), and each step up trades the parser's speed dials back toward the pinned parser that level 4 uses (level 2 restores the two-table parser with shed probes, level 3 restores the probes and only shrinks the hash tables). They are byte-stream compatible with level 4 but compress less.
 Levels 13-14 add epoch dictionaries and pre-filtering; levels 15-25 progressively increase block window sizes up to 16 MiB (`block-log2` 24) for maximum compression ratio.
 
 | level | tier | contexts | sub-lit | conditioning | litref | dicts | filter | checksums | block_log2 |

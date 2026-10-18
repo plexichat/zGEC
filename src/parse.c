@@ -658,6 +658,35 @@ uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
     return (uint32_t)len;
 }
 
+/* Sparse interior inserts for the lean core's accept path: a few positions at
+ * fixed offsets, constant work per sequence instead of the O(best_len) walk in
+ * fast_parse (which, at the fast rung, touched nearly as many positions as the
+ * main loop did). Only the long table exists here, so every offset goes into
+ * tl. Out of line so the pinned levels, which never call this, keep the exact
+ * hot-path code shape they had before this option existed. */
+__attribute__((noinline))
+static void fast_insert_sparse_long(uint32_t *tl, const uint8_t *vb, size_t end,
+                                    size_t ip, uint32_t best_len, uint32_t gen,
+                                    unsigned lshift)
+{
+    size_t i2 = ip + 2u;
+    size_t ie = ip + (size_t)best_len;
+    if (i2 + 8u <= end) {
+        uint64_t iv = zgec_rd64(vb + i2);
+        tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i2);
+    }
+    if (ie >= 2u && ie - 2u + 8u <= end) {
+        size_t i1 = ie - 2u;
+        uint64_t iv = zgec_rd64(vb + i1);
+        tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i1);
+    }
+    if (ie >= 1u && ie - 1u + 8u <= end) {
+        size_t i1 = ie - 1u;
+        uint64_t iv = zgec_rd64(vb + i1);
+        tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i1);
+    }
+}
+
 static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size_t vb_size,
                            int dial)
 {
@@ -676,7 +705,8 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
      * table-latency bound; 3 additionally drops the repeat-offset probes and
      * the short-table probe, the two optional per-position passes. Every
      * rung trades ratio for throughput and is only ever set by the new fast
-     * levels 1-3. */
+     * levels 1-3. Dial 4 does not reach this function: zgec_parse_block_dial
+     * routes it to fast_parse_lite() below. */
     unsigned extra_bits = (dial >= 2) ? 4u : ((dial >= 1) ? 2u : 0u);
     const int no_short = (dial >= 3);
     const int no_reps  = (dial >= 3);
@@ -1100,6 +1130,133 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     }
     return ZGEC_OK;
 }
+
+/* Level-1 core: one long table, no repeat-offset probes, no short table, no
+ * lazy check, sparse interior inserts. This is the from-scratch single-table
+ * rung: it keeps only the mandatory per-position body (one hash, one table
+ * load, one store) plus a candidate probe, dropping the two optional passes
+ * and the short/long fan-out that fast_parse carries for the pinned levels.
+ * Measured -15% encode time for +1.9% size against the dial-3 rung it
+ * replaces as level 1, so the fast ladder's top step is this core and
+ * fast_parse itself stays untouched for the pinned levels (its byte stream
+ * and throughput do not move). */
+static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
+                                size_t vb_size)
+{
+    uint32_t *tl;
+    zgec_sequence *seq;
+    size_t seq_cap;
+    size_t ip;
+    size_t anchor;
+    size_t end = vb_size;
+    zgec_reps reps;
+    size_t pos;
+    unsigned fbits = fast_table_bits(end - prefix, 4u);
+    unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
+    uint32_t gen = 1u;
+    int tl_owned = 0;
+
+    if (fbits <= ZGEC_FAST_SCRATCH_BITS) {
+        tl = fast_tl_scratch;
+    } else {
+        tl = (uint32_t *)zgec_alloc(((size_t)1u << fbits) * sizeof(uint32_t), 64);
+        tl_owned = 1;
+    }
+    seq_cap = (end - prefix) / 8u + 16u;
+    seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
+    if (!tl || !seq) {
+        if (tl_owned) zgec_free(tl);
+        zgec_free(seq);
+        return ZGEC_ERR_NOMEM;
+    }
+    memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
+
+    /* Seed with the dictionary / literal-reference prefix, sparsely. */
+    for (pos = 0; pos + 8u <= prefix; pos += 4u) {
+        uint64_t sv = zgec_rd64(vb + pos);
+        tl[fast_hash_l_v(sv) >> lshift] = fast_pack(gen, pos);
+    }
+
+    zgec_reps_init(&reps);
+    ip = prefix;
+    anchor = prefix;
+    p->n_seq = 0;
+    p->n_lit = 0;
+
+    while (ip + 8u <= end) {
+        uint64_t cur8 = zgec_rd64(vb + ip);
+        uint32_t hl = fast_hash_l_v(cur8) >> lshift;
+        uint32_t cl = tl[hl];
+        tl[hl] = fast_pack(gen, ip);
+
+        uint32_t best_len = 0u;
+        uint32_t best_off = 0u;
+        size_t cap = end - ip;
+        /* The long table promises an 8-byte key, so a candidate is only a
+         * match when the full word agrees; a collision (diff != 0) is dropped
+         * without a length scan, which is the whole probe. */
+        if (fast_live(cl, gen)) {
+            size_t cpos = fast_pos_of(cl);
+            if (cpos < ip) {
+                size_t d = ip - cpos;
+                if (zgec_rd64(vb + ip - d) == cur8) {
+                    best_len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                    best_off = (uint32_t)d;
+                }
+            }
+        }
+
+        if (best_len >= ZGEC_FAST_MIN_LONG) {
+            /* Back-extend into the pending literals; the match end does not
+             * move, so the offset stays valid and only literals are shed. */
+            while (ip > anchor && (size_t)best_off < ip &&
+                   vb[ip - 1u] == vb[ip - (size_t)best_off - 1u]) {
+                ip--;
+                best_len++;
+            }
+            uint32_t ll = (uint32_t)(ip - anchor);
+            uint32_t ob = zgec_reps_encode(&reps, best_off);
+            (void)zgec_reps_resolve(&reps, ob);
+            if (ll > 0u) {
+                memcpy(p->lit + p->n_lit, vb + anchor, ll);
+                p->n_lit += ll;
+            }
+            if (p->n_seq >= seq_cap) {
+                size_t nc = seq_cap * 2u;
+                zgec_sequence *ns = (zgec_sequence *)zgec_alloc(nc * sizeof(zgec_sequence), _Alignof(zgec_sequence));
+                if (!ns) {
+                    if (tl_owned) zgec_free(tl);
+                    zgec_free(seq);
+                    return ZGEC_ERR_NOMEM;
+                }
+                memcpy(ns, seq, p->n_seq * sizeof(zgec_sequence));
+                zgec_free(seq);
+                seq = ns;
+                seq_cap = nc;
+            }
+            seq[p->n_seq].ll = ll;
+            seq[p->n_seq].ml = best_len;
+            seq[p->n_seq].offbase = ob;
+            p->n_seq++;
+            fast_insert_sparse_long(tl, vb, end, ip, best_len, gen, lshift);
+            ip += best_len;
+            anchor = ip;
+        } else {
+            ip += ((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u;
+        }
+    }
+
+    if (anchor < end) {
+        size_t tail = end - anchor;
+        memcpy(p->lit + p->n_lit, vb + anchor, tail);
+        p->n_lit += tail;
+    }
+
+    zgec_free(p->seq);
+    p->seq = seq;
+    if (tl_owned) zgec_free(tl);
+    return ZGEC_OK;
+}
 #endif /* ZGEC_FASTDFAST_OFF */
 
 zgec_err zgec_parse_block_dial(zgec_parse **out,
@@ -1112,7 +1269,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
     /* Never leave a stale pointer behind on the failure paths below. */
     *out = NULL;
     if (fast_dial < 0) fast_dial = 0;
-    else if (fast_dial > 3) fast_dial = 3;
+    else if (fast_dial > 4) fast_dial = 4;
     if ((!src && raw_size > 0)) return ZGEC_ERR_INVAL;
     /* A size without a pointer would leave the [dict) region of the
      * virtual buffer below uninitialised and exposed to the matcher, so
@@ -1221,7 +1378,9 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
 
 #ifndef ZGEC_FASTDFAST_OFF
     if (tier == ZGEC_TIER_FAST) {
-        zgec_err fe = fast_parse(p, vb, prefix, vb_size, fast_dial);
+        zgec_err fe = (fast_dial >= 4)
+            ? fast_parse_lite(p, vb, prefix, vb_size)
+            : fast_parse(p, vb, prefix, vb_size, fast_dial);
         zgec_free(vb);
         if (fe != ZGEC_OK) { zgec_parse_free(p); return fe; }
         *out = p;
