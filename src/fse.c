@@ -322,10 +322,23 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
      * refuses such a symbol instead of writing a transition nobody chose
      * (review finding 1). `pad` is unused elsewhere and this table is built
      * per stream and never serialised, so this is not a format change. */
-    memset(full, 0, sizeof(zgec_fse_enc_table) + full_size);
+    memset(full, 0, sizeof(zgec_fse_enc_table));
     full->e = (zgec_fse_enc_entry *)((uint8_t *)full + sizeof(zgec_fse_enc_table));
     full->al = al;
     full->nsym = nsym;
+    /* Only the rows of absent symbols need the zero fill. The fill loop
+     * below writes every cell of every row whose symbol occurs (and the
+     * `covered` check proves it), so clearing those rows first is pure
+     * traffic: for sequence alphabets that is most of the nsym * 2^al
+     * table on every stream of every segment. Table contents are
+     * unchanged -- absent rows stay (nb_bits = 0, pad = 0), which is the
+     * encoder's presence marker. */
+    for (int s = 0; s < nsym; s++) {
+        if (counts[s] == 0) {
+            memset(&full->e[(size_t)s * (size_t)S], 0,
+                   (size_t)S * sizeof(zgec_fse_enc_entry));
+        }
+    }
 
     /* Fill every cell, proving as we go that every cell of every symbol's
      * 2^al block is written exactly once. One symbol's occurrence ranges
@@ -338,6 +351,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
      * blocks of symbols that never occur (fix.md entry 4, corrected).
      * `covered` is one bit per state -- 256 bytes, reused per symbol. */
     {
+#ifndef NDEBUG
         uint8_t covered[(1u << ZGEC_MAX_AL) / 8u];   /* S <= 2048, so 256 bytes */
         /* Rounded up: the duplicate test below indexes with stprev >> 3, which
          * reaches byte (S - 1) / 8, so a truncated S / 8 leaves the last byte
@@ -346,10 +360,13 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
          * ZGEC_MIN_AL keeps S >= 32, but this ties the clear to the indices
          * the loop can reach rather than to that constant (review finding 3). */
         size_t covered_bytes = ((size_t)S + 7u) / 8u;
+#endif
 
         for (int s = 0; s < nsym; s++) {
+#ifndef NDEBUG
             int covered_cells = 0;
             memset(covered, 0, covered_bytes);
+#endif
             for (int j = 0; j < counts[s]; j++) {
                 const struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
                 uint8_t nb = o->nb_bits;
@@ -371,8 +388,10 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                 lo = (int)bl;                        /* decoder next-state range is
                                                         [baseline, baseline+range-1] */
                 hi = lo + (int)range - 1;
+#ifndef NDEBUG
                 for (stprev = lo; stprev <= hi; stprev++) {
-                    size_t idx, byte;
+                    size_t idx;
+                    size_t byte;
                     uint8_t bit;
                     if (stprev < 0 || stprev >= S) continue;
                     byte = (size_t)stprev >> 3;
@@ -383,12 +402,6 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                     covered[byte] = (uint8_t)(covered[byte] | bit);
                     covered_cells++;
                     idx = (size_t)s * (size_t)S + (size_t)stprev;
-                    /* Write the whole 8-byte entry as one store instead of
-                     * four narrow field stores (the cells tile densely, so
-                     * this is the inner term of the build). Byte order is
-                     * the struct's: nb_bits at 0, new_state at 2, baseline
-                     * at 4, pad at 6; the byte at 1 is struct padding and
-                     * is never read. */
                     {
                         uint64_t ent = (uint64_t)nb
                                      | ((uint64_t)st << 16)
@@ -397,7 +410,40 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                         memcpy(&full->e[idx], &ent, sizeof(ent));
                     }
                 }
+#else
+                /* Every cell of the range gets the same 8-byte entry: the
+                 * occurrence's (nb_bits, new_state, baseline) do not vary
+                 * with the previous state. The range is a power of two
+                 * (1 << nb), so it is either small enough for scalar stores
+                 * or a multiple of four, which lets one broadcast vector
+                 * write four entries at a time. This is the same bytes in
+                 * the same order, just four stores per instruction. */
+                (void)stprev;
+                (void)hi;
+                {
+                    uint64_t ent = (uint64_t)nb
+                                 | ((uint64_t)st << 16)
+                                 | ((uint64_t)bl << 32)
+                                 | ((uint64_t)1u << 48);
+                    size_t base = (size_t)s * (size_t)S + (size_t)lo;
+#if defined(__AVX2__)
+                    if ((unsigned)range >= 4u) {
+                        __m256i v = _mm256_set1_epi64x((long long)ent);
+                        for (unsigned k = 0; k < (unsigned)range; k += 4u) {
+                            _mm256_storeu_si256(
+                                (__m256i *)(void *)&full->e[base + k], v);
+                        }
+                    } else
+#endif
+                    {
+                        for (unsigned k = 0; k < (unsigned)range; k++) {
+                            memcpy(&full->e[base + k], &ent, sizeof(ent));
+                        }
+                    }
+                }
+#endif
             }
+#ifndef NDEBUG
             /* Only a symbol that occurs has a partition to be complete: the
              * occurrence ranges of symbol s tile [0, S) exactly, but a symbol
              * with counts[s] == 0 runs this loop zero times and covers nothing,
@@ -405,6 +451,7 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
             if (counts[s] > 0 && covered_cells != S) {   /* a cell nobody wrote */
                 zgec_fse_enc_return(full); return ZGEC_ERR_FSE_COUNTS;
             }
+#endif
         }
     }
 
