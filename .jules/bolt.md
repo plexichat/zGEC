@@ -433,3 +433,14 @@ Do NOT take without a byte-identity gate:
     be proven output-neutral before landing.
   - `bolt/fuzz-leak-and-enc-perf` commits compiled binaries to the repo and
     changes no source; ignore it.
+
+## 2026-10-19 - Contiguous rANS Encoder Entry Packing, Register State Hoisting, and FSE Symbol Info Pre-Table
+
+**Learning:**
+1. In `src/rans.c` and `include/zgec_rans.h`, restructuring `zgec_rans_enc_table` from Structure-of-Arrays (separate 256-element arrays for `f`, `c`, `xmax`, `f_recip`) into a contiguous 256-element array of 12-byte `zgec_rans_enc_entry` structs eliminates up to 4 disjoint L1 cache line accesses per encoded symbol.
+2. In `zgec_rans_encode` (`k == 1` and `k > 1`), hoisting all 8 lane states (`x0`..`x7`) and the word index (`nwords`) into local scalar GPR registers removes repeated in-loop pointer dereferences and stack reloads.
+3. In `zgec_fse_encode` (`src/fse.c`), pre-packing row pointers, base offsets, extra bit widths, and validity markers into a 256-element stack table `sinfo[256]` before entering the reverse loop eliminates redundant per-symbol table row pointer calculations, separate `base`/`nbits` array loads, and `row[0].pad == 0` checks.
+4. In `zgec_ctx_body_bits` (`src/encode.c`), when `has_rs == 0`, iterating lane-by-lane with an unrolled 4-wide loop over `[lane_start + 1, lane_end)` removes per-byte lane boundary comparisons and `zgec_rs_get` queries.
+
+**Action:**
+When optimizing entropy encoders, always pack per-symbol encoder properties into contiguous 12/16-byte structs to maximize L1 cache locality, hoist state variables into GPR scalar registers, and precompute per-symbol row properties prior to stream assembly loops.

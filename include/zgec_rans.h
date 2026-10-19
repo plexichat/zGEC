@@ -43,10 +43,14 @@ typedef struct {
 
 /* Encoder tables (Annex B.2). */
 typedef struct {
-    uint32_t f_recip[ZGEC_NSYM_LIT];  /* precomputed reciprocal for fast division */
-    uint32_t xmax[ZGEC_NSYM_LIT];     /* precomputed xmax = f << 21 for fast renorm check */
-    uint16_t f[ZGEC_NSYM_LIT];
-    uint16_t c[ZGEC_NSYM_LIT];
+    uint32_t xmax;
+    uint32_t f_recip;
+    uint16_t f;
+    uint16_t c;
+} zgec_rans_enc_entry;
+
+typedef struct {
+    zgec_rans_enc_entry entries[ZGEC_NSYM_LIT];
 } zgec_rans_enc_table;
 
 /* Build decoder tables from normalised counts (256 entries).

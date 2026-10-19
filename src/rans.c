@@ -147,14 +147,14 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts)
             uint32_t eff = (c < 0) ? 1u : (uint32_t)c;
             if (c < -1) return ZGEC_ERR_RANS_STATE;
             if (eff > (uint32_t)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
-            t->f[s] = (uint16_t)eff;
-            t->c[s] = (uint16_t)sum;
+            t->entries[s].f = (uint16_t)eff;
+            t->entries[s].c = (uint16_t)sum;
             /* Renormalise while x >= f << 21. For f == ZGEC_RANS_M the
              * true threshold is 2^32, which overflows a 32-bit xmax;
              * zgec_rans_encode_symbol handles that single-symbol case
              * before it ever reads xmax, so saturate here rather than
              * store 0. */
-            t->xmax[s] = (eff >= (uint32_t)ZGEC_RANS_M)
+            t->entries[s].xmax = (eff >= (uint32_t)ZGEC_RANS_M)
                              ? 0xFFFFFFFFu
                              : (eff << 21u);
             sum += eff;
@@ -165,9 +165,9 @@ zgec_err zgec_rans_build_enc(zgec_rans_enc_table *t, const int16_t *counts)
              * 2^32 + 1, so it is stored as 0 and takes a branch there. */
             if (eff > 1u) {
                 uint64_t recip = ((uint64_t)1 << 32) / (uint64_t)eff + 1u;
-                t->f_recip[s] = (uint32_t)recip;
+                t->entries[s].f_recip = (uint32_t)recip;
             } else {
-                t->f_recip[s] = 0u;   /* eff == 0 unused; eff == 1 branched */
+                t->entries[s].f_recip = 0u;   /* eff == 0 unused; eff == 1 branched */
             }
         }
         if (sum != (uint32_t)ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
@@ -435,42 +435,32 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
  * caller sizes `words` with that slack, so no per-write bound test is needed
  * (a committed word can only appear once per symbol, and there are n_lit
  * symbols, so nwords <= n_lit <= words_cap). */
-static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_t s,
-                                          uint32_t *state_ptr, uint16_t *words,
-                                          size_t *nwords_ptr, size_t words_cap)
-{
-    (void)words_cap;
-    uint32_t f = tab->f[s];
-    if (f == 0u) return -1;
-    /* A single-symbol table (f == ZGEC_RANS_M, c == 0, probability 1)
-     * is an exact identity on the state: x/f<<L + x%f + c == x, and the
-     * renormalisation threshold f<<21 is 2^32, which does not fit the
-     * 32-bit xmax field (it wraps to 0 and would renormalise forever).
-     * Handle it before the threshold test so it neither renormalises nor
-     * depends on xmax. */
-    if (f == (uint32_t)ZGEC_RANS_M) return 0;
-    uint32_t x = *state_ptr;
-    uint32_t need = (x >= tab->xmax[s]) ? 1u : 0u;
-    size_t nw = *nwords_ptr;
-    words[nw] = (uint16_t)x;
-    *nwords_ptr = nw + (size_t)need;
-    x = need ? (x >> 16) : x;
-    uint32_t quo;
-    uint32_t rems;
-    if (f == 1u) {
-        quo = x;
-        rems = 0u;
-    } else {
-        uint64_t prod = (uint64_t)x * (uint64_t)tab->f_recip[s];
-        quo = (uint32_t)(prod >> 32);
-        rems = x - quo * f;
-        uint32_t adj = (rems >= f) ? 1u : 0u;
-        quo -= adj;
-        rems += adj * f;
-    }
-    *state_ptr = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
-    return 0;
-}
+#define RANS_ENC_SYMBOL_FAST(tab, s, x_var) do { \
+    uint8_t _s = (s); \
+    const zgec_rans_enc_entry *_e = &(tab)->entries[_s]; \
+    uint32_t _f = _e->f; \
+    if (_f == 0u) { if (words_owned) zgec_free(words); return 0; } \
+    if (_f != (uint32_t)ZGEC_RANS_M) { \
+        uint32_t _x = (x_var); \
+        uint32_t _need = (_x >= _e->xmax) ? 1u : 0u; \
+        words[nwords] = (uint16_t)_x; \
+        nwords += _need; \
+        _x = _need ? (_x >> 16) : _x; \
+        uint32_t _quo, _rems; \
+        if (_f == 1u) { \
+            _quo = _x; \
+            _rems = 0u; \
+        } else { \
+            uint64_t _prod = (uint64_t)_x * (uint64_t)_e->f_recip; \
+            _quo = (uint32_t)(_prod >> 32); \
+            _rems = _x - _quo * _f; \
+            uint32_t _adj = (_rems >= _f) ? 1u : 0u; \
+            _quo -= _adj; \
+            _rems += _adj * _f; \
+        } \
+        (x_var) = (_quo << ZGEC_RANS_L) + _rems + (uint32_t)_e->c; \
+    } \
+} while (0)
 
 /* ---- 8-lane rANS encode (section 9.5) ---- */
 
@@ -529,70 +519,103 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     for (unsigned lane = 0; lane < 8; lane++)
         if (len[lane] > max_rounds) max_rounds = len[lane];
     if (k > 1) zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, k);
+
+    uint32_t x0 = state[0], x1 = state[1], x2 = state[2], x3 = state[3];
+    uint32_t x4 = state[4], x5 = state[5], x6 = state[6], x7 = state[7];
+
     if (k == 1) {
         const zgec_rans_enc_table *tab = &tables[0];
         size_t full = len[7];
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;
             if (round < full) {
-                size_t j7 = start[7] + round;
-                size_t j6 = start[6] + round;
-                size_t j5 = start[5] + round;
-                size_t j4 = start[4] + round;
-                size_t j3 = start[3] + round;
-                size_t j2 = start[2] + round;
-                size_t j1 = start[1] + round;
-                size_t j0 = start[0] + round;
-                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
-                    if (words_owned) zgec_free(words);
-                    return 0;
-                }
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[7] + round], x7);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[6] + round], x6);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[5] + round], x5);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[4] + round], x4);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[3] + round], x3);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[2] + round], x2);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[1] + round], x1);
+                RANS_ENC_SYMBOL_FAST(tab, Z[start[0] + round], x0);
             } else {
-                for (int lane = 7; lane >= 0; lane--) {
-                    size_t j;
-                    if (round >= len[lane]) continue;
-                    j = start[lane] + round;
-                    uint8_t s = Z[j];
-                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                        if (words_owned) zgec_free(words);
-                        return 0;
-                    }
-                }
+                if (round < len[7]) RANS_ENC_SYMBOL_FAST(tab, Z[start[7] + round], x7);
+                if (round < len[6]) RANS_ENC_SYMBOL_FAST(tab, Z[start[6] + round], x6);
+                if (round < len[5]) RANS_ENC_SYMBOL_FAST(tab, Z[start[5] + round], x5);
+                if (round < len[4]) RANS_ENC_SYMBOL_FAST(tab, Z[start[4] + round], x4);
+                if (round < len[3]) RANS_ENC_SYMBOL_FAST(tab, Z[start[3] + round], x3);
+                if (round < len[2]) RANS_ENC_SYMBOL_FAST(tab, Z[start[2] + round], x2);
+                if (round < len[1]) RANS_ENC_SYMBOL_FAST(tab, Z[start[1] + round], x1);
+                if (round < len[0]) RANS_ENC_SYMBOL_FAST(tab, Z[start[0] + round], x0);
             }
         }
     } else {
+        size_t full = len[7];
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;
-            for (int lane = 7; lane >= 0; lane--) {
-                int table_idx = 0;
-                size_t j;
-                if (round >= len[lane]) continue;
-                j = start[lane] + round;
-                if (j >= n_lit) { if (words_owned) zgec_free(words); return 0; }
-                if (j == start[lane] || zgec_rs_get(runstart, j)) {
-                    table_idx = k;
-                } else {
-                    uint8_t pidx = idx_lut[Z[j - 1]];
-                    if (pidx == 0xFFu) { if (words_owned) zgec_free(words); return 0; }
-                    table_idx = (int)pidx;
-                }
-                if (table_idx < 0 || table_idx > k) { if (words_owned) zgec_free(words); return 0; }
-                const zgec_rans_enc_table *tab = &tables[table_idx];
-                uint8_t s = Z[j];
-                if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                    if (words_owned) zgec_free(words);
-                    return 0;
+            if (round < full) {
+                size_t j7 = start[7] + round;
+                int t7 = (j7 == start[7] || zgec_rs_get(runstart, j7)) ? k : (int)idx_lut[Z[j7 - 1]];
+                if (t7 < 0 || t7 > k || t7 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t7], Z[j7], x7);
+
+                size_t j6 = start[6] + round;
+                int t6 = (j6 == start[6] || zgec_rs_get(runstart, j6)) ? k : (int)idx_lut[Z[j6 - 1]];
+                if (t6 < 0 || t6 > k || t6 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t6], Z[j6], x6);
+
+                size_t j5 = start[5] + round;
+                int t5 = (j5 == start[5] || zgec_rs_get(runstart, j5)) ? k : (int)idx_lut[Z[j5 - 1]];
+                if (t5 < 0 || t5 > k || t5 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t5], Z[j5], x5);
+
+                size_t j4 = start[4] + round;
+                int t4 = (j4 == start[4] || zgec_rs_get(runstart, j4)) ? k : (int)idx_lut[Z[j4 - 1]];
+                if (t4 < 0 || t4 > k || t4 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t4], Z[j4], x4);
+
+                size_t j3 = start[3] + round;
+                int t3 = (j3 == start[3] || zgec_rs_get(runstart, j3)) ? k : (int)idx_lut[Z[j3 - 1]];
+                if (t3 < 0 || t3 > k || t3 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t3], Z[j3], x3);
+
+                size_t j2 = start[2] + round;
+                int t2 = (j2 == start[2] || zgec_rs_get(runstart, j2)) ? k : (int)idx_lut[Z[j2 - 1]];
+                if (t2 < 0 || t2 > k || t2 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t2], Z[j2], x2);
+
+                size_t j1 = start[1] + round;
+                int t1 = (j1 == start[1] || zgec_rs_get(runstart, j1)) ? k : (int)idx_lut[Z[j1 - 1]];
+                if (t1 < 0 || t1 > k || t1 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t1], Z[j1], x1);
+
+                size_t j0 = start[0] + round;
+                int t0 = (j0 == start[0] || zgec_rs_get(runstart, j0)) ? k : (int)idx_lut[Z[j0 - 1]];
+                if (t0 < 0 || t0 > k || t0 == 0xFF) { if (words_owned) zgec_free(words); return 0; }
+                RANS_ENC_SYMBOL_FAST(&tables[t0], Z[j0], x0);
+            } else {
+                for (int lane = 7; lane >= 0; lane--) {
+                    int table_idx = 0;
+                    size_t j;
+                    if (round >= len[lane]) continue;
+                    j = start[lane] + round;
+                    if (j >= n_lit) { if (words_owned) zgec_free(words); return 0; }
+                    if (j == start[lane] || zgec_rs_get(runstart, j)) {
+                        table_idx = k;
+                    } else {
+                        uint8_t pidx = idx_lut[Z[j - 1]];
+                        if (pidx == 0xFFu) { if (words_owned) zgec_free(words); return 0; }
+                        table_idx = (int)pidx;
+                    }
+                    if (table_idx < 0 || table_idx > k) { if (words_owned) zgec_free(words); return 0; }
+                    uint32_t *x_lane = (lane == 7) ? &x7 : ((lane == 6) ? &x6 : ((lane == 5) ? &x5 : ((lane == 4) ? &x4 : ((lane == 3) ? &x3 : ((lane == 2) ? &x2 : ((lane == 1) ? &x1 : &x0))))));
+                    RANS_ENC_SYMBOL_FAST(&tables[table_idx], Z[j], *x_lane);
                 }
             }
         }
     }
+
+    state[0] = x0; state[1] = x1; state[2] = x2; state[3] = x3;
+    state[4] = x4; state[5] = x5; state[6] = x6; state[7] = x7;
 
     /* Size the whole result -- header plus words -- before writing any of
      * it, so a capacity failure leaves the caller's buffer untouched. The
