@@ -510,3 +510,28 @@ four entries at a time, and the coverage/duplicate checks are debug-only.
 Byte-identical (pinned sizes and l7 SHA unchanged). Interleaved A/B, min of 7
 on a pinned core: l7 7429.2 -> 7191.7 ms (-3.2%), l4 2030.1 -> 2000.9 ms
 (-1.4%); medians -3.0% / -2.1%. ctest 4/4 and a -T 4 round-trip clean.
+
+Session 2026-10-19 (cont.) -- rANS k == 1 lane-store chain.
+
+PROFILED -- fast-tier literal rANS is ~22% of l1 (ZGEC_RANS_PROFILE split:
+nwords/n_lit 0.39, so the output reverse-copy is only ~0.8%; the encode loop
+is ~8.2 cycles/literal). zgec_rans_encode k == 1 unrolled eight lanes but
+serialised every one through `nwords`: each `words[nwords] = x; nwords += need`
+made the next lane's store address depend on the previous commit.
+
+ACCEPTED -- rans.c: a store-free `zgec_rans_encode_core[_simple]` returns the
+next state / pre-shift word / commit bit; the k == 1 round computes the eight
+lanes and writes them at prefix-summed offsets in lane order 7..0 (lower lanes
+overwrite earlier uncommitted words at a shared offset, as the serial version
+did). The unconditional store for f == M is harmless: a committed slot at that
+offset is overwritten by the lane that commits it, and an uncommitted one is
+slack. Forcing always_inline matters -- without it clang emitted a real
+zgec_rans_encode_core call per symbol and the change was slower. A one-time
+scan of the 256 frequencies selects `_simple` (no f==0/1/M tests) when all are
+in [2, M-1]; otherwise the checked core keeps the old error behaviour.
+
+Byte-identical: pinned sizes l1..l10 all exact, l7 SHA
+13AF5E256B1731FEAC2FD795A51B9E9A8073F75E14990B75D2006D79FD1A4CDE, ctest 4/4,
+-T 4 round-trip clean. Interleaved A/B (pinned core, min of 9): l1 1135.8 ->
+1107.0 ms (-2.5% min; medians 1149.0 -> 1127.7, -1.9%); the hoisted simple
+path alone was ~1% of that.

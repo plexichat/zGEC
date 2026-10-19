@@ -472,6 +472,79 @@ static inline int zgec_rans_encode_symbol(const zgec_rans_enc_table *tab, uint8_
     return 0;
 }
 
+/* Store-free encode step for the k == 1 lane loop.
+ *
+ * Identical arithmetic to zgec_rans_encode_symbol, but the caller decides
+ * where the renormalisation word lands. That lets the eight lanes of a
+ * round be computed independently and the words written afterwards at
+ * prefix-summed offsets, instead of serialising every lane through the
+ * running `nwords` counter (each store address depended on the previous
+ * lane's commit). Semantics: *word is the pre-shift state (what the old
+ * code stored), *need is the commit bit, *xout the next state. For the
+ * single-symbol table (f == M) need is 0 and the state is unchanged; the
+ * unconditional store is harmless because any committed slot at that
+ * offset is overwritten by the lane that commits it, and an uncommitted
+ * one is slack. */
+static __attribute__((always_inline)) inline int
+zgec_rans_encode_core(const zgec_rans_enc_table *tab,
+                      uint8_t s, uint32_t x,
+                      uint32_t *xout, uint32_t *word,
+                      uint32_t *need)
+{
+    uint32_t f = tab->f[s];
+    if (f == 0u) return -1;
+    *word = (uint16_t)x;
+    if (f == (uint32_t)ZGEC_RANS_M) {
+        *need = 0u;
+        *xout = x;
+        return 0;
+    }
+    uint32_t nd = (x >= tab->xmax[s]) ? 1u : 0u;
+    x = nd ? (x >> 16) : x;
+    uint32_t quo;
+    uint32_t rems;
+    if (f == 1u) {
+        quo = x;
+        rems = 0u;
+    } else {
+        uint64_t prod = (uint64_t)x * (uint64_t)tab->f_recip[s];
+        quo = (uint32_t)(prod >> 32);
+        rems = x - quo * f;
+        uint32_t adj = (rems >= f) ? 1u : 0u;
+        quo -= adj;
+        rems += adj * f;
+    }
+    *xout = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
+    *need = nd;
+    return 0;
+}
+
+/* Fast variant for tables whose every frequency is in [2, M-1], i.e. no
+ * zero (invalid) symbol, no single-symbol identity and no f == 1 branch.
+ * zgec_rans_encode scans the table once per call and only uses this when
+ * that holds, so the three per-symbol tests disappear from the hot loop.
+ * The arithmetic is identical to the checked core otherwise. */
+static __attribute__((always_inline)) inline int
+zgec_rans_encode_core_simple(const zgec_rans_enc_table *tab,
+                             uint8_t s, uint32_t x,
+                             uint32_t *xout, uint32_t *word,
+                             uint32_t *need)
+{
+    uint32_t f = tab->f[s];
+    uint32_t nd = (x >= tab->xmax[s]) ? 1u : 0u;
+    *word = (uint16_t)x;
+    x = nd ? (x >> 16) : x;
+    uint64_t prod = (uint64_t)x * (uint64_t)tab->f_recip[s];
+    uint32_t quo = (uint32_t)(prod >> 32);
+    uint32_t rems = x - quo * f;
+    uint32_t adj = (rems >= f) ? 1u : 0u;
+    quo -= adj;
+    rems += adj * f;
+    *xout = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
+    *need = nd;
+    return 0;
+}
+
 /* ---- 8-lane rANS encode (section 9.5) ---- */
 
 size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
@@ -529,30 +602,63 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
     for (unsigned lane = 0; lane < 8; lane++)
         if (len[lane] > max_rounds) max_rounds = len[lane];
     if (k > 1) zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, k);
+#define ZGEC_RANS_ROUND(CORE)                                                   \
+    do {                                                                        \
+        size_t j7 = start[7] + round;                                           \
+        size_t j6 = start[6] + round;                                           \
+        size_t j5 = start[5] + round;                                           \
+        size_t j4 = start[4] + round;                                           \
+        size_t j3 = start[3] + round;                                           \
+        size_t j2 = start[2] + round;                                           \
+        size_t j1 = start[1] + round;                                           \
+        size_t j0 = start[0] + round;                                           \
+        uint32_t base = (uint32_t)nwords;                                       \
+        uint32_t off = 0;                                                       \
+        uint32_t ns, wv, nd;                                                    \
+        if (CORE(tab, Z[j7], state[7], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[7] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j6], state[6], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[6] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j5], state[5], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[5] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j4], state[4], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[4] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j3], state[3], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[3] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j2], state[2], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[2] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j1], state[1], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[1] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        if (CORE(tab, Z[j0], state[0], &ns, &wv, &nd) != 0) goto fail_words;    \
+        state[0] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+        nwords = (size_t)base + off;                                            \
+    } while (0)
+
     if (k == 1) {
         const zgec_rans_enc_table *tab = &tables[0];
         size_t full = len[7];
+        int simple = 1;
+        /* One-time scan: the per-symbol f == 0 / 1 / M tests in the
+         * checked core are only needed when such a frequency exists.
+         * A zero frequency for a symbol that never occurs in Z is not an
+         * error (the checked core would never look at it), so any of
+         * these just selects the checked path. */
+        for (int s = 0; s < ZGEC_NSYM_LIT; s++) {
+            uint32_t f = tab->f[s];
+            if (f < 2u || f == (uint32_t)ZGEC_RANS_M) { simple = 0; break; }
+        }
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;
             if (round < full) {
-                size_t j7 = start[7] + round;
-                size_t j6 = start[6] + round;
-                size_t j5 = start[5] + round;
-                size_t j4 = start[4] + round;
-                size_t j3 = start[3] + round;
-                size_t j2 = start[2] + round;
-                size_t j1 = start[1] + round;
-                size_t j0 = start[0] + round;
-                if (zgec_rans_encode_symbol(tab, Z[j7], &state[7], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j6], &state[6], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j5], &state[5], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j4], &state[4], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j3], &state[3], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j2], &state[2], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j1], &state[1], words, &nwords, words_cap) != 0 ||
-                    zgec_rans_encode_symbol(tab, Z[j0], &state[0], words, &nwords, words_cap) != 0) {
-                    if (words_owned) zgec_free(words);
-                    return 0;
+                /* Commit order is lane 7 down to lane 0: each lane writes
+                 * the slot left by the previous commit, so later (lower)
+                 * lanes overwrite earlier uncommitted words at a shared
+                 * offset, exactly as the serial version did. Only one
+                 * lane's temporaries are live at a time. */
+                if (simple) {
+                    ZGEC_RANS_ROUND(zgec_rans_encode_core_simple);
+                } else {
+                    ZGEC_RANS_ROUND(zgec_rans_encode_core);
                 }
             } else {
                 for (int lane = 7; lane >= 0; lane--) {
@@ -594,6 +700,11 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
         }
     }
 
+    goto after_loops;
+fail_words:
+    if (words_owned) zgec_free(words);
+    return 0;
+after_loops:
     /* Size the whole result -- header plus words -- before writing any of
      * it, so a capacity failure leaves the caller's buffer untouched. The
      * header used to be written first, which modified stream on failure. */
