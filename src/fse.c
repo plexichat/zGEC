@@ -3,6 +3,7 @@
 #endif
 #include "zgec_fse.h"
 #include "zgec_seq.h"
+#include "zgec_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -48,6 +49,16 @@ static void zgec_fse_enc_return(zgec_fse_enc_table *t)
 {
     t->e = (zgec_fse_enc_entry *)(void *)zgec_fse_enc_pool;
     zgec_fse_enc_pool = t;
+}
+
+/* Free all cached FSE encoder tables in the thread-local pool for the calling thread. */
+void zgec_fse_cleanup_tls(void)
+{
+    while (zgec_fse_enc_pool) {
+        zgec_fse_enc_table *t = zgec_fse_enc_pool;
+        zgec_fse_enc_pool = (zgec_fse_enc_table *)(void *)t->e;
+        zgec_free(t);
+    }
 }
 
 /* ---- forward bit reader (LSB-first, little-endian words) ---- */

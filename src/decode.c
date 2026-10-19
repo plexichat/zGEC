@@ -1993,6 +1993,7 @@ static void zgec_phaseA_run_range(zgec_phaseA_range *r)
                                          jb->seg_out_start, jb->dir_raw_len);
         if (jb->err != ZGEC_OK) break; /* error scan stays index-ordered */
     }
+    zgec_thread_cleanup();
 }
 
 #if defined(_WIN32)
@@ -3329,7 +3330,10 @@ static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
     for (;;) {
         uint32_t k = (uint32_t)zgec_atomic_fetch_add_size(jb->next, 1);
         uint32_t i;
-        if (k >= jb->nblk) return;
+        if (k >= jb->nblk) {
+            zgec_thread_cleanup();
+            return;
+        }
         i = (uint32_t)(((uint64_t)k * (uint64_t)jb->blk_stride) %
                        (uint64_t)jb->nblk);
         const uint8_t *p = NULL;
