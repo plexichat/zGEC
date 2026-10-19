@@ -589,3 +589,18 @@ Byte-identical: pinned sizes l1..l10 exact, l7 SHA
 395.5M ticks (-6.8%), l3 770.7M -> 687.7M (-10.8%). Whole-file interleaved A/B
 (pinned core, min of 9): l1 902.7 -> 898.9 ms (-0.4% min, medians -1.1%);
 l3 1569.7 -> 1551.0 ms (-1.2% min, medians -1.8%).
+
+## Task bolt-3 — Literal rANS encode (levels 1-4)
+
+Optimized `zgec_rans_encode` for `k == 1` and `zgec_rans_histograms`:
+1. Hoisted `state[0]`..`state[7]` lane states and word write pointer `wp` into CPU scalar registers across all full rounds in `zgec_rans_encode` for `k == 1`, eliminating stack reloads and `state` array indexing per round.
+2. Inlined direct pointer increment word stores in `zgec_rans_step_fast`, removing the `if (CORE(...) != 0) goto fail_words` per-round dead error branches.
+3. Hoisted `idx_lut` sentinel (0xFFu) check out of the inner loop in `zgec_rans_histograms` for multi-table histograms.
+
+Verification & Benchmark:
+Byte-identical across all pinned levels l4, l6, l7, l8, l9, l10. l7 SHA-256 equals `13AF5E256B1731FEAC2FD795A51B9E9A8073F75E14990B75D2006D79FD1A4CDE`. `ctest` 4/4 passed. `-T 4` threaded round-trip integrity test passed.
+
+Interleaved A/B benchmark (N=7, single thread, 211.9 MB silesia.all):
+- Level 1: Base min 3.3162s, New min 3.2075s (**+3.28% min speedup**, **+3.12% median speedup**)
+- Level 2: Base min 3.8555s, New min 3.7841s (**+1.85% min speedup**, **+1.09% median speedup**)
+- Level 4: Base med 5.4383s, New med 5.2501s (**+3.46% median speedup**)

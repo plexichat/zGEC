@@ -519,11 +519,25 @@ zgec_rans_encode_core(const zgec_rans_enc_table *tab,
     return 0;
 }
 
-/* Fast variant for tables whose every frequency is in [2, M-1], i.e. no
- * zero (invalid) symbol, no single-symbol identity and no f == 1 branch.
- * zgec_rans_encode scans the table once per call and only uses this when
- * that holds, so the three per-symbol tests disappear from the hot loop.
- * The arithmetic is identical to the checked core otherwise. */
+static __attribute__((always_inline)) inline void
+zgec_rans_step_fast(const zgec_rans_enc_table *tab,
+                    uint8_t s, uint32_t x,
+                    uint32_t *xout, uint16_t **wp)
+{
+    uint32_t f = (uint32_t)tab->f[s];
+    uint32_t nd = (x >= tab->xmax[s]) ? 1u : 0u;
+    **wp = (uint16_t)x;
+    *wp += nd;
+    x = nd ? (x >> 16) : x;
+    uint64_t prod = (uint64_t)x * (uint64_t)tab->f_recip[s];
+    uint32_t quo = (uint32_t)(prod >> 32);
+    uint32_t rems = x - quo * f;
+    uint32_t adj = (rems >= f) ? 1u : 0u;
+    quo -= adj;
+    rems += adj * f;
+    *xout = (quo << ZGEC_RANS_L) + rems + (uint32_t)tab->c[s];
+}
+
 static __attribute__((always_inline)) inline int
 zgec_rans_encode_core_simple(const zgec_rans_enc_table *tab,
                              uint8_t s, uint32_t x,
@@ -638,37 +652,60 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
         const zgec_rans_enc_table *tab = &tables[0];
         size_t full = len[7];
         int simple = 1;
-        /* One-time scan: the per-symbol f == 0 / 1 / M tests in the
-         * checked core are only needed when such a frequency exists.
-         * A zero frequency for a symbol that never occurs in Z is not an
-         * error (the checked core would never look at it), so any of
-         * these just selects the checked path. */
         for (int s = 0; s < ZGEC_NSYM_LIT; s++) {
             uint32_t f = tab->f[s];
             if (f < 2u || f == (uint32_t)ZGEC_RANS_M) { simple = 0; break; }
         }
-        for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
-            size_t round = round_p1 - 1;
-            if (round < full) {
-                /* Commit order is lane 7 down to lane 0: each lane writes
-                 * the slot left by the previous commit, so later (lower)
-                 * lanes overwrite earlier uncommitted words at a shared
-                 * offset, exactly as the serial version did. Only one
-                 * lane's temporaries are live at a time. */
-                if (simple) {
-                    ZGEC_RANS_ROUND(zgec_rans_encode_core_simple);
-                } else {
-                    ZGEC_RANS_ROUND(zgec_rans_encode_core);
-                }
-            } else {
+        if (simple) {
+            size_t round_p1 = max_rounds;
+            for (; round_p1 > full; round_p1--) {
+                size_t round = round_p1 - 1;
                 for (int lane = 7; lane >= 0; lane--) {
-                    size_t j;
                     if (round >= len[lane]) continue;
-                    j = start[lane] + round;
+                    size_t j = start[lane] + round;
                     uint8_t s = Z[j];
-                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                        if (words_owned) zgec_free(words);
-                        return 0;
+                    uint32_t ns, wv, nd;
+                    zgec_rans_encode_core_simple(tab, s, state[lane], &ns, &wv, &nd);
+                    state[lane] = ns;
+                    words[nwords] = (uint16_t)wv;
+                    nwords += nd;
+                }
+            }
+
+            uint32_t st7 = state[7], st6 = state[6], st5 = state[5], st4 = state[4];
+            uint32_t st3 = state[3], st2 = state[2], st1 = state[1], st0 = state[0];
+            uint16_t *wp = words + nwords;
+
+            for (; round_p1 > 0; round_p1--) {
+                size_t round = round_p1 - 1;
+                zgec_rans_step_fast(tab, Z[start[7] + round], st7, &st7, &wp);
+                zgec_rans_step_fast(tab, Z[start[6] + round], st6, &st6, &wp);
+                zgec_rans_step_fast(tab, Z[start[5] + round], st5, &st5, &wp);
+                zgec_rans_step_fast(tab, Z[start[4] + round], st4, &st4, &wp);
+                zgec_rans_step_fast(tab, Z[start[3] + round], st3, &st3, &wp);
+                zgec_rans_step_fast(tab, Z[start[2] + round], st2, &st2, &wp);
+                zgec_rans_step_fast(tab, Z[start[1] + round], st1, &st1, &wp);
+                zgec_rans_step_fast(tab, Z[start[0] + round], st0, &st0, &wp);
+            }
+
+            state[7] = st7; state[6] = st6; state[5] = st5; state[4] = st4;
+            state[3] = st3; state[2] = st2; state[1] = st1; state[0] = st0;
+            nwords = (size_t)(wp - words);
+        } else {
+            for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
+                size_t round = round_p1 - 1;
+                if (round < full) {
+                    ZGEC_RANS_ROUND(zgec_rans_encode_core);
+                } else {
+                    for (int lane = 7; lane >= 0; lane--) {
+                        size_t j;
+                        if (round >= len[lane]) continue;
+                        j = start[lane] + round;
+                        uint8_t s = Z[j];
+                        if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                            if (words_owned) zgec_free(words);
+                            return 0;
+                        }
                     }
                 }
             }
