@@ -294,6 +294,8 @@ static inline int zgec_add_overflows(size_t a, size_t b) {
 /* ---- memory helpers (aligned) ---- */
 void *zgec_alloc(size_t n, size_t align);
 void  zgec_free(void *p);
+void  zgec_pool_flush(void);
+void  zgec_tls_touch(void);
 
 #ifdef __cplusplus
 }

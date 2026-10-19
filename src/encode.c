@@ -98,12 +98,14 @@ static void zgec_enc_work_run(zgec_enc_work *w)
 static DWORD WINAPI zgec_enc_work_proc_win(LPVOID arg)
 {
     zgec_enc_work_run((zgec_enc_work *)arg);
+    zgec_thread_pools_flush();
     return (DWORD)0;
 }
 #else
 static void *zgec_enc_work_proc_posix(void *arg)
 {
     zgec_enc_work_run((zgec_enc_work *)arg);
+    zgec_thread_pools_flush();
     return NULL;
 }
 #endif
@@ -187,6 +189,7 @@ static void zgec_enc_parallel_for(int n_threads, size_t n,
         zgec_free(started);
     }
 #endif
+    zgec_thread_pools_flush();
     zgec_mu_destroy(&w.mu);
 }
 
@@ -2662,21 +2665,21 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
          * above (table builds, desc serialisation, stream encodes),
          * so they must be released here; the tmp block is always
          * freed (and NULLed) at its failure sites. */
-        zgec_free(lit_desc);
-        zgec_free(lit_stream);
-        zgec_free(tb_blk);
+        zgec_free(lit_desc); lit_desc = NULL;
+        zgec_free(lit_stream); lit_stream = NULL;
+        zgec_free(tb_blk); tb_blk = NULL;
         for (ci = 0; ci < 3; ci++) {
-            zgec_fse_free_enc(enc_of3[ci]);
-            zgec_fse_free_dec(dec_of3[ci]);
-            zgec_fse_free_enc(enc_ll3[ci]);
-            zgec_fse_free_dec(dec_ll3[ci]);
+            zgec_fse_free_enc(enc_of3[ci]); enc_of3[ci] = NULL;
+            zgec_fse_free_dec(dec_of3[ci]); dec_of3[ci] = NULL;
+            zgec_fse_free_enc(enc_ll3[ci]); enc_ll3[ci] = NULL;
+            zgec_fse_free_dec(dec_ll3[ci]); dec_ll3[ci] = NULL;
         }
-        zgec_fse_free_enc(enc_ll);
-        zgec_fse_free_dec(dec_ll);
-        zgec_fse_free_enc(enc_ml);
-        zgec_fse_free_dec(dec_ml);
-        zgec_fse_free_enc(enc_of);
-        zgec_fse_free_dec(dec_of);
+        zgec_fse_free_enc(enc_ll); enc_ll = NULL;
+        zgec_fse_free_dec(dec_ll); dec_ll = NULL;
+        zgec_fse_free_enc(enc_ml); enc_ml = NULL;
+        zgec_fse_free_dec(dec_ml); dec_ml = NULL;
+        zgec_fse_free_enc(enc_of); enc_of = NULL;
+        zgec_fse_free_dec(dec_of); dec_of = NULL;
         return err;
     }
 

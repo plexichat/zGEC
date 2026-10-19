@@ -272,11 +272,11 @@ static void zgec_dict_prev_free(zgec_dict_prev *p)
     size_t i;
     if (!p) return;
     for (i = 0; i < 3; i++) {
-        if ((int)i < p->n_ll && p->ll[i]) zgec_fse_free_dec(p->ll[i]);
-        if ((int)i < p->n_of && p->of[i]) zgec_fse_free_dec(p->of[i]);
+        if ((int)i < p->n_ll && p->ll[i]) { zgec_fse_free_dec(p->ll[i]); p->ll[i] = NULL; }
+        if ((int)i < p->n_of && p->of[i]) { zgec_fse_free_dec(p->of[i]); p->of[i] = NULL; }
     }
-    if (p->ml) zgec_fse_free_dec(p->ml);
-    zgec_free(p->lit);
+    if (p->ml) { zgec_fse_free_dec(p->ml); p->ml = NULL; }
+    zgec_free(p->lit); p->lit = NULL;
     zgec_dict_prev_init(p);
 }
 
@@ -1010,13 +1010,13 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         return ZGEC_OK;
 
 lit_seq_fail:
-        zgec_free(rs);
-        zgec_free(lt);
+        zgec_free(rs); rs = NULL;
+        zgec_free(lt); lt = NULL;
         for (ti = 0; ti < 3; ti++) {
-            if (ti < n_ll && llt[ti]) zgec_fse_free_dec(llt[ti]);
-            if (ti < n_of && oft[ti]) zgec_fse_free_dec(oft[ti]);
+            if (ti < n_ll && llt[ti]) { zgec_fse_free_dec(llt[ti]); llt[ti] = NULL; }
+            if (ti < n_of && oft[ti]) { zgec_fse_free_dec(oft[ti]); oft[ti] = NULL; }
         }
-        if (mlt) zgec_fse_free_dec(mlt);
+        if (mlt) { zgec_fse_free_dec(mlt); mlt = NULL; }
         zgec_dict_seg_release(seg);
         return derr;
     }

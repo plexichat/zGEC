@@ -48,3 +48,9 @@ Also verified for this change: no encoder-table free can double-free --
 `enc_ll/ml/of` and the `enc_ll3/of3` clusters are NULLed after their one free,
 so the `seg_fail_tables` error path only frees NULLs when the success path
 already freed them. A -T 4 encode/decode round-trip and ASan-clean ctest pass.
+
+2026-10-19 - Allocator Pool Hardening, Double-Free Guards, and Thread-Exit Pool Teardown
+
+Learning: In `zgec_alloc`/`zgec_free` and `zgec_fse_enc_pool`, thread-local block pools reduce allocator lock contention and page-fault churn during high-throughput encoding. However, unmanaged thread exits left cached blocks un-freed, resulting in thread-exit memory leak reports under AddressSanitizer/LeakSanitizer. Adding POSIX `pthread` thread-specific key destructors and explicit worker thread teardown via `zgec_thread_pools_flush()` guarantees 100% cleanup of thread-local pools upon worker thread termination and process exit. Additionally, clearing `((void **)p)[-1] = NULL` in `zgec_free` and validating pointers in `zgec_fse_enc_return` against list cycles eliminates double-free vulnerabilities, while capping `zgec_fse_enc_pool` at 8 slots ensures memory bounds <= 32 MiB per thread are strictly maintained.
+
+Action: Always register thread-local pool destructors or invoke thread pool flushing prior to worker thread exit, clear freed interior pointer headers to guard against double-free attempts, and enforce strict slot count bounds on pooled allocation lists.

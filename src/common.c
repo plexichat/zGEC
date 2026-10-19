@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -136,10 +137,47 @@ static void *zgec_pool_take(size_t total)
     }
 }
 
+#if !defined(_WIN32)
+#include <pthread.h>
+
+static pthread_key_t zgec_tls_key;
+static pthread_once_t zgec_tls_key_once = PTHREAD_ONCE_INIT;
+
+static void zgec_tls_destructor(void *arg)
+{
+    (void)arg;
+    zgec_thread_pools_flush();
+}
+
+static void zgec_tls_key_init(void)
+{
+    (void)pthread_key_create(&zgec_tls_key, zgec_tls_destructor);
+}
+
+void zgec_tls_touch(void)
+{
+    pthread_once(&zgec_tls_key_once, zgec_tls_key_init);
+    if (pthread_getspecific(zgec_tls_key) == NULL) {
+        (void)pthread_setspecific(zgec_tls_key, (void *)1);
+    }
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+static void __attribute__((destructor)) zgec_process_exit_cleanup(void)
+{
+    zgec_thread_pools_flush();
+}
+#endif
+
+#else
+void zgec_tls_touch(void) {}
+#endif
+
 /* Offer a block to the cache; returns 0 if it was not taken (caller frees). */
 static int zgec_pool_put(void *raw, size_t total)
 {
     if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
+    zgec_tls_touch();
     zgec_pool[zgec_pool_n].raw = raw;
     zgec_pool[zgec_pool_n].total = total;
     zgec_pool_n++;
@@ -199,6 +237,8 @@ void *zgec_alloc(size_t n, size_t align)
     aligned = sum & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
     ((size_t *)aligned)[-2] = total;
+    assert(((size_t *)aligned)[-2] >= n + prefix);
+    assert((uintptr_t)aligned >= (uintptr_t)raw + 2u * sizeof(void *));
     return (void *)aligned;
 }
 
@@ -214,12 +254,26 @@ void zgec_free(void *p)
 {
     if (!p) return;
     void *raw = ((void **)p)[-1];
+    if (!raw) return;
+    ((void **)p)[-1] = NULL;
     size_t total = ((size_t *)p)[-2];
     if (total >= ZGEC_POOL_MIN && total <= ZGEC_POOL_MAX_BLOCK &&
         zgec_pool_put(raw, total)) {
         return;
     }
     free(raw);
+}
+
+/* Flush all cached blocks in the thread-local pool for the calling thread. */
+void zgec_pool_flush(void)
+{
+    unsigned i;
+    for (i = 0; i < zgec_pool_n; i++) {
+        free(zgec_pool[i].raw);
+        zgec_pool[i].raw = NULL;
+        zgec_pool[i].total = 0;
+    }
+    zgec_pool_n = 0;
 }
 
 /* ---- block pre-filter transforms (section 7.5) ---- */

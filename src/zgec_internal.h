@@ -16,6 +16,7 @@
  */
 
 #include "zgec_common.h"
+#include "zgec_fse.h"
 
 #include <stddef.h>
 #include <stdint.h>
@@ -137,6 +138,13 @@ static inline zgec_err zgec_check_stream_sentinel(const uint8_t *s, size_t n)
 static inline size_t zgec_filter_shuffle_count(size_t rows, size_t rem, size_t c)
 {
     return rows + ((c < rem) ? 1u : 0u);
+}
+
+/* Flush all thread-local allocator pools (common block pool and FSE encoder table pool). */
+static inline void zgec_thread_pools_flush(void)
+{
+    zgec_pool_flush();
+    zgec_fse_enc_pool_flush();
 }
 
 #endif /* ZGEC_INTERNAL_H */

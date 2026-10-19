@@ -1999,12 +1999,14 @@ static void zgec_phaseA_run_range(zgec_phaseA_range *r)
 static DWORD WINAPI zgec_phaseA_proc_win(LPVOID arg)
 {
     zgec_phaseA_run_range((zgec_phaseA_range *)arg);
+    zgec_thread_pools_flush();
     return (DWORD)0;
 }
 #else
 static void *zgec_phaseA_proc_posix(void *arg)
 {
     zgec_phaseA_run_range((zgec_phaseA_range *)arg);
+    zgec_thread_pools_flush();
     return NULL;
 }
 #endif
@@ -2067,6 +2069,7 @@ static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
     zgec_free(ths);
     zgec_free(started);
 #endif
+    zgec_thread_pools_flush();
 }
 
 /* Parallel Phase A for a whole block. Serial: parse headers, build
@@ -3360,12 +3363,14 @@ static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
 static DWORD WINAPI zgec_dec_blocks_proc_win(LPVOID arg)
 {
     zgec_dec_blocks_run((zgec_dec_block_job *)arg);
+    zgec_thread_pools_flush();
     return (DWORD)0;
 }
 #else
 static void *zgec_dec_blocks_proc_posix(void *arg)
 {
     zgec_dec_blocks_run((zgec_dec_block_job *)arg);
+    zgec_thread_pools_flush();
     return NULL;
 }
 #endif
@@ -3426,6 +3431,7 @@ static void zgec_dec_blocks_spawn(zgec_dec_block_job *jobs, size_t w)
     zgec_free(ths);
     zgec_free(started);
 #endif
+    zgec_thread_pools_flush();
 }
 
 /* A block worker: the parent's level and limits, serial inside the block

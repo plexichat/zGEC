@@ -60,6 +60,7 @@ void zgec_fse_free_dec(zgec_fse_dec_table *t);
 /* Build the encode table from a decode table. */
 zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *dec);
 void zgec_fse_free_enc(zgec_fse_enc_table *t);
+void zgec_fse_enc_pool_flush(void);
 
 /* ---- normalised-count serialisation (RFC 8878 section 4.1.1) ---- */
 
