@@ -450,6 +450,31 @@ byte-identical but **slower** (l4 +3.7%, l6 +2.5%). The common case is a byte
 that *does* match, so the extra load+branch is pure overhead on top of the xor
 the original already skipped. Do not re-attempt without a different structure.
 
+Measured NEGATIVE result -- AVX2 gather over `zgec_seq_lut512` (branch
+`bolt-fse-seq-opt-task2`): pad the LUT to 513 entries, load 8 values with
+`_mm256_i32gather_epi32(..., scale 2)`, shift/and to the code byte and pack.
+Byte-identical, but **neutral at l1** (0.0%) and **+0.4% at l4**; the gather
+costs as much as the eight scalar L1 loads it replaces on this CPU. The same
+branch's `binfo[256]` (base+nbits in one 8-byte record) and the folded `next[]`
+pass in `zgec_fse_build_dec` are also in the noise. Reverted.
+
 WINDOWS GOTCHA: `grp1`, `grp2`, `grp3` are macros in the MinGW/Windows headers
 (they expand to numeric resource constants), so local variables with those
 names do not compile here with `-Werror`. Use `ga`/`gb`/`gc`/`gd`.
+
+REJECTED for correctness -- multi-context rANS full-lane hoist
+(`jules-143888259400267764`, `bolt-opt-rans-fse-encode-throughput`): the
+unguarded "round < len[7]" fast path drops the `idx_lut[Z[j-1]] == 0xFF`
+sentinel test before indexing `tables[table_idx]`. `tables` has k+1 entries,
+so a 0xFF sentinel indexes far out of bounds. Do not take it unless the
+sentinel is proven impossible for k>1 and an assert/fuzz run backs that up.
+
+REJECTED for safety -- decode branch `jules-decode-opt-rans-match-copy`:
+the seq_decode_cond changes delete the `symbol` range test, the `pad > 32`
+test and the whole `bad_symbol` path, so a malformed stream can index the
+symbol/extra tables out of range (and shift by an unbounded amount). Its
+reported l7/l10 decode gain (~10%) comes partly from that removed work. The
+match-copy dispatch rewrite in the same commit is worth porting *with* the
+validation kept, if a decode pass is ever done.
+
+`bolt/fuzz-leak-and-enc-perf` commits compiled binaries and changes no source.

@@ -52,3 +52,20 @@ already freed them. A -T 4 encode/decode round-trip and ASan-clean ctest pass.
 2026-10-19 - Thread-Local Pool Retention in Short-Lived Worker Threads
 Learning: When parallel encoding or decoding loops spawn transient POSIX/Windows worker threads, retaining cached memory blocks in thread-local storage (`zgec_pool` in `src/common.c` and `zgec_fse_enc_pool` in `src/fse.c`) across worker thread completion causes memory leaks upon thread termination under LeakSanitizer (LSan). Explicitly draining and releasing all cached blocks in thread-local pools (`zgec_thread_cleanup`) at worker thread exit eliminates the leak. (These are real leaks, not sanitizer false positives: the blocks become unreachable when the thread's TLS is torn down.)
 Action: Always invoke `zgec_thread_cleanup()` before worker threads terminate in parallel work dispatch routines.
+
+2026-10-19 - Audit of the inbound agent branches: two memory-safety regressions to reject
+Learning: Two of the 2026-10-19 bolt/jules branches buy speed by deleting
+validation on the *decompression* path, which consumes untrusted bytes:
+  - `jules-decode-opt-rans-match-copy` (src/decode.c, `seq_decode_cond`) removes
+    the `symbol` range test, the `pad > 32` test and the `bad_symbol` cleanup
+    label. A corrupt stream can then drive `zgec_seq_extra` / symbol tables out
+    of range and shift by an unbounded amount. The reported ~10% decode gain is
+    partly the removed checks.
+  - `jules-143888...` and `bolt-opt-rans-fse-encode-throughput` hoist the
+    multi-context rANS loop without the `idx_lut[...] == 0xFF` sentinel test,
+    so `tables[255]` can be indexed when the table array holds k+1 <= 4 entries.
+Action: The encoder may assume its own buffers, but the decoder must keep every
+range check. Treat "deleted bounds check" as a failed review even if the
+reported speedup is large; a decode optimisation must be re-done with the checks
+in place. (The match-copy dispatch rewrite in that branch is otherwise sound and
+can be ported separately.)
