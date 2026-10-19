@@ -1327,6 +1327,41 @@ void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
     *bw_ptr = p;
 }
 
+/* Same drain as above for callers whose value is already known to fit in
+ * n bits (a transition field fused with its extra bits: the concatenation
+ * is less than 2^n by construction). Skipping the mask and the n == 0
+ * branch matters in the serial sequence loop, where n == 0 is common (a
+ * high-count state paired with a no-extra-bits code) and the branch is a
+ * coin flip that mispredicts. */
+static inline ZGEC_FSE_BW_INLINE
+void zgec_fse_bw_write_raw(uint64_t *bw_acc, unsigned *bw_nacc,
+                           uint8_t **bw_ptr, const uint8_t *bw_end,
+                           int *overflow, uint64_t val, unsigned n)
+{
+    uint64_t acc = *bw_acc | (val << *bw_nacc);
+    unsigned nacc = *bw_nacc + n;
+    uint8_t *p = *bw_ptr;
+    unsigned flush = (nacc >= 32u) ? 1u : 0u;
+    zgec_wr32(p, (uint32_t)acc);
+    p += (size_t)flush * 4u;
+    acc = flush ? (acc >> 32u) : acc;
+    nacc -= flush * 32u;
+    if (nacc >= 32u) {
+        if (p + 4 > bw_end) {
+            *bw_acc = acc; *bw_nacc = nacc; *bw_ptr = p;
+            *overflow = 1;
+            return;
+        }
+        zgec_wr32(p, (uint32_t)acc);
+        p += 4;
+        acc >>= 32u;
+        nacc -= 32u;
+    }
+    *bw_acc = acc;
+    *bw_nacc = nacc;
+    *bw_ptr = p;
+}
+
 zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
                           const uint32_t *values, const uint8_t *syms, size_t n,
                           const uint32_t *base, const uint8_t *nbits)
@@ -1412,7 +1447,7 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             mask = (nb >= 32u) ? 0xFFFFFFFFu : ((1u << nb) - 1u);
             comb |= (uint64_t)(extra & mask) << cn;
             cn += nb;
-            zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, comb, cn);
+            zgec_fse_bw_write_raw(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, comb, cn);
             if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
             state = entry.new_state;
         }
