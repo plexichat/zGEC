@@ -111,6 +111,9 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
     int S = 1 << al;
     int effective_sum = 0;
     int s_eff = 0;
+    int next[256];
+    memset(next, 0, sizeof(next));
+
 #if defined(__AVX2__)
     __m256i vsum = _mm256_setzero_si256();
     __m256i vone = _mm256_set1_epi32(1);
@@ -124,6 +127,7 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
         __m256i vneg = _mm256_cmpgt_epi32(vzero, vc);
         __m256i veff = _mm256_blendv_epi8(vc, vone, vneg);
         vsum = _mm256_add_epi32(vsum, veff);
+        _mm256_storeu_si256((__m256i *)(void *)(next + s_eff), veff);
     }
     __m128i vlow = _mm256_castsi256_si128(vsum);
     __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
@@ -136,6 +140,7 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
         if (counts[s_eff] < -1) return ZGEC_ERR_FSE_COUNTS;
         int eff = counts[s_eff] < 0 ? 1 : counts[s_eff];
         effective_sum += eff;
+        next[s_eff] = eff;
     }
     if (effective_sum != S) return ZGEC_ERR_FSE_SUM;
 
@@ -152,7 +157,6 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
        the second pass reads table[i] while writing t->e[i], which would
        otherwise alias. */
     unsigned char table[1u << ZGEC_MAX_AL];   /* S <= 2048 */
-    memset(table, 0, (size_t)S);
     int high = S - 1;
     for (int s_idx = 0; s_idx < nsym; s_idx++) {
         if (counts[s_idx] < 0) table[high--] = (unsigned char)s_idx;
@@ -169,22 +173,6 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
         }
     }
     if (pos != 0) { zgec_free(t); return ZGEC_ERR_FSE_COUNTS; }
-
-    int next[256];
-    memset(next, 0, sizeof(next));
-    int s_next = 0;
-#if defined(__AVX2__)
-    __m256i vone_nxt = _mm256_set1_epi32(1);
-    __m256i vzero_nxt = _mm256_setzero_si256();
-    for (; s_next + 8 <= nsym; s_next += 8) {
-        __m128i raw16 = _mm_loadu_si128((const __m128i *)(const void *)(counts + s_next));
-        __m256i vc = _mm256_cvtepi16_epi32(raw16);
-        __m256i vneg = _mm256_cmpgt_epi32(vzero_nxt, vc);
-        __m256i veff = _mm256_blendv_epi8(vc, vone_nxt, vneg);
-        _mm256_storeu_si256((__m256i *)(void *)(next + s_next), veff);
-    }
-#endif
-    for (; s_next < nsym; s_next++) next[s_next] = counts[s_next] < 0 ? 1 : counts[s_next];
     for (int i = 0; i < S; i++) {
         int s = table[i];
         if (s < 0 || s >= nsym) { zgec_free(t); return ZGEC_ERR_FSE_COUNTS; }
@@ -360,6 +348,11 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                 lo = (int)bl;                        /* decoder next-state range is
                                                         [baseline, baseline+range-1] */
                 hi = lo + (int)range - 1;
+                uint64_t ent = (uint64_t)nb
+                             | ((uint64_t)st << 16)
+                             | ((uint64_t)bl << 32)
+                             | ((uint64_t)1u << 48);
+                size_t base_idx = (size_t)s * (size_t)S;
                 for (stprev = lo; stprev <= hi; stprev++) {
                     size_t idx, byte;
                     uint8_t bit;
@@ -371,20 +364,8 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
                     }
                     covered[byte] = (uint8_t)(covered[byte] | bit);
                     covered_cells++;
-                    idx = (size_t)s * (size_t)S + (size_t)stprev;
-                    /* Write the whole 8-byte entry as one store instead of
-                     * four narrow field stores (the cells tile densely, so
-                     * this is the inner term of the build). Byte order is
-                     * the struct's: nb_bits at 0, new_state at 2, baseline
-                     * at 4, pad at 6; the byte at 1 is struct padding and
-                     * is never read. */
-                    {
-                        uint64_t ent = (uint64_t)nb
-                                     | ((uint64_t)st << 16)
-                                     | ((uint64_t)bl << 32)
-                                     | ((uint64_t)1u << 48);
-                        memcpy(&full->e[idx], &ent, sizeof(ent));
-                    }
+                    idx = base_idx + (size_t)stprev;
+                    memcpy(&full->e[idx], &ent, sizeof(ent));
                 }
             }
             /* Only a symbol that occurs has a partition to be complete: the
@@ -1309,13 +1290,23 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     }
 
     if (base != NULL && nbits != NULL) {
+        struct {
+            uint32_t base;
+            uint32_t nbits;
+        } binfo[256];
+        int nsym_build = (t->nsym < 256) ? t->nsym : 256;
+        for (int s = 0; s < nsym_build; s++) {
+            binfo[s].base = base[s];
+            binfo[s].nbits = (uint32_t)nbits[s];
+        }
+
         for (size_t i = n - 1; i > 0; i--) {
             uint8_t s = syms[i - 1];
             const zgec_fse_enc_entry *row;
             zgec_fse_enc_entry entry;
             uint32_t bits;
             uint32_t val = values[i - 1];
-            unsigned nb = (unsigned)nbits[s];
+            unsigned nb;
             uint64_t comb;
             unsigned cn;
             uint32_t lo;
@@ -1347,7 +1338,8 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
              * the symbol derivation already rules out. */
             comb = (uint64_t)bits;
             cn = (unsigned)entry.nb_bits;
-            lo = base[s];
+            lo = binfo[s].base;
+            nb = binfo[s].nbits;
             if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
             extra = val - lo;
             if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
