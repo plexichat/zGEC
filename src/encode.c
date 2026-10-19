@@ -1431,8 +1431,21 @@ static double zgec_seq_coded_bits_desc(const uint32_t *hist,
     double bits = 0.0;
     uint8_t tmp[1024];
     size_t nw = 0;
-    int s;
-    for (s = 0; s < ZGEC_NSYM_SEQ; s++) total += (uint64_t)hist[s];
+    int s = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    for (; s + 8 <= ZGEC_NSYM_SEQ; s += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + s));
+        vsum = _mm256_add_epi32(vsum, v);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+#endif
+    for (; s < ZGEC_NSYM_SEQ; s++) total += (uint64_t)hist[s];
     if (total == 0) {
         if (desc_bytes_out) *desc_bytes_out = 0;
         return 0.0;
@@ -1597,18 +1610,28 @@ static void zgec_hist_lit_slice(uint32_t *hist, const uint8_t *lit, size_t n)
         uint32_t c1[ZGEC_NSYM_LIT] = {0};
         uint32_t c2[ZGEC_NSYM_LIT] = {0};
         uint32_t c3[ZGEC_NSYM_LIT] = {0};
-        for (; i + 4 <= n; i += 4) {
-            c0[lit[i]]++;
-            c1[lit[i + 1]]++;
-            c2[lit[i + 2]]++;
-            c3[lit[i + 3]]++;
+        uint32_t c4[ZGEC_NSYM_LIT] = {0};
+        uint32_t c5[ZGEC_NSYM_LIT] = {0};
+        uint32_t c6[ZGEC_NSYM_LIT] = {0};
+        uint32_t c7[ZGEC_NSYM_LIT] = {0};
+        for (; i + 8 <= n; i += 8) {
+            c0[lit[i]]++;     c1[lit[i + 1]]++; c2[lit[i + 2]]++; c3[lit[i + 3]]++;
+            c4[lit[i + 4]]++; c5[lit[i + 5]]++; c6[lit[i + 6]]++; c7[lit[i + 7]]++;
         }
         for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
             __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
             __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
             __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
             __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
-            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+            __m256i v4 = _mm256_loadu_si256((const __m256i *)(const void *)(c4 + s));
+            __m256i v5 = _mm256_loadu_si256((const __m256i *)(const void *)(c5 + s));
+            __m256i v6 = _mm256_loadu_si256((const __m256i *)(const void *)(c6 + s));
+            __m256i v7 = _mm256_loadu_si256((const __m256i *)(const void *)(c7 + s));
+            __m256i sum01 = _mm256_add_epi32(v0, v1);
+            __m256i sum23 = _mm256_add_epi32(v2, v3);
+            __m256i sum45 = _mm256_add_epi32(v4, v5);
+            __m256i sum67 = _mm256_add_epi32(v6, v7);
+            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(sum01, sum23), _mm256_add_epi32(sum45, sum67));
             _mm256_storeu_si256((__m256i *)(hist + s), sum);
         }
     }
@@ -2164,6 +2187,7 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
     __m256i v1 = _mm256_set1_epi32(1);
     __m256i vzero = _mm256_setzero_si256();
     __m256i vml_sum_acc = _mm256_setzero_si256();
+    __m256i vmask511 = _mm256_set1_epi32((int)~511u);
     const __m256i v_offsets = _mm256_set_epi32(84, 72, 60, 48, 36, 24, 12, 0);
     for (; t + 8 <= n; t += 8) {
         const zgec_sequence *q = &parse->seq[s0 + t];
@@ -2182,14 +2206,44 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
         _mm256_storeu_si256((__m256i *)(p->of + t), v_ofv);
         _mm256_storeu_si256((__m256i *)(p->mls + t), v_mls);
 
-        for (size_t k = 0; k < 8; k++) {
-            uint8_t nb = 0;
-            p->h_ll[zgec_seq_code_of(p->ll[t + k], &nb)]++;
-            p->xbits += (uint64_t)nb;
-            p->h_ml[zgec_seq_code_of(p->ml[t + k], &nb)]++;
-            p->xbits += (uint64_t)nb;
-            p->h_of[zgec_seq_code_of(p->of[t + k], &nb)]++;
-            p->xbits += (uint64_t)nb;
+        if (_mm256_testz_si256(v_ll, vmask511)) {
+            for (size_t k = 0; k < 8; k++) {
+                uint16_t e = zgec_seq_lut512[p->ll[t + k]];
+                p->h_ll[e >> 8]++;
+                p->xbits += (uint64_t)(e & 0xFFu);
+            }
+        } else {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t nb = 0;
+                p->h_ll[zgec_seq_code_of(p->ll[t + k], &nb)]++;
+                p->xbits += (uint64_t)nb;
+            }
+        }
+        if (_mm256_testz_si256(v_mlv, vmask511)) {
+            for (size_t k = 0; k < 8; k++) {
+                uint16_t e = zgec_seq_lut512[p->ml[t + k]];
+                p->h_ml[e >> 8]++;
+                p->xbits += (uint64_t)(e & 0xFFu);
+            }
+        } else {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t nb = 0;
+                p->h_ml[zgec_seq_code_of(p->ml[t + k], &nb)]++;
+                p->xbits += (uint64_t)nb;
+            }
+        }
+        if (_mm256_testz_si256(v_ofv, vmask511)) {
+            for (size_t k = 0; k < 8; k++) {
+                uint16_t e = zgec_seq_lut512[p->of[t + k]];
+                p->h_of[e >> 8]++;
+                p->xbits += (uint64_t)(e & 0xFFu);
+            }
+        } else {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t nb = 0;
+                p->h_of[zgec_seq_code_of(p->of[t + k], &nb)]++;
+                p->xbits += (uint64_t)nb;
+            }
         }
     }
     {
@@ -2977,12 +3031,14 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
     uint32_t c1[ZGEC_NSYM_LIT] = {0};
     uint32_t c2[ZGEC_NSYM_LIT] = {0};
     uint32_t c3[ZGEC_NSYM_LIT] = {0};
+    uint32_t c4[ZGEC_NSYM_LIT] = {0};
+    uint32_t c5[ZGEC_NSYM_LIT] = {0};
+    uint32_t c6[ZGEC_NSYM_LIT] = {0};
+    uint32_t c7[ZGEC_NSYM_LIT] = {0};
     i = 0;
-    for (; i + 4 <= n; i += 4) {
-        c0[p[i]]++;
-        c1[p[i + 1]]++;
-        c2[p[i + 2]]++;
-        c3[p[i + 3]]++;
+    for (; i + 8 <= n; i += 8) {
+        c0[p[i]]++;     c1[p[i + 1]]++; c2[p[i + 2]]++; c3[p[i + 3]]++;
+        c4[p[i + 4]]++; c5[p[i + 5]]++; c6[p[i + 6]]++; c7[p[i + 7]]++;
     }
     for (; i < n; i++) {
         c0[p[i]]++;
@@ -2993,12 +3049,20 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
         __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
         __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
         __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
-        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+        __m256i v4 = _mm256_loadu_si256((const __m256i *)(const void *)(c4 + s));
+        __m256i v5 = _mm256_loadu_si256((const __m256i *)(const void *)(c5 + s));
+        __m256i v6 = _mm256_loadu_si256((const __m256i *)(const void *)(c6 + s));
+        __m256i v7 = _mm256_loadu_si256((const __m256i *)(const void *)(c7 + s));
+        __m256i sum01 = _mm256_add_epi32(v0, v1);
+        __m256i sum23 = _mm256_add_epi32(v2, v3);
+        __m256i sum45 = _mm256_add_epi32(v4, v5);
+        __m256i sum67 = _mm256_add_epi32(v6, v7);
+        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(sum01, sum23), _mm256_add_epi32(sum45, sum67));
         _mm256_storeu_si256((__m256i *)(hist + s), sum);
     }
 #else
     for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
-        hist[s] = c0[s] + c1[s] + c2[s] + c3[s];
+        hist[s] = c0[s] + c1[s] + c2[s] + c3[s] + c4[s] + c5[s] + c6[s] + c7[s];
     }
 #endif
     i = 1;
