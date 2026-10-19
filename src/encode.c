@@ -370,14 +370,14 @@ static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym,
     if (total == 0) return 0.0;
     {
         double tlog = zgec_fast_log2_u64(total);
-        double bits = 0.0;
+        double sum_hlog = 0.0;
         for (int s = 0; s < nsym; s++) {
-            if (hist[s] > 0) {
-                bits += (double)(uint64_t)hist[s] *
-                        (tlog - zgec_fast_log2_u64((uint64_t)hist[s]));
+            uint32_t c = hist[s];
+            if (c > 1u) {
+                sum_hlog += (double)(uint64_t)c * zgec_fast_log2_u64((uint64_t)c);
             }
         }
-        return bits;
+        return (double)total * tlog - sum_hlog;
     }
 }
 
@@ -1597,20 +1597,40 @@ static void zgec_hist_lit_slice(uint32_t *hist, const uint8_t *lit, size_t n)
         uint32_t c1[ZGEC_NSYM_LIT] = {0};
         uint32_t c2[ZGEC_NSYM_LIT] = {0};
         uint32_t c3[ZGEC_NSYM_LIT] = {0};
-        for (; i + 4 <= n; i += 4) {
+        uint32_t c4[ZGEC_NSYM_LIT] = {0};
+        uint32_t c5[ZGEC_NSYM_LIT] = {0};
+        uint32_t c6[ZGEC_NSYM_LIT] = {0};
+        uint32_t c7[ZGEC_NSYM_LIT] = {0};
+        for (; i + 8 <= n; i += 8) {
             c0[lit[i]]++;
             c1[lit[i + 1]]++;
             c2[lit[i + 2]]++;
             c3[lit[i + 3]]++;
+            c4[lit[i + 4]]++;
+            c5[lit[i + 5]]++;
+            c6[lit[i + 6]]++;
+            c7[lit[i + 7]]++;
+        }
+        for (; i < n; i++) {
+            c0[lit[i]]++;
         }
         for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
             __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
             __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
             __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
             __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
-            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+            __m256i v4 = _mm256_loadu_si256((const __m256i *)(const void *)(c4 + s));
+            __m256i v5 = _mm256_loadu_si256((const __m256i *)(const void *)(c5 + s));
+            __m256i v6 = _mm256_loadu_si256((const __m256i *)(const void *)(c6 + s));
+            __m256i v7 = _mm256_loadu_si256((const __m256i *)(const void *)(c7 + s));
+            __m256i sum01 = _mm256_add_epi32(v0, v1);
+            __m256i sum23 = _mm256_add_epi32(v2, v3);
+            __m256i sum45 = _mm256_add_epi32(v4, v5);
+            __m256i sum67 = _mm256_add_epi32(v6, v7);
+            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(sum01, sum23), _mm256_add_epi32(sum45, sum67));
             _mm256_storeu_si256((__m256i *)(hist + s), sum);
         }
+        return;
     }
 #endif
     for (; i < n; i++) hist[lit[i]]++;
@@ -1773,13 +1793,11 @@ static zgec_err zgec_select_coder(const zgec_params *params,
         }
         {
             uint32_t rhist[ZGEC_NSYM_LIT];
-            size_t r;
             double cyc =
                 slow_sublit ? ZGEC_ENC_CYC_SUBLIT_SLOW_PER_SYM
                             : (ZGEC_ENC_CYC_RANS_PER_SYM +
                                ZGEC_ENC_CYC_SUBLIT_FAST_PER_SYM);
-            memset(rhist, 0, sizeof(rhist));
-            for (r = 0; r < n_lit_slice; r++) rhist[resid[r]]++;
+            zgec_hist_lit_slice(rhist, resid, n_lit_slice);
             /* NOTE (D9): raw residuals are never scored: bytewise they
              * are exactly n_lit_slice bytes like raw plain, with no
              * better model, so raw plain always ties-or-beats them. */
@@ -2977,12 +2995,20 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
     uint32_t c1[ZGEC_NSYM_LIT] = {0};
     uint32_t c2[ZGEC_NSYM_LIT] = {0};
     uint32_t c3[ZGEC_NSYM_LIT] = {0};
+    uint32_t c4[ZGEC_NSYM_LIT] = {0};
+    uint32_t c5[ZGEC_NSYM_LIT] = {0};
+    uint32_t c6[ZGEC_NSYM_LIT] = {0};
+    uint32_t c7[ZGEC_NSYM_LIT] = {0};
     i = 0;
-    for (; i + 4 <= n; i += 4) {
+    for (; i + 8 <= n; i += 8) {
         c0[p[i]]++;
         c1[p[i + 1]]++;
         c2[p[i + 2]]++;
         c3[p[i + 3]]++;
+        c4[p[i + 4]]++;
+        c5[p[i + 5]]++;
+        c6[p[i + 6]]++;
+        c7[p[i + 7]]++;
     }
     for (; i < n; i++) {
         c0[p[i]]++;
@@ -2993,12 +3019,20 @@ static void zgec_enc_sample_stats(const uint8_t *p, size_t n,
         __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
         __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
         __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
-        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+        __m256i v4 = _mm256_loadu_si256((const __m256i *)(const void *)(c4 + s));
+        __m256i v5 = _mm256_loadu_si256((const __m256i *)(const void *)(c5 + s));
+        __m256i v6 = _mm256_loadu_si256((const __m256i *)(const void *)(c6 + s));
+        __m256i v7 = _mm256_loadu_si256((const __m256i *)(const void *)(c7 + s));
+        __m256i sum01 = _mm256_add_epi32(v0, v1);
+        __m256i sum23 = _mm256_add_epi32(v2, v3);
+        __m256i sum45 = _mm256_add_epi32(v4, v5);
+        __m256i sum67 = _mm256_add_epi32(v6, v7);
+        __m256i sum = _mm256_add_epi32(_mm256_add_epi32(sum01, sum23), _mm256_add_epi32(sum45, sum67));
         _mm256_storeu_si256((__m256i *)(hist + s), sum);
     }
 #else
     for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
-        hist[s] = c0[s] + c1[s] + c2[s] + c3[s];
+        hist[s] = c0[s] + c1[s] + c2[s] + c3[s] + c4[s] + c5[s] + c6[s] + c7[s];
     }
 #endif
     i = 1;

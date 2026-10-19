@@ -1,3 +1,6 @@
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #include "zgec_lit.h"
 
 #include <stddef.h>
@@ -193,7 +196,26 @@ zgec_err zgec_lit_runstart(uint8_t *runstart,
     /* Pass 1: prove sum(ll) <= n_lit without touching runstart. */
     {
         size_t vpos = 0;
-        for (size_t vi = 0; vi < n_seq; vi++) {
+        size_t vi = 0;
+#if defined(__AVX2__)
+        __m256i vn_lit = _mm256_set1_epi32((n_lit > (size_t)INT32_MAX) ? INT32_MAX : (int)n_lit);
+        __m256i vsum = _mm256_setzero_si256();
+        while (vi + 8 <= n_seq) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(ll + vi));
+            unsigned gt = (unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(_mm256_cmpgt_epi32(v, vn_lit)));
+            if (gt != 0u) return ZGEC_ERR_LL_SUM;
+            vsum = _mm256_add_epi32(vsum, v);
+            vi += 8;
+        }
+        __m128i vlow = _mm256_castsi256_si128(vsum);
+        __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+        vlow = _mm_add_epi32(vlow, vhigh);
+        vlow = _mm_hadd_epi32(vlow, vlow);
+        vlow = _mm_hadd_epi32(vlow, vlow);
+        vpos += (size_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+        if (vpos > n_lit) return ZGEC_ERR_LL_SUM;
+#endif
+        for (; vi < n_seq; vi++) {
             size_t vadd = (size_t)ll[vi];
             if (vadd > n_lit - vpos) return ZGEC_ERR_LL_SUM;
             vpos += vadd;
