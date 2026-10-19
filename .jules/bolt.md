@@ -478,3 +478,35 @@ match-copy dispatch rewrite in the same commit is worth porting *with* the
 validation kept, if a decode pass is ever done.
 
 `bolt/fuzz-leak-and-enc-perf` commits compiled binaries and changes no source.
+
+Session 2026-10-19 -- closing the l7 emit gap and the parse split.
+
+PROFILED, no byte-identical win -- the ~15% of l7 inside emit that the phase
+timers did not name is the block-level context work: zgec_select_contexts on
+the plain literals 5.1%, the D6 sub-context residual build 2.2%, and
+zgec_select_contexts on the residuals 6.7%. Inside one call the split is
+runstart 0.7%, 4x64x256 histogram 2.5%, mode ranking 0.3%, and
+zgec_cluster_greedy 8.0% of total. The clustering is the cost: the seed
+evaluates 2016 pair deltas, each a 256-term floating-point accumulation whose
+order is part of the bitstream, so the dependent add chain (4 cycles/term)
+cannot be reassociated or vectorised without changing output. Fusing the
+sum into the seed (no 1 KiB temp row), hoisting the outer row into L1, and
+dropping the per-symbol zero test all measured neutral; reverted. Treat the
+greedy merge as a floor.
+
+PROFILED -- parse at l7 is main find 42% (36.8M calls), the lazy block 28%
+(13.05M probes at ip+1), and the rest of the loop body 29%. (Careful: a
+timer placed after the LL/ML/OF mode picks includes zgec_emit_lit_stream,
+which sits in the same else-block -- it is not all table build.)
+
+Measured NEGATIVE -- prefetching the bucket of the position after next
+(ip + 2*nstep) in the parse skip schedule: byte-identical but l7 min +1.5%.
+One find of lead time is already enough; the extra hash+prefetch is overhead.
+
+ACCEPTED -- zgec_fse_build_enc (commit 68ad5ec): only absent-symbol rows of
+the nsym*2^al encoder table are zeroed (present rows are filled completely by
+the occurrence loop), the per-range fill uses an AVX2 8-byte broadcast store
+four entries at a time, and the coverage/duplicate checks are debug-only.
+Byte-identical (pinned sizes and l7 SHA unchanged). Interleaved A/B, min of 7
+on a pinned core: l7 7429.2 -> 7191.7 ms (-3.2%), l4 2030.1 -> 2000.9 ms
+(-1.4%); medians -3.0% / -2.1%. ctest 4/4 and a -T 4 round-trip clean.
