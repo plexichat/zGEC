@@ -559,3 +559,33 @@ l7 61,909,039 and l7 SHA 13AF5E...4CDE, ctest 4/4, -T 4 round-trip clean.
 Interleaved A/B vs bb45bc8 (min of 9/7): l1 1122.2 -> 1115.0 ms (-0.6% min,
 medians 1142.1 -> 1119.8, -1.9%); l3 1794.7 -> 1772.0 ms (-1.3% min, median
 -0.3%). Emission's third scan is gone; prep still scans each segment once.
+
+Session 2026-10-19 (cont.) -- raw bit-writer for fused sequence fields.
+
+PROFILED -- zgec_fse_encode's serial loop (seqtbl encode ~15% of l1, ~14% of l3)
+dominates on the state chain but the inlined bit-writer still paid two
+data-dependent costs per symbol: an if (n == 0) return branch (n is the fused
+transition+extra width, and n == 0 is common: a high-count state paired with
+a no-extra-bits code) and a redundant mask recompute
+(n == 32 ? ... : (1ull << n) - 1) + AND.
+
+REJECTED -- a preflight that hoisted the row[0].pad marker, the nsym check and
+the nbits mask into a per-symbol table, with a three-stream lockstep encoder
+on top. The 3-lane version spilled badly (304 stack refs, 6.6 KB body) and was
+~20% slower; the preflight alone was neutral-to-slower because the mask table
+is a stack load and the pad/nsym scans cost real work. Also tried a full n-byte
+max(syms) preflight: pure overhead, removed.
+
+ACCEPTED -- zgec_fse_bw_write_raw: same drain as zgec_fse_bw_write_local, but
+no mask and no zero test. Valid because the caller passes a transition field
+fused with its extra bits, which is < 2^n by construction (bits < 2^cn_entry,
+extra < 2^nb, shifted by cn_entry). n == 0 stays branchless: val == 0, nacc
+unchanged, the (already unconditional) 32-bit store is simply overwritten.
+Used only in the base && nbits branch; the two-write fallback is untouched.
+
+Byte-identical: pinned sizes l1..l10 exact, l7 SHA
+13AF5E256B1731FEAC2FD795A51B9E9A8073F75E14990B75D2006D79FD1A4CDE, ctest 4/4,
+-T 4 round-trip clean. Isolated encode-phase rdtsc (min of 6): l1 424.5M ->
+395.5M ticks (-6.8%), l3 770.7M -> 687.7M (-10.8%). Whole-file interleaved A/B
+(pinned core, min of 9): l1 902.7 -> 898.9 ms (-0.4% min, medians -1.1%);
+l3 1569.7 -> 1551.0 ms (-1.2% min, medians -1.8%).
