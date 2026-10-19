@@ -1327,41 +1327,6 @@ void zgec_fse_bw_write_local(uint64_t *bw_acc, unsigned *bw_nacc,
     *bw_ptr = p;
 }
 
-/* Same drain as above for callers whose value is already known to fit in
- * n bits (a transition field fused with its extra bits: the concatenation
- * is less than 2^n by construction). Skipping the mask and the n == 0
- * branch matters in the serial sequence loop, where n == 0 is common (a
- * high-count state paired with a no-extra-bits code) and the branch is a
- * coin flip that mispredicts. */
-static inline ZGEC_FSE_BW_INLINE
-void zgec_fse_bw_write_raw(uint64_t *bw_acc, unsigned *bw_nacc,
-                           uint8_t **bw_ptr, const uint8_t *bw_end,
-                           int *overflow, uint64_t val, unsigned n)
-{
-    uint64_t acc = *bw_acc | (val << *bw_nacc);
-    unsigned nacc = *bw_nacc + n;
-    uint8_t *p = *bw_ptr;
-    unsigned flush = (nacc >= 32u) ? 1u : 0u;
-    zgec_wr32(p, (uint32_t)acc);
-    p += (size_t)flush * 4u;
-    acc = flush ? (acc >> 32u) : acc;
-    nacc -= flush * 32u;
-    if (nacc >= 32u) {
-        if (p + 4 > bw_end) {
-            *bw_acc = acc; *bw_nacc = nacc; *bw_ptr = p;
-            *overflow = 1;
-            return;
-        }
-        zgec_wr32(p, (uint32_t)acc);
-        p += 4;
-        acc >>= 32u;
-        nacc -= 32u;
-    }
-    *bw_acc = acc;
-    *bw_nacc = nacc;
-    *bw_ptr = p;
-}
-
 zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
                           const uint32_t *values, const uint8_t *syms, size_t n,
                           const uint32_t *base, const uint8_t *nbits)
@@ -1379,6 +1344,13 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     if (!values || !syms) return ZGEC_ERR_INVAL;
     if (bw->overflow) return ZGEC_ERR_BITSTREAM_OVERFLOW;
 
+    /* Hoist the table fields: the per-symbol 32-bit stores go through a
+     * uint8_t *, which may alias anything, so without these locals the
+     * compiler must reload t->e / t->al / t->nsym on every iteration. */
+    const zgec_fse_enc_entry *const ents = t->e;
+    const unsigned t_al = (unsigned)t->al;
+    const int t_nsym = t->nsym;
+
     uint64_t bw_acc = bw->acc;
     unsigned bw_nacc = bw->nacc;
     uint8_t *bw_ptr = bw->ptr;
@@ -1386,10 +1358,10 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     int overflow = 0;
 
     last_s = syms[n - 1];
-    if ((int)last_s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-    if ((t->e + ((size_t)last_s << t->al))[0].pad == 0)
+    if ((int)last_s >= t_nsym) return ZGEC_ERR_FSE_SYMBOL;
+    if ((ents + ((size_t)last_s << t_al))[0].pad == 0)
         return ZGEC_ERR_FSE_SYMBOL;
-    state = (t->e + ((size_t)last_s << t->al))[0].new_state;
+    state = (ents + ((size_t)last_s << t_al))[0].new_state;
 
     {
         uint32_t extra = 0u;
@@ -1413,10 +1385,9 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             unsigned cn;
             uint32_t lo;
             uint32_t extra;
-            uint32_t mask;
 
-            if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-            row = t->e + ((size_t)s << t->al);
+            if ((int)s >= t_nsym) return ZGEC_ERR_FSE_SYMBOL;
+            row = ents + ((size_t)s << t_al);
             if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
             entry = row[(size_t)state];
             bits = (state >= (uint32_t)entry.baseline)
@@ -1444,10 +1415,31 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
             extra = val - lo;
             if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-            mask = (nb >= 32u) ? 0xFFFFFFFFu : ((1u << nb) - 1u);
-            comb |= (uint64_t)(extra & mask) << cn;
+            /* extra is now known to fit in nb bits (and for nb >= 32 it is
+             * a full 32-bit value), so masking it again is a no-op. The
+             * transition field bits is < 2^entry.nb_bits <= 2^cn, so the
+             * two fields cannot overlap; + and | therefore agree. */
+            comb += (uint64_t)extra << cn;
             cn += nb;
-            zgec_fse_bw_write_raw(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, comb, cn);
+            bw_acc |= comb << bw_nacc;
+            bw_nacc += cn;
+            {
+                unsigned flush = (bw_nacc >= 32u) ? 1u : 0u;
+                zgec_wr32(bw_ptr, (uint32_t)bw_acc);
+                bw_ptr += (size_t)flush * 4u;
+                bw_acc = flush ? (bw_acc >> 32u) : bw_acc;
+                bw_nacc -= flush * 32u;
+            }
+            if (bw_nacc >= 32u) {
+                if (bw_ptr + 4 > bw_end) {
+                    overflow = 1;
+                } else {
+                    zgec_wr32(bw_ptr, (uint32_t)bw_acc);
+                    bw_ptr += 4;
+                    bw_acc >>= 32u;
+                    bw_nacc -= 32u;
+                }
+            }
             if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
             state = entry.new_state;
         }
@@ -1460,8 +1452,8 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
             uint32_t extra = 0u;
             unsigned nb = 0u;
 
-            if ((int)s >= t->nsym) return ZGEC_ERR_FSE_SYMBOL;
-            row = t->e + ((size_t)s << t->al);
+            if ((int)s >= t_nsym) return ZGEC_ERR_FSE_SYMBOL;
+            row = ents + ((size_t)s << t_al);
             if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
             entry = row[(size_t)state];
             bits = (state >= (uint32_t)entry.baseline)
@@ -1477,7 +1469,7 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
         }
     }
 
-    zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, state, (unsigned)t->al);
+    zgec_fse_bw_write_local(&bw_acc, &bw_nacc, &bw_ptr, bw_end, &overflow, state, (unsigned)t_al);
     if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
 
     unsigned bytes = bw_nacc >> 3;
