@@ -472,9 +472,12 @@ static void zgec_enc_rewrite_offbase_from_dist(zgec_parse *parse,
     }
 }
 
-/* rep0 in effect before each sequence of a run of n sequences. */
-static void zgec_enc_rep0_before(uint32_t *rep0_out,
-                                 const zgec_sequence *seq, size_t n)
+/* rep0 in effect before each sequence of a run of n sequences, and the
+ * rep0 after the last one (used as the tail literals' predictor, section
+ * 9.6). Both come from the same move-to-front chain, so they are produced
+ * in one pass instead of two. Returns the tail rep0. */
+static uint32_t zgec_enc_rep0_both(uint32_t *rep0_out,
+                                   const zgec_sequence *seq, size_t n)
 {
     zgec_reps r;
     size_t i;
@@ -483,16 +486,6 @@ static void zgec_enc_rep0_before(uint32_t *rep0_out,
         rep0_out[i] = r.rep[0];
         (void)zgec_reps_resolve(&r, seq[i].offbase);
     }
-}
-
-/* rep0 in effect after the last sequence of a run (used as the tail
- * literals' predictor, section 9.6). */
-static uint32_t zgec_enc_rep0_after(const zgec_sequence *seq, size_t n)
-{
-    zgec_reps r;
-    size_t i;
-    zgec_reps_init(&r);
-    for (i = 0; i < n; i++) (void)zgec_reps_resolve(&r, seq[i].offbase);
     return r.rep[0];
 }
 
@@ -2225,8 +2218,7 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
         p->h_of[zgec_seq_code_of(ofv, &nb)]++;
         p->xbits += (uint64_t)nb;
     }
-    zgec_enc_rep0_before(p->rep0, &parse->seq[s0], n);
-    p->rep0_tail = zgec_enc_rep0_after(&parse->seq[s0], n);
+    p->rep0_tail = zgec_enc_rep0_both(p->rep0, &parse->seq[s0], n);
     if (seg_lit && n_lit_slice > 0) {
         zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
     }
@@ -3386,10 +3378,9 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                         tml[tt] = (qq->ml >= 3) ? (qq->ml - 3u) : 0u;
                         seg_ml += (uint64_t)qq->ml;
                     }
-                    zgec_enc_rep0_before(tr0, &parse->seq[s0], nn);
                     zgec_enc_build_resid(
                         rb + l0, parse->lit + l0, nl, tll, tml, nn, tr0,
-                        zgec_enc_rep0_after(&parse->seq[s0], nn), vb_all,
+                        zgec_enc_rep0_both(tr0, &parse->seq[s0], nn), vb_all,
                         vb_seg_base + bo2);
                     zgec_free(tll);
                     zgec_free(tml);
