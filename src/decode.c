@@ -1869,22 +1869,16 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
                 } else if (moff >= 8 && mlen <= 32 && raw_size > 64) {
-                    /* 1..32 bytes with off >= 8: four 8-byte chunks,
-                     * branch-free. Chunk k reads [d-off+8k, d-off+8k+8)
-                     * and writes [d+8k, d+8k+8): off >= 8 puts the source
-                     * before the destination of the same chunk, and the
-                     * bytes above d come from the earlier chunks, so the
-                     * result matches the byte-at-a-time order. Bytes past
-                     * the match end are written but never read: outside
-                     * the last-64 window every position below raw_size is
-                     * claimed and rewritten by a later sequence before
-                     * the buffer is read (the near-end guard above keeps
-                     * the last 64 exact, and raw_size > 64 is checked
-                     * here because that guard is what proves the slack). */
                     zgec_wr64(d, zgec_rd64(msrc));
-                    zgec_wr64(d + 8, zgec_rd64(msrc + 8));
-                    zgec_wr64(d + 16, zgec_rd64(msrc + 16));
-                    zgec_wr64(d + 24, zgec_rd64(msrc + 24));
+                    if (mlen > 8) {
+                        zgec_wr64(d + 8, zgec_rd64(msrc + 8));
+                        if (mlen > 16) {
+                            zgec_wr64(d + 16, zgec_rd64(msrc + 16));
+                            if (mlen > 24) {
+                                zgec_wr64(d + 24, zgec_rd64(msrc + 24));
+                            }
+                        }
+                    }
                 } else if (moff >= 32 && mlen >= 32) {
                     exec_match_wide(d, msrc, mlen, 32);
                 } else if (moff >= 16 && mlen >= 16) {
@@ -1922,9 +1916,24 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                     }
                     for (; i < mlen; i++) d[i] = msrc[i % 4];
 #endif
-                } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
-                    memcpy(d, msrc, 4);
-                    memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                } else if (moff >= 4 && mlen >= 4) {
+                    exec_match_wide(d, msrc, mlen, 4);
+                } else if (moff == 3 && mlen >= 3) {
+                    uint8_t s0 = msrc[0], s1 = msrc[1], s2 = msrc[2];
+                    size_t i = 0;
+                    while (i + 6 <= mlen) {
+                        d[i] = s0; d[i+1] = s1; d[i+2] = s2;
+                        d[i+3] = s0; d[i+4] = s1; d[i+5] = s2;
+                        i += 6;
+                    }
+                    if (i + 3 <= mlen) {
+                        d[i] = s0; d[i+1] = s1; d[i+2] = s2;
+                        i += 3;
+                    }
+                    if (i < mlen) {
+                        d[i] = s0;
+                        if (i + 1 < mlen) d[i+1] = s1;
+                    }
                 } else {
                     for (k = 0; k < mlen; k++) d[k] = msrc[k];
                 }

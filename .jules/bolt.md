@@ -589,3 +589,13 @@ Byte-identical: pinned sizes l1..l10 exact, l7 SHA
 395.5M ticks (-6.8%), l3 770.7M -> 687.7M (-10.8%). Whole-file interleaved A/B
 (pinned core, min of 9): l1 902.7 -> 898.9 ms (-0.4% min, medians -1.1%);
 l3 1569.7 -> 1551.0 ms (-1.2% min, medians -1.8%).
+
+## 2026-10-20 - Unrolled 8-Lane rANS Decoding ILP and Bounded Match Copying
+
+**Learning:**
+1. In `zgec_rans_decode` (`src/rans.c`), unrolling the 8 lanes during full rounds (`round < full && remaining > 15u`) into scalar register variables (`x0..x7`, `st0..st7`) for both `k = 1` and `k > 1` (no-runstart) streams allows superscalar hardware pipelines to execute independent table lookups, frequency multiplications, and bitstream renormalizations in parallel.
+2. Replacing individual per-lane validity checks with a combined bitwise OR check `if (!f0 || !f1 || !f2 || !f3 || !f4 || !f5 || !f6 || !f7)` eliminates 7 out of 8 branches per round while correctly detecting any invalid symbol state across all 8 lanes.
+3. In `exec_block` (`src/decode.c`), bounding unaligned 64-bit stores for `moff >= 8 && mlen <= 32` based on `mlen` avoids writing 32 bytes when `mlen <= 8`, and using 4-byte chunk copies for `moff >= 4 && mlen >= 4` and unrolled 3-byte pattern loops for `moff == 3 && mlen >= 3` completely eliminates slow scalar byte loops.
+
+**Action:**
+In multi-lane rANS decoders, hold lane states in scalar local variables with combined branch checks, and handle periodic match offsets (`moff == 3`, `moff >= 4`) with chunked or pattern-unrolled writes.
