@@ -250,7 +250,7 @@ struct zgec_matcher {
     uint32_t       c_flags[2];  /* bit0: c_hs valid, bit1: c_hl valid */
 };
 
-static inline uint32_t mf_hash5_v(uint64_t v)
+static inline __attribute__((always_inline)) uint32_t mf_hash5_v(uint64_t v)
 {
     uint32_t h = (uint32_t)v;
     h ^= h >> 15;
@@ -260,7 +260,7 @@ static inline uint32_t mf_hash5_v(uint64_t v)
     return h;
 }
 
-static inline uint32_t mf_hash4_v(uint32_t v)
+static inline __attribute__((always_inline)) uint32_t mf_hash4_v(uint32_t v)
 {
     uint32_t h = v;
     h ^= h >> 16;
@@ -269,7 +269,7 @@ static inline uint32_t mf_hash4_v(uint32_t v)
     return h;
 }
 
-static inline uint32_t mf_hash8_v(uint64_t v)
+static inline __attribute__((always_inline)) uint32_t mf_hash8_v(uint64_t v)
 {
     uint64_t x = v + 0x9E3779B97F4A7C15ULL;
     x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
@@ -281,7 +281,7 @@ static inline uint32_t mf_hash8_v(uint64_t v)
 /* Multiplicative hash of the 5 bytes at ip
  * (section 11.2). The caller must guarantee
  * ip + 5 <= vb_size. */
-static uint32_t mf_hash5(const uint8_t *vb, size_t ip)
+static inline __attribute__((always_inline)) uint32_t mf_hash5(const uint8_t *vb, size_t ip)
 {
     uint32_t h = zgec_rd32(vb + ip);
     h ^= h >> 15;
@@ -292,7 +292,7 @@ static uint32_t mf_hash5(const uint8_t *vb, size_t ip)
 }
 
 /* 4-byte variant for data classified as binary. */
-static uint32_t mf_hash4(const uint8_t *vb, size_t ip)
+static inline __attribute__((always_inline)) uint32_t mf_hash4(const uint8_t *vb, size_t ip)
 {
     uint32_t h = zgec_rd32(vb + ip);
     h ^= h >> 16;
@@ -305,7 +305,7 @@ static uint32_t mf_hash4(const uint8_t *vb, size_t ip)
  * bucket). Xorshift/multiply/xorshift: the final shift xors the high
  * bits down, so the returned low 32 bits mix all eight input bytes.
  * The caller must guarantee ip + 8 <= vb_size. */
-static uint32_t mf_hash8(const uint8_t *vb, size_t ip)
+static inline __attribute__((always_inline)) uint32_t mf_hash8(const uint8_t *vb, size_t ip)
 {
     uint64_t x = (uint64_t)zgec_rd64(vb + ip);
     x ^= x >> 33;
@@ -315,7 +315,7 @@ static uint32_t mf_hash8(const uint8_t *vb, size_t ip)
 }
 
 /* Short hash selected by the binary classification. */
-static uint32_t mf_hash_short(const zgec_matcher *m, const uint8_t *vb, size_t ip)
+static inline __attribute__((always_inline)) uint32_t mf_hash_short(const zgec_matcher *m, const uint8_t *vb, size_t ip)
 {
     if (m->is_binary) {
         return mf_hash4(vb, ip);
@@ -370,13 +370,13 @@ static int mf_classify_binary(const uint8_t *vb, size_t vb_size)
  * entry is the empty sentinel. Positions at or above
  * 2^24 - 1 cannot be packed distinctly and are
  * rejected by the caller. */
-static uint32_t mf_pack(uint32_t pos, uint32_t tag)
+static inline __attribute__((always_inline)) uint32_t mf_pack(uint32_t pos, uint32_t tag)
 {
     return ((pos + 1u) & ZGEC_MF_POS_MASK) | ((tag & ZGEC_MF_TAG_MASK) << ZGEC_MF_TAG_SHIFT);
 }
 
 /* Unpack the position from a non-empty entry. */
-static uint32_t mf_pos(uint32_t entry)
+static inline __attribute__((always_inline)) uint32_t mf_pos(uint32_t entry)
 {
     return (entry & ZGEC_MF_POS_MASK) - 1u;
 }
@@ -392,7 +392,7 @@ static void mf_prefetch_bucket(const void *line)
 /* Insert pos into the short bucket. The lanes are a ring: the next
  * write slot is short_head[bucket], so an insert is two stores rather
  * than an nlanes-wide shift. Lookup walks the ring newest first. */
-static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
+static inline __attribute__((always_inline)) void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
     uint32_t *b = &m->short_tab[(size_t)bucket << m->nlanes_shift];
     uint32_t h = (uint32_t)m->short_head[bucket];
@@ -406,12 +406,12 @@ static void mf_insert_short(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 
 /* Insert pos into the long table: one entry per
  * bucket, newest overwrites. */
-static void mf_insert_long(zgec_matcher *m, uint32_t bucket, uint32_t entry)
+static inline __attribute__((always_inline)) void mf_insert_long(zgec_matcher *m, uint32_t bucket, uint32_t entry)
 {
     m->long_tab[(size_t)bucket] = entry;
 }
 
-static void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int long_ok)
+static inline __attribute__((always_inline)) void mf_insert_pos(zgec_matcher *m, const uint8_t *vb, size_t pos, int long_ok)
 {
     uint32_t h;
     uint32_t bucket;
@@ -601,7 +601,7 @@ uint32_t mf_match_len(const uint8_t *vb, size_t ip, uint32_t d, uint32_t cap)
  * `newest` is the newest-lane index ((head - 1) & (nlanes - 1)): both
  * only gate work, the accessed range stays b[0 .. nlanes) and the hit
  * semantics are unchanged. */
-static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
+static inline __attribute__((always_inline)) uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
                                uint32_t want, uint32_t newest)
 {
     uint32_t e0;
@@ -694,7 +694,7 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
  * best->offset only changes on an assignment, so updating the flag
  * there yields the same value re-deriving it would while making each
  * candidate three compares cheaper. */
-static inline void mf_update_best(uint32_t d, uint32_t len, zgec_match *best,
+static inline __attribute__((always_inline)) void mf_update_best(uint32_t d, uint32_t len, zgec_match *best,
                                   uint32_t rep0, uint32_t rep1, uint32_t rep2,
                                   int *best_is_rep)
 {
