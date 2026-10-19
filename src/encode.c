@@ -89,7 +89,10 @@ static void zgec_enc_work_run(zgec_enc_work *w)
 {
     for (;;) {
         size_t i = zgec_atomic_fetch_add_size(&w->next, 1);
-        if (i >= w->n) return;
+        if (i >= w->n) {
+            zgec_thread_cleanup();
+            return;
+        }
         w->fn(w->ctx, i);
     }
 }
@@ -188,6 +191,7 @@ static void zgec_enc_parallel_for(int n_threads, size_t n,
     }
 #endif
     zgec_mu_destroy(&w.mu);
+    zgec_thread_cleanup();
 }
 
 zgec_err zgec_compress(const uint8_t *src, size_t src_size,

@@ -146,6 +146,17 @@ static int zgec_pool_put(void *raw, size_t total)
     return 1;
 }
 
+/* Free all cached blocks in the thread-local pool for the calling thread. */
+void zgec_alloc_cleanup_tls(void)
+{
+    while (zgec_pool_n > 0) {
+        zgec_pool_n--;
+        free(zgec_pool[zgec_pool_n].raw);
+        zgec_pool[zgec_pool_n].raw = NULL;
+        zgec_pool[zgec_pool_n].total = 0;
+    }
+}
+
 /* Aligned allocation via over-allocation: the block
    is [ original pointer ][ total size ][ padding ][ aligned data ].
    The original pointer is stored immediately before

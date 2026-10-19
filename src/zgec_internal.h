@@ -139,4 +139,14 @@ static inline size_t zgec_filter_shuffle_count(size_t rows, size_t rem, size_t c
     return rows + ((c < rem) ? 1u : 0u);
 }
 
+/* Thread-local memory pool cleanup declarations. */
+void zgec_alloc_cleanup_tls(void);
+void zgec_fse_cleanup_tls(void);
+
+static inline void zgec_thread_cleanup(void)
+{
+    zgec_fse_cleanup_tls();
+    zgec_alloc_cleanup_tls();
+}
+
 #endif /* ZGEC_INTERNAL_H */

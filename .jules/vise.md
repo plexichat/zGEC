@@ -48,3 +48,7 @@ Also verified for this change: no encoder-table free can double-free --
 `enc_ll/ml/of` and the `enc_ll3/of3` clusters are NULLed after their one free,
 so the `seg_fail_tables` error path only frees NULLs when the success path
 already freed them. A -T 4 encode/decode round-trip and ASan-clean ctest pass.
+
+2026-10-19 - Thread-Local Pool Retention in Short-Lived Worker Threads
+Learning: When parallel encoding or decoding loops spawn transient POSIX/Windows worker threads, retaining cached memory blocks in thread-local storage (`zgec_pool` in `src/common.c` and `zgec_fse_enc_pool` in `src/fse.c`) across worker thread completion causes memory leaks upon thread termination under LeakSanitizer (LSan). Explicitly draining and releasing all cached blocks in thread-local pools (`zgec_thread_cleanup`) at worker thread exit eliminates LSan false positives and memory leaks completely.
+Action: Always invoke `zgec_thread_cleanup()` before worker threads terminate in parallel work dispatch routines.
