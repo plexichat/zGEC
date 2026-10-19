@@ -433,3 +433,23 @@ Do NOT take without a byte-identity gate:
     be proven output-neutral before landing.
   - `bolt/fuzz-leak-and-enc-perf` commits compiled binaries to the repo and
     changes no source; ignore it.
+
+2026-10-19 note -- `zgec_ctx_body_bits` rewrite (from
+`origin/bolt/avx2-encode-throughput-opt`): iterate the histogram once per lane
+(`start[lane]..start[lane+1]`), count the lane's first byte as a runstart, and
+in the no-runstart case run a 4-wide unrolled interior loop with no per-byte
+lane-boundary test or `zgec_rs_get` call. Byte-identical; interleaved A/B at l7
+(min/median of 9) -1.2% / -1.2%. Kept. (The same branch's seq.c
+`_mm256_testz_si256` gate around the syms loop was not taken: it still does the
+scalar LUT lookups, so it only hoists a branch.)
+
+Measured NEGATIVE result -- `fast_parse` candidate pre-filters (tried directly
+on l4, the parse-bound tier): adding a single-byte gate at
+`max(best_len, MIN-1)` before the 64-bit xor in the rep and long probes is
+byte-identical but **slower** (l4 +3.7%, l6 +2.5%). The common case is a byte
+that *does* match, so the extra load+branch is pure overhead on top of the xor
+the original already skipped. Do not re-attempt without a different structure.
+
+WINDOWS GOTCHA: `grp1`, `grp2`, `grp3` are macros in the MinGW/Windows headers
+(they expand to numeric resource constants), so local variables with those
+names do not compile here with `-Werror`. Use `ga`/`gb`/`gc`/`gd`.

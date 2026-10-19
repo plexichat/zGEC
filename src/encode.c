@@ -1514,24 +1514,52 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        size_t next_lane_idx = 0;
         int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
-        for (j = 0; j < n_z; j++) {
-            if (has_rs && zgec_rs_get(runstart, j)) {
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
-            }
-            if (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) {
-                while (next_lane_idx < ZGEC_NLANES && j == start[next_lane_idx]) next_lane_idx++;
-                rs_hist[z[j]]++;
-                rs_total++;
-                continue;
-            }
-            {
-                unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                grp_total[grp]++;
+        for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
+            size_t l_start = start[lane];
+            size_t l_end = (lane + 1 < ZGEC_NLANES) ? start[lane + 1] : n_z;
+            if (l_start >= l_end) continue;
+
+            /* First byte of each lane is a lane start -> rs_hist */
+            rs_hist[z[l_start]]++;
+            rs_total++;
+
+            if (has_rs) {
+                for (j = l_start + 1; j < l_end; j++) {
+                    if (zgec_rs_get(runstart, j)) {
+                        rs_hist[z[j]]++;
+                        rs_total++;
+                    } else {
+                        unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                        cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                        grp_total[grp]++;
+                    }
+                }
+            } else {
+                /* Fast path: no runstarts and no lane boundary checks in interior */
+                j = l_start + 1;
+                for (; j + 4 <= l_end; j += 4) {
+                    unsigned ga = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)ga * 256u + (uint32_t)z[j]]++;
+                    grp_total[ga]++;
+
+                    unsigned gb = (unsigned)grp_lut[z[j]];
+                    cls_hist[(size_t)gb * 256u + (uint32_t)z[j + 1]]++;
+                    grp_total[gb]++;
+
+                    unsigned gc = (unsigned)grp_lut[z[j + 1]];
+                    cls_hist[(size_t)gc * 256u + (uint32_t)z[j + 2]]++;
+                    grp_total[gc]++;
+
+                    unsigned gd = (unsigned)grp_lut[z[j + 2]];
+                    cls_hist[(size_t)gd * 256u + (uint32_t)z[j + 3]]++;
+                    grp_total[gd]++;
+                }
+                for (; j < l_end; j++) {
+                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                    grp_total[grp]++;
+                }
             }
         }
     }
