@@ -1590,6 +1590,39 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
  * resid_in (P2) is a prebuilt residual the caller shares with
  * emission; scratch_cls/scratch_cond (M2) are block-level scratch
  * the caller may provide to avoid per-segment 64 KiB churn. */
+/* Byte histogram of a literal slice. Shared by zgec_seg_prep_build (so the
+ * per-segment histogram is built once) and zgec_select_coder when no
+ * prebuilt one is supplied. Eight accumulators avoid store-to-load
+ * forwarding stalls on runs of equal literals. */
+static void zgec_hist_lit_slice(uint32_t *hist, const uint8_t *lit, size_t n)
+{
+    size_t i = 0;
+    memset(hist, 0, ZGEC_NSYM_LIT * sizeof(*hist));
+#if defined(__AVX2__)
+    {
+        uint32_t c0[ZGEC_NSYM_LIT] = {0};
+        uint32_t c1[ZGEC_NSYM_LIT] = {0};
+        uint32_t c2[ZGEC_NSYM_LIT] = {0};
+        uint32_t c3[ZGEC_NSYM_LIT] = {0};
+        for (; i + 4 <= n; i += 4) {
+            c0[lit[i]]++;
+            c1[lit[i + 1]]++;
+            c2[lit[i + 2]]++;
+            c3[lit[i + 3]]++;
+        }
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+            __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+            __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+            __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
+            _mm256_storeu_si256((__m256i *)(hist + s), sum);
+        }
+    }
+#endif
+    for (; i < n; i++) hist[lit[i]]++;
+}
+
 static zgec_err zgec_select_coder(const zgec_params *params,
                                   const uint8_t *seg_lit, size_t n_lit_slice,
                                   const uint32_t *ll_arr,
@@ -1608,6 +1641,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                                   uint32_t *scratch_cls,
                                   uint32_t *scratch_cond,
                                   int allow_ll_cond,
+                                  const uint32_t *h_lit_in,
                                   zgec_coder_choice *out)
 {
     zgec_coder_choice best;
@@ -1619,7 +1653,6 @@ static zgec_err zgec_select_coder(const zgec_params *params,
     int resid_owned = 0;
     double seq_bits;
     int slow_sublit = 0;
-    size_t i;
 
     if (!params || !out) return ZGEC_ERR_INVAL;
     (void)h_ml;
@@ -1641,31 +1674,11 @@ static zgec_err zgec_select_coder(const zgec_params *params,
     if (n_lit_slice > 0) {
         hist = (uint32_t *)zgec_alloc(256 * sizeof(*hist), 64);
         if (!hist) return ZGEC_ERR_NOMEM;
-        memset(hist, 0, 256 * sizeof(*hist));
-        i = 0;
-#if defined(__AVX2__)
-        if (n_lit_slice >= 32) {
-            uint32_t c0[ZGEC_NSYM_LIT] = {0};
-            uint32_t c1[ZGEC_NSYM_LIT] = {0};
-            uint32_t c2[ZGEC_NSYM_LIT] = {0};
-            uint32_t c3[ZGEC_NSYM_LIT] = {0};
-            for (; i + 4 <= n_lit_slice; i += 4) {
-                c0[seg_lit[i]]++;
-                c1[seg_lit[i + 1]]++;
-                c2[seg_lit[i + 2]]++;
-                c3[seg_lit[i + 3]]++;
-            }
-            for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
-                __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
-                __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
-                __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
-                __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
-                __m256i sum = _mm256_add_epi32(_mm256_add_epi32(v0, v1), _mm256_add_epi32(v2, v3));
-                _mm256_storeu_si256((__m256i *)(hist + s), sum);
-            }
+        if (h_lit_in) {
+            memcpy(hist, h_lit_in, 256 * sizeof(*hist));
+        } else {
+            zgec_hist_lit_slice(hist, seg_lit, n_lit_slice);
         }
-#endif
-        for (; i < n_lit_slice; i++) hist[seg_lit[i]]++;
 
         /* Candidate: rANS order-0 on plain literals. The number of
          * literal tables is fixed per block by the block parameters
@@ -1946,7 +1959,8 @@ static zgec_err zgec_emit_lit_stream(uint8_t **desc, size_t *desc_size,
                                      uint32_t rep0_tail,
                                      const uint8_t *vb, size_t vb_base,
                                      size_t seg_out_start,
-                                     const uint8_t *resid_in)
+                                     const uint8_t *resid_in,
+                                     const uint32_t *h_lit_in)
 {
     uint8_t *z = NULL;
     const uint8_t *zin = lit_src;
@@ -2018,7 +2032,14 @@ static zgec_err zgec_emit_lit_stream(uint8_t **desc, size_t *desc_size,
     desc_buf = (uint8_t *)zgec_alloc(desc_cap, 64);
     if (!hist || !enc_tabs || !desc_buf) { err = ZGEC_ERR_NOMEM; goto done; }
 
-    zgec_rans_histograms(hist, n_tables, zin, lit_n, ctx_mode, cmap, runstart);
+    if (h_lit_in && lit_form == 0 && k <= 1) {
+        /* The caller already built this segment's plain-literal byte
+         * histogram for scoring: the k == 1 coder has exactly one table,
+         * so it IS the rANS table histogram. Saves a third full scan. */
+        memcpy(hist, h_lit_in, ZGEC_NSYM_LIT * sizeof(uint32_t));
+    } else {
+        zgec_rans_histograms(hist, n_tables, zin, lit_n, ctx_mode, cmap, runstart);
+    }
 
     for (t = 0; t < n_tables; t++) {
         int16_t counts[ZGEC_NSYM_LIT];
@@ -2098,6 +2119,7 @@ typedef struct {
     uint32_t *mls;     /* real ML >= 3 (carved from arena) */
     void *arena;       /* single allocation backing ll/ml/of/rep0/mls */
     uint8_t *resid;    /* sub-literal residual (owned, NULL unless built) */
+    uint32_t h_lit[ZGEC_NSYM_LIT]; /* plain-literal byte histogram */
 } zgec_seg_prep;
 
 static void zgec_seg_prep_free(zgec_seg_prep *p)
@@ -2126,7 +2148,13 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
     uint32_t *blk = NULL;
     if (!p || !parse) return ZGEC_ERR_INVAL;
     memset(p, 0, sizeof(*p));
-    if (n == 0) return ZGEC_OK;
+    if (n == 0) {
+        /* Literals-only segment: still needs the plain-literal histogram
+         * for coder selection and emission. */
+        if (seg_lit && n_lit_slice > 0)
+            zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
+        return ZGEC_OK;
+    }
     if (n > SIZE_MAX / (5 * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
     blk = (uint32_t *)zgec_alloc(n * 5 * sizeof(uint32_t),
                                 _Alignof(uint32_t));
@@ -2199,6 +2227,9 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
     }
     zgec_enc_rep0_before(p->rep0, &parse->seq[s0], n);
     p->rep0_tail = zgec_enc_rep0_after(&parse->seq[s0], n);
+    if (seg_lit && n_lit_slice > 0) {
+        zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
+    }
     if (want_resid && n_lit_slice > 0 && seg_lit && vb) {
         p->resid = (uint8_t *)zgec_alloc(n_lit_slice, 64);
         if (!p->resid) {
@@ -2357,6 +2388,9 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
                                        vb, vb_base, seg_out_start,
                                        (eff_form && eff_coder)
                                            ? prep->resid
+                                           : NULL,
+                                       (eff_form == 0 && lit_k <= 1)
+                                           ? prep->h_lit
                                            : NULL);
             if (err != ZGEC_OK && eff_coder != 0) {
                 /* D8: an rANS literal failure (table build or the
@@ -2376,7 +2410,7 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
                 err = zgec_emit_lit_stream(
                     &lit_desc, &lit_desc_size, &lit_stream, &lit_size,
                     parse->lit + l0, n_lit_slice, 0, 0, 1, 0, NULL, NULL,
-                    NULL, 0, NULL, 0, NULL, 0, 0, NULL);
+                    NULL, 0, NULL, 0, NULL, 0, 0, NULL, NULL);
             }
         }
         if (err != ZGEC_OK) goto seg_fail_tables;
@@ -2733,7 +2767,10 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
                                    (int)lit_cd->ctx_mode,
                                    (lit_k > 1) ? lit_cd->class_map : NULL,
                                    NULL, NULL, 0, NULL, 1u, NULL, 0, 0,
-                                   NULL);
+                                   NULL,
+                                   (eff_form == 0 && lit_k <= 1)
+                                       ? prep->h_lit
+                                       : NULL);
         if (err != ZGEC_OK && eff_coder != 0) {
             /* D8: fall back to raw plain literals (see above). */
             zgec_free(lit_desc);
@@ -2747,7 +2784,7 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
             err = zgec_emit_lit_stream(
                 &lit_desc, &lit_desc_size, &lit_stream, &lit_size,
                 parse->lit + l0, n_lit_slice, 0, 0, 1, 0, NULL, NULL,
-                NULL, 0, NULL, 0, NULL, 0, 0, NULL);
+                NULL, 0, NULL, 0, NULL, 0, 0, NULL, NULL);
         }
         if (err != ZGEC_OK) {
             zgec_free(lit_desc);
@@ -2883,7 +2920,7 @@ static void zgec_enc_seg_job(void *ctx, size_t s)
         (int)p->bp->sub.ctx_count, (int)p->bp->sub.ctx_mode,
         prep.h_ll, prep.h_ml, prep.h_of, prep.xbits, prep.resid,
         scratch_cls, scratch_cond,
-        p->params->use_litref ? 0 : 1, &choice);
+        p->params->use_litref ? 0 : 1, prep.h_lit, &choice);
     if (err != ZGEC_OK) { zgec_seg_prep_free(&prep); goto sjob_done; }
 
     err = zgec_emit_segment(&seg_payload, &seg_cap, &seg_off,

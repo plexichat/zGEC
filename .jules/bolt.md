@@ -535,3 +535,27 @@ Byte-identical: pinned sizes l1..l10 all exact, l7 SHA
 -T 4 round-trip clean. Interleaved A/B (pinned core, min of 9): l1 1135.8 ->
 1107.0 ms (-2.5% min; medians 1149.0 -> 1127.7, -1.9%); the hoisted simple
 path alone was ~1% of that.
+
+Session 2026-10-19 (cont.) -- literal histogram built once per segment.
+
+PROFILED -- segmentation is ~10% of l1. Its own split (temp rdtsc counters):
+literal/sequence histogram construction ~65%, greedy merge ~6%, seg_dist
+resolve ~9%, the two offbase rewrites ~19%. The block literal stream was
+being scanned three times: once for the granule histograms in
+zgec_segment_greedy, once in zgec_select_coder for scoring, and once more in
+zgec_rans_histograms at emission.
+
+ACCEPTED -- zgec_seg_prep_build now builds the plain-literal byte histogram
+(zgec_hist_lit_slice, the same 4-accumulator loop) and prep.h_lit is passed to
+both zgec_select_coder (copied instead of rescanned) and
+zgec_emit_lit_stream, which uses it directly when lit_form == 0 and k <= 1
+(exactly the single-table histogram zgec_rans_histograms would produce).
+Literals-only segments (n_seq == 0) return early from prep before the arrays,
+so they build h_lit in that early-return path too -- missing that changed the
+l1 size by +1.3 MB until fixed.
+
+Byte-identical: l1 80,567,687 / l2 79,091,618 / l3 68,006,258 / l4 65,059,955 /
+l7 61,909,039 and l7 SHA 13AF5E...4CDE, ctest 4/4, -T 4 round-trip clean.
+Interleaved A/B vs bb45bc8 (min of 9/7): l1 1122.2 -> 1115.0 ms (-0.6% min,
+medians 1142.1 -> 1119.8, -1.9%); l3 1794.7 -> 1772.0 ms (-1.3% min, median
+-0.3%). Emission's third scan is gone; prep still scans each segment once.
