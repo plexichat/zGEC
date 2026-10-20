@@ -839,3 +839,13 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-21 - AVX2 SIMD Vectorization across Encode Hot Paths
+
+**Learning:**
+1. In `include/zgec_lit.h` (`zgec_rs_is_empty`), checking if a run-start bitmap contains any non-zero bits previously processed 8 bytes at a time with 64-bit loads. Vectorizing 32 bytes at a time using 256-bit AVX2 SIMD (`_mm256_loadu_si256` + `_mm256_testz_si256`) branchlessly checks 256 bits per instruction, accelerating run-start bitmask validation across encoder context selection and rANS histogram generation loops.
+2. In `src/encode.c` (`zgec_enc_all_same_byte`), checking if a 32-byte chunk matches a target byte with `_mm256_xor_si256` and `_mm256_testz_si256` eliminates movemask byte extraction latency.
+3. In `src/dict.c` (`zgec_dict_store_literals`), sub-literal prediction residual addition when `lit_form == 1` and `rep0 >= 32` and `pos >= rep0` is vectorized 32 bytes at a time using 256-bit AVX2 SIMD (`_mm256_add_epi8`), avoiding scalar byte loops during dictionary literal reconstruction.
+
+**Action:**
+Use 256-bit AVX2 SIMD `_mm256_testz_si256` for bitmask zero checks and `_mm256_add_epi8` for predictive residual additions when `pos >= rep0 >= 32`.

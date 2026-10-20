@@ -400,8 +400,8 @@ static int zgec_enc_all_same_byte(const uint8_t *src, size_t n)
         __m256i target = _mm256_set1_epi8((char)src[0]);
         while (i + 32 <= n) {
             __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
-            unsigned m = (unsigned)_mm256_movemask_epi8(_mm256_cmpeq_epi8(v, target));
-            if (m != 0xFFFFFFFFu) return 0;
+            __m256i xor_v = _mm256_xor_si256(v, target);
+            if (!_mm256_testz_si256(xor_v, xor_v)) return 0;
             i += 32;
         }
     }
