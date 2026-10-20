@@ -589,3 +589,13 @@ Byte-identical: pinned sizes l1..l10 exact, l7 SHA
 395.5M ticks (-6.8%), l3 770.7M -> 687.7M (-10.8%). Whole-file interleaved A/B
 (pinned core, min of 9): l1 902.7 -> 898.9 ms (-0.4% min, medians -1.1%);
 l3 1569.7 -> 1551.0 ms (-1.2% min, medians -1.8%).
+
+## 2026-10-20 - Lock-Free Export Cache Slots, 8-Lane rANS Decode Unrolling, and Phase B Match Copying
+
+**Learning:**
+1. In `src/decode.c` (`zgec_export_slot`), mutex locking (`zgec_mu`) for frame literal export cache slots caused heavy setup and teardown overhead (`pthread_mutex_init` and `pthread_mutex_destroy` for every block in a frame). Replacing mutexes with a 32-bit atomic state machine (`0: UNINIT`, `1: EXPORTING`, `2: READY`) using `__atomic_compare_exchange_n` and `__atomic_store_n` with release memory order eliminates all per-slot mutex operations.
+2. In `src/rans.c` (`zgec_rans_decode`), hoisting 8-lane states (`state[0..7]`) into scalar registers (`st0..st7`) and unrolling 8-lane full rounds for `k == 1` and `k > 1` (no-runstart) allows out-of-order execution across independent rANS state transitions, eliminating per-lane loop overhead.
+3. In Phase B match copying (`src/decode.c`), handling `moff >= 8` with single/dual 64-bit unaligned stores (`mlen <= 8`, `mlen <= 16`), handling `moff >= 4` with 4-byte chunk copies, and handling `moff == 3` with an unrolled 3-byte pattern loop avoids slow scalar byte-by-byte loops.
+
+**Action:**
+Use atomic state transitions for frame-wide export slot synchronization, hoist multi-lane rANS decoder states into scalar registers, and use chunked unaligned word stores for LZ match reconstruction.

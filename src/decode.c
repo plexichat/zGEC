@@ -1265,20 +1265,30 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                                ml_stream, (size_t)h.ml_size);
             if (e != ZGEC_OK) return e;
             {
-                /* ml + 3, folded. The old u64 test could only fire when
-                 * m > 0xFFFFFFFF (m < 3 is impossible for a u64 sum), and
-                 * a 32-bit add makes that wrap land in {0, 1, 2} - so one
-                 * `v < 3` tests exactly the same condition without a
-                 * branch in the loop. The walk also accumulates the V1 ML
-                 * total from the values it stores, which removes the
-                 * second pass over ml[] entirely. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
-                    uint32_t v = seg->ml[i] + 3u;
-                    seg->ml[i] = v;
-                    sum_ml += (uint64_t)v;
+                size_t k = 0;
+                size_t nseq = seg->n_seq;
+                uint64_t sum0 = 0, sum1 = 0;
+                for (; k + 4 <= nseq; k += 4) {
+                    uint32_t v0 = seg->ml[k + 0] + 3u;
+                    uint32_t v1 = seg->ml[k + 1] + 3u;
+                    uint32_t v2 = seg->ml[k + 2] + 3u;
+                    uint32_t v3 = seg->ml[k + 3] + 3u;
+                    seg->ml[k + 0] = v0;
+                    seg->ml[k + 1] = v1;
+                    seg->ml[k + 2] = v2;
+                    seg->ml[k + 3] = v3;
+                    sum0 += (uint64_t)v0 + (uint64_t)v1;
+                    sum1 += (uint64_t)v2 + (uint64_t)v3;
+                    bad |= (v0 < 3u) | (v1 < 3u) | (v2 < 3u) | (v3 < 3u);
+                }
+                for (; k < nseq; k++) {
+                    uint32_t v = seg->ml[k] + 3u;
+                    seg->ml[k] = v;
+                    sum0 += (uint64_t)v;
                     bad |= (v < 3u);
                 }
+                sum_ml += sum0 + sum1;
                 if (bad) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
             }
             if (h.ctx_of) {
@@ -1302,13 +1312,23 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             }
             if (e != ZGEC_OK) return e;
             {
-                /* ob = raw + 1 in 32-bit: the only raw value the old u64
-                 * bound (ob < 1 impossible, ob > 0xFFFFFFFF) could reject
-                 * is 0xFFFFFFFF, and that add wraps it to a stored zero. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
-                    uint32_t ob = seg->of[i] + 1u;
-                    seg->of[i] = ob;
+                size_t k = 0;
+                size_t nseq = seg->n_seq;
+                for (; k + 4 <= nseq; k += 4) {
+                    uint32_t ob0 = seg->of[k + 0] + 1u;
+                    uint32_t ob1 = seg->of[k + 1] + 1u;
+                    uint32_t ob2 = seg->of[k + 2] + 1u;
+                    uint32_t ob3 = seg->of[k + 3] + 1u;
+                    seg->of[k + 0] = ob0;
+                    seg->of[k + 1] = ob1;
+                    seg->of[k + 2] = ob2;
+                    seg->of[k + 3] = ob3;
+                    bad |= (ob0 == 0u) | (ob1 == 0u) | (ob2 == 0u) | (ob3 == 0u);
+                }
+                for (; k < nseq; k++) {
+                    uint32_t ob = seg->of[k] + 1u;
+                    seg->of[k] = ob;
                     bad |= (ob == 0u);
                 }
                 if (bad) return ZGEC_ERR_OFFSET;
@@ -1374,11 +1394,17 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
      * walk is branch-free, which matters because the 60/40 zero/non-zero
      * mix of ll[i] used to mispredict here on every other symbol. */
     {
-        uint64_t total = 0;
-        for (i = 0; i < seg->n_seq; i++) {
-            total += (uint64_t)seg->ll[i];
+        uint64_t total0 = 0, total1 = 0;
+        size_t k = 0;
+        size_t nseq = seg->n_seq;
+        for (; k + 4 <= nseq; k += 4) {
+            total0 += (uint64_t)seg->ll[k + 0] + (uint64_t)seg->ll[k + 1];
+            total1 += (uint64_t)seg->ll[k + 2] + (uint64_t)seg->ll[k + 3];
         }
-        sum_ll = total;
+        for (; k < nseq; k++) {
+            total0 += (uint64_t)seg->ll[k];
+        }
+        sum_ll = total0 + total1;
     }
     if (sum_ll > (uint64_t)seg->n_lit) {
         if (!rs_is_stack) zgec_free(runstart);
@@ -1481,14 +1507,30 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             if (e != ZGEC_OK) return e;
         }
         {
-            /* Same fold as the conditioned path above. */
             uint32_t bad = 0;
-            for (i = 0; i < seg->n_seq; i++) {
-                uint32_t v = seg->ml[i] + 3u;
-                seg->ml[i] = v;
-                sum_ml += (uint64_t)v;
+            size_t k = 0;
+            size_t nseq = seg->n_seq;
+            uint64_t sum0 = 0, sum1 = 0;
+            for (; k + 4 <= nseq; k += 4) {
+                uint32_t v0 = seg->ml[k + 0] + 3u;
+                uint32_t v1 = seg->ml[k + 1] + 3u;
+                uint32_t v2 = seg->ml[k + 2] + 3u;
+                uint32_t v3 = seg->ml[k + 3] + 3u;
+                seg->ml[k + 0] = v0;
+                seg->ml[k + 1] = v1;
+                seg->ml[k + 2] = v2;
+                seg->ml[k + 3] = v3;
+                sum0 += (uint64_t)v0 + (uint64_t)v1;
+                sum1 += (uint64_t)v2 + (uint64_t)v3;
+                bad |= (v0 < 3u) | (v1 < 3u) | (v2 < 3u) | (v3 < 3u);
+            }
+            for (; k < nseq; k++) {
+                uint32_t v = seg->ml[k] + 3u;
+                seg->ml[k] = v;
+                sum0 += (uint64_t)v;
                 bad |= (v < 3u);
             }
+            sum_ml += sum0 + sum1;
             if (bad) return ZGEC_ERR_MATCH_LENGTH; /* V3 */
         }
         if (!fused) {
@@ -1499,11 +1541,23 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             if (e != ZGEC_OK) return e;
         }
         {
-            /* Same fold as the conditioned path above. */
             uint32_t bad = 0;
-            for (i = 0; i < seg->n_seq; i++) {
-                uint32_t ob = seg->of[i] + 1u;
-                seg->of[i] = ob;
+            size_t k = 0;
+            size_t nseq = seg->n_seq;
+            for (; k + 4 <= nseq; k += 4) {
+                uint32_t ob0 = seg->of[k + 0] + 1u;
+                uint32_t ob1 = seg->of[k + 1] + 1u;
+                uint32_t ob2 = seg->of[k + 2] + 1u;
+                uint32_t ob3 = seg->of[k + 3] + 1u;
+                seg->of[k + 0] = ob0;
+                seg->of[k + 1] = ob1;
+                seg->of[k + 2] = ob2;
+                seg->of[k + 3] = ob3;
+                bad |= (ob0 == 0u) | (ob1 == 0u) | (ob2 == 0u) | (ob3 == 0u);
+            }
+            for (; k < nseq; k++) {
+                uint32_t ob = seg->of[k] + 1u;
+                seg->of[k] = ob;
                 bad |= (ob == 0u);
             }
             if (bad) return ZGEC_ERR_OFFSET;
@@ -1766,10 +1820,6 @@ static void exec_match_wide(uint8_t *d, const uint8_t *src, size_t len,
     memcpy(d + len - quantum, src + len - quantum, quantum);
 }
 
-/* Read-only dummy literal source for the branch-free 0..4-byte literal
- * write in exec_block (see there). */
-static const uint8_t zgec_lit_dummy[4] = { 0, 0, 0, 0 };
-
 static zgec_err exec_block(zgec_block_arrays *ba)
 {
     /* u64 accumulators: on 32-bit a size_t sum_ll could wrap past the
@@ -1817,19 +1867,17 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                 exec_literals_sub(ba->vb, ba->out, lit_cur, (size_t)ll,
                                   seg->rep0_before[j], (size_t)out_pos,
                                   LdLl);
-            } else if (ll <= 4 && raw_size > 64 &&
+            } else if (ll <= 8 && raw_size > 64 &&
                        out_pos + (uint64_t)ll <= (uint64_t)raw_size - 64) {
-                /* 0..4 literal bytes (the common case): one 4-byte copy.
-                 * Reads past this sequence's literals stay inside the
-                 * allocation: lit_cur + ll <= seg->lit + n_lit (V1
-                 * prefix bound) and the slice carries ZGEC_LIT_SLACK
-                 * zeroed bytes; a NULL lit_cur (n_lit == 0) is only
-                 * reachable with ll == 0, which reads the 4-byte dummy.
-                 * For ll < 4 the extra bytes are garbage that a later
-                 * write always replaces before the buffer is read (same
-                 * argument as the match arm below). */
-                const uint8_t *ls = (ll > 0) ? lit_cur : zgec_lit_dummy;
-                zgec_wr32(ba->out + (size_t)out_pos, zgec_rd32(ls));
+                if (ll > 0) {
+                    const uint8_t *ls = lit_cur;
+                    zgec_wr64(ba->out + (size_t)out_pos, zgec_rd64(ls));
+                }
+            } else if (ll <= 16 && raw_size > 64 &&
+                       out_pos + (uint64_t)ll <= (uint64_t)raw_size - 64) {
+                zgec_wr64(ba->out + (size_t)out_pos, zgec_rd64(lit_cur));
+                zgec_wr64(ba->out + (size_t)out_pos + (size_t)ll - 8,
+                          zgec_rd64(lit_cur + (size_t)ll - 8));
             } else if (ll > 0) {
                 me = exec_literals_plain(ba->out, lit_cur, (size_t)ll,
                                     (size_t)out_pos, raw_size);
@@ -1864,36 +1912,39 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                         for (k = 0; k < mlen; k++) d[k] = msrc[k];
                     }
                 } else if (moff == 1) {
-                    /* RLE: every copied byte repeats the one immediately
-                     * before the match, so the byte-at-a-time order is
-                     * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
-                } else if (moff >= 8 && mlen <= 32 && raw_size > 64) {
-                    /* 1..32 bytes with off >= 8: four 8-byte chunks,
-                     * branch-free. Chunk k reads [d-off+8k, d-off+8k+8)
-                     * and writes [d+8k, d+8k+8): off >= 8 puts the source
-                     * before the destination of the same chunk, and the
-                     * bytes above d come from the earlier chunks, so the
-                     * result matches the byte-at-a-time order. Bytes past
-                     * the match end are written but never read: outside
-                     * the last-64 window every position below raw_size is
-                     * claimed and rewritten by a later sequence before
-                     * the buffer is read (the near-end guard above keeps
-                     * the last 64 exact, and raw_size > 64 is checked
-                     * here because that guard is what proves the slack). */
-                    zgec_wr64(d, zgec_rd64(msrc));
-                    zgec_wr64(d + 8, zgec_rd64(msrc + 8));
-                    zgec_wr64(d + 16, zgec_rd64(msrc + 16));
-                    zgec_wr64(d + 24, zgec_rd64(msrc + 24));
-                } else if (moff >= 32 && mlen >= 32) {
-                    exec_match_wide(d, msrc, mlen, 32);
-                } else if (moff >= 16 && mlen >= 16) {
-                    exec_match_wide(d, msrc, mlen, 16);
-                } else if (moff >= 8 && mlen > 8) {
-                    exec_match_wide(d, msrc, mlen, 8);
-                /* The periodic-offset replicators below are reachable
-                 * only for moff < 8 now (2/4); moff 8/16 fall through
-                 * to the wide copies above with identical output. */
+                } else if (moff >= 8) {
+                    if (mlen <= 8) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                    } else if (mlen <= 16) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                        zgec_wr64(d + mlen - 8, zgec_rd64(msrc + mlen - 8));
+                    } else if (mlen <= 32) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                        zgec_wr64(d + 8, zgec_rd64(msrc + 8));
+                        zgec_wr64(d + 16, zgec_rd64(msrc + 16));
+                        zgec_wr64(d + 24, zgec_rd64(msrc + 24));
+                    } else {
+                        exec_match_wide(d, msrc, mlen, moff >= 32 ? 32 : (moff >= 16 ? 16 : 8));
+                    }
+                } else if (moff >= 4) {
+                    if (mlen <= 4) {
+                        zgec_wr32(d, zgec_rd32(msrc));
+                    } else if (mlen <= 8) {
+                        memcpy(d, msrc, 4);
+                        memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                    } else {
+                        for (k = 0; k + 4 <= mlen; k += 4) {
+                            memcpy(d + k, msrc + k, 4);
+                        }
+                        memcpy(d + mlen - 4, msrc + mlen - 4, 4);
+                    }
+                } else if (moff == 3) {
+                    uint8_t p0 = msrc[0], p1 = msrc[1], p2 = msrc[2];
+                    for (k = 0; k + 3 <= mlen; k += 3) {
+                        d[k] = p0; d[k + 1] = p1; d[k + 2] = p2;
+                    }
+                    for (; k < mlen; k++) d[k] = msrc[k - 3];
 #if defined(__AVX2__)
                 } else if (moff == 2 && mlen >= 8) {
                     uint16_t p16 = zgec_rd16(msrc);
@@ -1908,23 +1959,7 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                         i += 8;
                     }
                     for (; i < mlen; i++) d[i] = msrc[i % 2];
-                } else if (moff == 4 && mlen >= 8) {
-                    uint32_t p32 = zgec_rd32(msrc);
-                    __m256i v256 = _mm256_set1_epi32((int)p32);
-                    size_t i = 0;
-                    while (i + 32 <= mlen) {
-                        _mm256_storeu_si256((__m256i *)(d + i), v256);
-                        i += 32;
-                    }
-                    while (i + 8 <= mlen) {
-                        zgec_wr64(d + i, (uint64_t)p32 | ((uint64_t)p32 << 32));
-                        i += 8;
-                    }
-                    for (; i < mlen; i++) d[i] = msrc[i % 4];
 #endif
-                } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
-                    memcpy(d, msrc, 4);
-                    memcpy(d + mlen - 4, msrc + mlen - 4, 4);
                 } else {
                     for (k = 0; k < mlen; k++) d[k] = msrc[k];
                 }
@@ -2686,12 +2721,11 @@ efail:
  */
 
 typedef struct {
-    zgec_mu  mu;      /* held while this slot is being exported */
+    uint32_t state;   /* 0: UNINIT, 1: EXPORTING, 2: READY */
     uint8_t *lit;     /* exported literals; NULL when empty or released */
     size_t   len;
     size_t   refs;    /* consumers that still have to copy the bytes */
     zgec_err err;     /* export error, valid once ready */
-    unsigned ready;   /* 1 once lit/len/err are settled */
     unsigned alias;   /* 1 when lit points into the frame, not owned */
 } zgec_export_slot;
 
@@ -2752,7 +2786,6 @@ static void zgec_export_cache_free(zgec_export_cache *c)
     if (c == NULL) return;
     if (c->slot != NULL) {
         for (i = 0; i < c->nblk; i++) {
-            zgec_mu_destroy(&c->slot[i].mu);
             /* An alias points into the frame: releasing it would free a
              * pointer that was never allocated. */
             if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
@@ -2799,16 +2832,6 @@ static void zgec_export_cache_init(zgec_export_cache *c,
         return;
     }
     memset(c->slot, 0, c->nblk * sizeof(*c->slot));
-    for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
-    for (i = 0; i < c->nblk; i++) {
-        if (c->slot[i].mu.ok == 0) {
-            /* Without the slot locks the exporters could not agree on a
-             * result, so the frame has to go without the cache rather
-             * than risk a duplicated export. */
-            zgec_export_cache_free(c);
-            return;
-        }
-    }
     for (i = 0; i < c->nblk; i++) {
         const zgec_footer_block_entry *be = &f->blocks[i];
         uint8_t D = be->lit_ref_depth;
@@ -2912,23 +2935,35 @@ static zgec_err zgec_export_slot_acquire(zgec_export_cache *c, uint32_t idx,
     *len = 0u;
     if (c == NULL || idx >= c->nblk) return ZGEC_ERR_INTERNAL;
     s = &c->slot[idx];
-    zgec_mu_lock(&s->mu);
-    if (s->ready != 0u) {
+
+    uint32_t st = __atomic_load_n(&s->state, __ATOMIC_ACQUIRE);
+    if (st == 2u) {
         *lit = s->lit;
         *len = s->len;
-        e = s->err;
-        zgec_mu_unlock(&s->mu);
+        return s->err;
+    }
+
+    uint32_t expected = 0u;
+    if (__atomic_compare_exchange_n(&s->state, &expected, 1u, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        e = zgec_export_block(c, idx, s);
+        s->err = e;
+        __atomic_store_n(&s->state, 2u, __ATOMIC_RELEASE);
+        *lit = s->lit;
+        *len = s->len;
         return e;
     }
-    /* Claimed by this worker, and still locked: publish the export
-     * before anybody else can look at it. */
-    e = zgec_export_block(c, idx, s);
-    s->ready = 1u;
-    zgec_mu_unlock(&s->mu);
-    if (e != ZGEC_OK) return e;
+
+    while (__atomic_load_n(&s->state, __ATOMIC_ACQUIRE) != 2u) {
+#if defined(_WIN32)
+        Sleep(0);
+#else
+        sched_yield();
+#endif
+    }
     *lit = s->lit;
     *len = s->len;
-    return ZGEC_OK;
+    return s->err;
 }
 
 /* Local LITREF predecessor: parse and export one predecessor record,
