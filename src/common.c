@@ -364,8 +364,16 @@ zgec_err zgec_filter_inverse(uint8_t *buf, size_t n,
         size_t rem = n % N;
         size_t c;
         size_t k = 0;
-        uint8_t *tmp = (uint8_t *)zgec_alloc(n, 64);
-        if (!tmp) return ZGEC_ERR_NOMEM;
+        uint8_t stack_tmp[8192];
+        uint8_t *tmp = NULL;
+        int tmp_owned = 0;
+        if (n <= sizeof(stack_tmp)) {
+            tmp = stack_tmp;
+        } else {
+            tmp = (uint8_t *)zgec_alloc(n, 64);
+            if (!tmp) return ZGEC_ERR_NOMEM;
+            tmp_owned = 1;
+        }
         memcpy(tmp, buf, n);
         for (c = 0; c < N; c++) {
             size_t count = zgec_filter_shuffle_count(full_rows, rem, c);
@@ -376,7 +384,7 @@ zgec_err zgec_filter_inverse(uint8_t *buf, size_t n,
                 i += N;
             }
         }
-        zgec_free(tmp);
+        if (tmp_owned) zgec_free(tmp);
     }
     return ZGEC_OK;
 }
