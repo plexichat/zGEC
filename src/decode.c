@@ -3,6 +3,10 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if !defined(_WIN32)
+#include <sched.h>
+#endif
+
 #if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
 #include <immintrin.h>
 #endif
@@ -2699,14 +2703,41 @@ efail:
  * still in flight rather than by the whole frame.
  */
 
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+static inline uint32_t zgec_atomic_cas_u32(volatile uint32_t *ptr, uint32_t old_val, uint32_t new_val) {
+    return (uint32_t)_InterlockedCompareExchange((long volatile *)ptr, (long)new_val, (long)old_val);
+}
+static inline uint32_t zgec_atomic_load_u32(volatile uint32_t *ptr) {
+    uint32_t val = *ptr;
+    _ReadWriteBarrier();
+    return val;
+}
+static inline void zgec_atomic_store_u32(volatile uint32_t *ptr, uint32_t val) {
+    _ReadWriteBarrier();
+    *ptr = val;
+}
+#else
+static inline uint32_t zgec_atomic_cas_u32(volatile uint32_t *ptr, uint32_t old_val, uint32_t new_val) {
+    uint32_t expected = old_val;
+    __atomic_compare_exchange_n(ptr, &expected, new_val, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE);
+    return expected;
+}
+static inline uint32_t zgec_atomic_load_u32(volatile uint32_t *ptr) {
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+}
+static inline void zgec_atomic_store_u32(volatile uint32_t *ptr, uint32_t val) {
+    __atomic_store_n(ptr, val, __ATOMIC_RELEASE);
+}
+#endif
+
 typedef struct {
-    zgec_mu  mu;      /* held while this slot is being exported */
-    uint8_t *lit;     /* exported literals; NULL when empty or released */
+    volatile uint32_t state; /* 0: UNINIT, 1: EXPORTING, 2: READY */
+    uint8_t *lit;            /* exported literals; NULL when empty or released */
     size_t   len;
-    size_t   refs;    /* consumers that still have to copy the bytes */
-    zgec_err err;     /* export error, valid once ready */
-    unsigned ready;   /* 1 once lit/len/err are settled */
-    unsigned alias;   /* 1 when lit points into the frame, not owned */
+    size_t   refs;           /* consumers that still have to copy the bytes */
+    zgec_err err;            /* export error, valid once ready */
+    unsigned alias;          /* 1 when lit points into the frame, not owned */
 } zgec_export_slot;
 
 typedef struct {
@@ -2766,7 +2797,6 @@ static void zgec_export_cache_free(zgec_export_cache *c)
     if (c == NULL) return;
     if (c->slot != NULL) {
         for (i = 0; i < c->nblk; i++) {
-            zgec_mu_destroy(&c->slot[i].mu);
             /* An alias points into the frame: releasing it would free a
              * pointer that was never allocated. */
             if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
@@ -2813,16 +2843,6 @@ static void zgec_export_cache_init(zgec_export_cache *c,
         return;
     }
     memset(c->slot, 0, c->nblk * sizeof(*c->slot));
-    for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
-    for (i = 0; i < c->nblk; i++) {
-        if (c->slot[i].mu.ok == 0) {
-            /* Without the slot locks the exporters could not agree on a
-             * result, so the frame has to go without the cache rather
-             * than risk a duplicated export. */
-            zgec_export_cache_free(c);
-            return;
-        }
-    }
     for (i = 0; i < c->nblk; i++) {
         const zgec_footer_block_entry *be = &f->blocks[i];
         uint8_t D = be->lit_ref_depth;
@@ -2926,23 +2946,29 @@ static zgec_err zgec_export_slot_acquire(zgec_export_cache *c, uint32_t idx,
     *len = 0u;
     if (c == NULL || idx >= c->nblk) return ZGEC_ERR_INTERNAL;
     s = &c->slot[idx];
-    zgec_mu_lock(&s->mu);
-    if (s->ready != 0u) {
-        *lit = s->lit;
-        *len = s->len;
-        e = s->err;
-        zgec_mu_unlock(&s->mu);
-        return e;
+    for (;;) {
+        uint32_t st = zgec_atomic_load_u32(&s->state);
+        if (st == 2u) { /* READY */
+            *lit = s->lit;
+            *len = s->len;
+            return s->err;
+        }
+        if (st == 0u) { /* UNINIT */
+            if (zgec_atomic_cas_u32(&s->state, 0u, 1u) == 0u) { /* Claimed: UNINIT -> EXPORTING */
+                e = zgec_export_block(c, idx, s);
+                zgec_atomic_store_u32(&s->state, 2u); /* EXPORTING -> READY */
+                *lit = s->lit;
+                *len = s->len;
+                return e;
+            }
+        }
+        /* State is 1 (EXPORTING) or CAS lost race: yield and retry */
+#if defined(_WIN32)
+        Sleep(0);
+#else
+        sched_yield();
+#endif
     }
-    /* Claimed by this worker, and still locked: publish the export
-     * before anybody else can look at it. */
-    e = zgec_export_block(c, idx, s);
-    s->ready = 1u;
-    zgec_mu_unlock(&s->mu);
-    if (e != ZGEC_OK) return e;
-    *lit = s->lit;
-    *len = s->len;
-    return ZGEC_OK;
 }
 
 /* Local LITREF predecessor: parse and export one predecessor record,

@@ -839,3 +839,11 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-20 - Lock-Free Literal Export Cache State Transitions
+
+**Learning:**
+In `src/decode.c`, frame literal export cache slots (`zgec_export_slot`) previously initialized and destroyed OS mutexes (`zgec_mu_init`/`zgec_mu_destroy`) for every block in the frame during `zgec_export_cache_init` and `zgec_export_cache_free`. For frames containing many blocks, allocating and destroying up to hundreds of mutexes per frame dominated profiling time. Replacing per-slot mutexes with a 32-bit atomic state variable (`0: UNINIT`, `1: EXPORTING`, `2: READY`) using atomic CAS (`zgec_atomic_cas_u32`), load (`zgec_atomic_load_u32`), and store (`zgec_atomic_store_u32`) operations eliminates mutex setup/teardown loops entirely while preserving thread-safety and lock-free slot publication across worker threads.
+
+**Action:**
+In frame-level or block-level cache structures, use atomic state transitions rather than per-slot OS mutexes to avoid initialization and destruction overhead on hot execution paths.
