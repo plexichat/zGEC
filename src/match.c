@@ -1149,13 +1149,8 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
             pos = mf_pos(e);
             if ((size_t)pos < ip) {
                 d = (uint32_t)(ip - (size_t)pos);
-                /* Retained explicit capacity check on the long-table path:
-                 * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
                     uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
-                    /* A candidate can only beat `best` if it matches at
-                     * target_len_long - 1 as well; one byte compare there skips
-                     * the length scan for the candidates that cannot. */
                     if (target_len_long <= cap &&
                         vb[ip - (size_t)d + (size_t)target_len_long - 1u] ==
                         vb[ip + (size_t)target_len_long - 1u]) {
@@ -1243,6 +1238,9 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
             if (n < 32u) {
                 rm &= (uint32_t)(((uint64_t)1u << n) - 1u);
             }
+            uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
+            uint8_t cur_target_byte = (target_len <= cap) ? vb[ip + (size_t)target_len - 1u] : 0u;
+
             while (rm != 0u && nhit > 0) {
                 uint32_t bpos = 31u - (uint32_t)__builtin_clz(rm);
                 uint32_t lane = (head + bpos) & (n - 1u);
@@ -1258,22 +1256,9 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     continue;
                 }
                 d = (uint32_t)(ip - (size_t)pos);
-                /* Assert-style: d <= ip < vb_size <= vb_capacity. */
                 assert((size_t)d <= m->vb_capacity);
-                /* No first-4-byte screen here: it would re-read the very
-                 * line the length compare below loads (a first-4 mismatch
-                 * sets some of the low four diff bits, so the length comes
-                 * out under 4 and the hash_min gate rejects it), and
-                 * pos < ip keeps the 8-byte read inside the buffer, so
-                 * dropping the screen removes a load without adding a
-                 * candidate. */
-                uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
-                /* A candidate can only beat `best` if it matches at
-                 * target_len - 1 as well; one byte compare there skips
-                 * the length scan for the candidates that cannot. */
                 if (target_len <= cap &&
-                    vb[ip - (size_t)d + (size_t)target_len - 1u] !=
-                    vb[ip + (size_t)target_len - 1u]) {
+                    vb[ip - (size_t)d + (size_t)target_len - 1u] != cur_target_byte) {
                     continue;
                 }
                 if (has_v8) {
@@ -1304,6 +1289,8 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     if (best.length >= cap && (best_is_rep || best.length > cap || best.offset <= 1u)) {
                         break;
                     }
+                    target_len = (best.length > hash_min) ? best.length : hash_min;
+                    cur_target_byte = (target_len <= cap) ? vb[ip + (size_t)target_len - 1u] : 0u;
                 }
             }
         }
