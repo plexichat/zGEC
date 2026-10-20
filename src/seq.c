@@ -396,38 +396,82 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         if (bw_overflow) { if (syms_allocated) zgec_free(syms); return 0; }
     }
 
-    for (i = n - 1; i > 0; i--) {
-        uint8_t s;
-        unsigned c;
-        zgec_fse_enc_entry entry;
-        uint32_t bits;
-        s = syms[i - 1];
-        c = use_prev ? ((i >= 2) ? zgec_mlclass(ml[i - 2]) : 0u)
-                     : zgec_mlclass(ml[i - 1]);
-        if (c >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
-        if ((int)s >= enc[c]->nsym) { if (syms_allocated) zgec_free(syms); return 0; }
-        entry = enc[c]->e[(size_t)s * (size_t)S + (size_t)state];
-        bits = (state >= (uint32_t)entry.baseline)
-                   ? (uint32_t)(state - (uint32_t)entry.baseline)
-                   : 0u;
-        if ((unsigned)entry.nb_bits < 32u &&
-            bits >= (UINT32_C(1) << (unsigned)entry.nb_bits)) {
-            if (syms_allocated) zgec_free(syms);
-            return 0;
-        }
-        WRITE_BITS_COND(bits, (unsigned)entry.nb_bits);
-        if (nbits[s] > 0) {
+    /* Branchless drain, mirroring the main FSE loop: the word-complete
+     * event is close to a coin flip, so branching on it mispredicts about
+     * once per symbol; the store is unconditional (every caller keeps
+     * slack past the stream) and only the advance is conditional. */
+#define COND_DRAIN() do { \
+        unsigned _f = (bw_nacc >= 32u) ? 1u : 0u; \
+        zgec_wr32(bw_ptr, (uint32_t)bw_acc); \
+        bw_ptr += (size_t)_f * 4u; \
+        bw_acc = _f ? (bw_acc >> 32u) : bw_acc; \
+        bw_nacc -= _f * 32u; \
+        if (bw_nacc >= 32u) { \
+            if (bw_ptr + 4 > bw_end) { bw_overflow = 1; goto cond_done; } \
+            zgec_wr32(bw_ptr, (uint32_t)bw_acc); \
+            bw_ptr += 4; \
+            bw_acc >>= 32u; \
+            bw_nacc -= 32u; \
+        } \
+    } while (0)
+
+    /* The three conditioned tables share an alphabet size and shift. */
+    {
+        const zgec_fse_enc_entry *const etab[3] = {
+            enc[0]->e, enc[1]->e, enc[2]->e
+        };
+        const unsigned back = use_prev ? 2u : 1u;
+
+        for (i = n - 1; i > 0; i--) {
+            uint8_t s = syms[i - 1];
+            const zgec_fse_enc_entry *row;
+            zgec_fse_enc_entry entry;
+            uint32_t bits;
+            uint32_t val;
+            uint32_t lo;
             uint32_t extra;
-            if (!zgec_seq_get_extra(values[i - 1], s, base, nbits, &extra)) {
+            unsigned c;
+            unsigned cn;
+            unsigned nb;
+
+            c = (i >= back) ? zgec_mlclass(ml[i - back]) : 0u;
+            if (c >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
+            if ((int)s >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
+            row = etab[c] + ((size_t)s << (unsigned)al);
+            entry = row[(size_t)state];
+            bits = (state >= (uint32_t)entry.baseline)
+                       ? (uint32_t)(state - (uint32_t)entry.baseline)
+                       : 0u;
+            cn = (unsigned)entry.nb_bits;
+            if (cn < 32u && bits >= (UINT32_C(1) << cn)) {
                 if (syms_allocated) zgec_free(syms);
                 return 0;
             }
-            WRITE_BITS_COND(extra, (unsigned)nbits[s]);
+            val = values[i - 1];
+            lo = base[s];
+            if (val < lo) { if (syms_allocated) zgec_free(syms); return 0; }
+            extra = val - lo;
+            nb = (unsigned)nbits[s];
+            if (nb < 32u && extra >= (UINT32_C(1) << nb)) {
+                if (syms_allocated) zgec_free(syms);
+                return 0;
+            }
+            /* Two separate branchless writes: bits is at most al (<= 11)
+             * and extra at most 32 wide, so each shift stays inside the
+             * 64-bit accumulator even when the unshifted fused form
+             * would not. A zero nb contributes nothing and costs no
+             * branch. */
+            bw_acc |= (uint64_t)bits << bw_nacc;
+            bw_nacc += cn;
+            COND_DRAIN();
+            bw_acc |= (uint64_t)extra << bw_nacc;
+            bw_nacc += nb;
+            COND_DRAIN();
+            state = entry.new_state;
+            if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
         }
-        if (bw_overflow) { if (syms_allocated) zgec_free(syms); return 0; }
-        state = entry.new_state;
-        if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
     }
+#undef COND_DRAIN
 
     WRITE_BITS_COND(state, (unsigned)al);
 
