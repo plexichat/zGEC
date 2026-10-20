@@ -699,6 +699,29 @@ static void fast_insert_sparse_long(uint32_t *tl, const uint8_t *vb, size_t end,
     }
 }
 
+/* Copy `ll` pending literals into the block's literal buffer.
+ *
+ * The literal buffer keeps ZGEC_LIT_SLACK spare bytes past the block and the
+ * virtual buffer keeps 64 bytes past its end, so a short run can move a fixed
+ * 8- or 16-byte block: the bytes past ll are overwritten by the next literal
+ * copy (or by the tail copy) before the literal region is read, and both the
+ * load and the store stay inside their allocations (anchor <= ip <= end - 8
+ * in both fast loops). Most runs between matches are only a few bytes, and a
+ * variable-length memcpy call cost more than the copy itself. The main/high
+ * parser keeps the plain memcpy: its literal runs are longer and its per-match
+ * work already dominates. */
+static inline __attribute__((always_inline))
+void parse_copy_lit(uint8_t *dst, const uint8_t *src, uint32_t ll)
+{
+    if (ll <= 8u) {
+        memcpy(dst, src, 8u);
+    } else if (ll <= 16u) {
+        memcpy(dst, src, 16u);
+    } else {
+        memcpy(dst, src, ll);
+    }
+}
+
 static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size_t vb_size,
                            int dial)
 {
@@ -1040,7 +1063,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             uint32_t ob = zgec_reps_encode(&reps, best_off);
             (void)zgec_reps_resolve(&reps, ob);
             if (ll > 0u) {
-                memcpy(p->lit + p->n_lit, vb + anchor, ll);
+                parse_copy_lit(p->lit + p->n_lit, vb + anchor, ll);
                 p->n_lit += ll;
             }
             if (p->n_seq >= seq_cap) {
@@ -1233,7 +1256,7 @@ static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
             uint32_t ob = zgec_reps_encode(&reps, best_off);
             (void)zgec_reps_resolve(&reps, ob);
             if (ll > 0u) {
-                memcpy(p->lit + p->n_lit, vb + anchor, ll);
+                parse_copy_lit(p->lit + p->n_lit, vb + anchor, ll);
                 p->n_lit += ll;
             }
             if (p->n_seq >= seq_cap) {

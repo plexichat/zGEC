@@ -778,3 +778,30 @@ and the third table's L2 footprint cancels any latency it could have hidden.
 Unpinned runs had shown a bogus 4-7% "win" at l2/l4; whole-file wall clock
 must be affinity-pinned here, the unpinned medians swing by more than the
 effect.
+
+Session 2026-10-20 (cont.) -- fast-tier literal copies.
+
+ACCEPTED -- parse_copy_lit in fast_parse and fast_parse_lite. Both loops called
+a variable-length memcpy for the literal run in front of every accepted match,
+and those runs are usually only a few bytes, so the call (size dispatch plus
+prologue) cost more than the copy. A run of <= 8 or <= 16 bytes now moves a
+fixed 8- or 16-byte block instead: the literal buffer keeps ZGEC_LIT_SLACK
+past the block, the virtual buffer keeps 64 bytes past its end, anchor <= ip
+<= end - 8 when the copy runs, and the bytes past ll are overwritten by the
+next copy or the tail copy before the literal region is read. Longer runs keep
+the plain memcpy. The main/high parser was left alone: its literal runs are
+longer, its per-match work already dominates, and its whole-file A/B at l7 was
+inside the noise either way.
+
+Byte-identical at every pinned level (l1-l10 sizes, l7 SHA). Affinity-pinned
+interleaved A/B against the same tree without the helper: l1 min -3.0% (5/7
+wins) and -3.1% / median -5.9% (7/9) in two sessions, l2 -3.5% min / -3.7%
+median (8/15), l4 -3.0% (5/7) when quiet and neutral (-0.6% median, 9/15)
+while the box was loaded. ctest 4/4.
+
+Measurement caveat for this session: a game was running on the machine, so
+absolute times drifted by up to 60% and unpinned runs were useless; only
+affinity-pinned interleaved pairs with min/median over 7-15 repetitions gave a
+stable answer. Also re-measured NEGATIVE (reverted): raising ZGEC_POOL_MAX_BLOCK
+from 4 MiB to 16 MiB (l1 +0.5%, l4 flat) -- the per-thread pool already covers
+every transient the encoder allocates.
