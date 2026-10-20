@@ -839,3 +839,29 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+Session 2026-10-20 (cont.) -- FSE entry width, staging gathers, both NEGATIVE.
+
+Tried and reverted: packing zgec_fse_enc_entry from 8 bytes to 4 (nb_bits 4
+bits, new_state and baseline 11 each, bit 26 the old pad/presence marker;
+_Static_assert ties the widths to ZGEC_MAX_AL). The sequence table the encoder
+walks is nsym * 2^al, i.e. 66 * 1024 * 8 = 540 KiB, just over the 512 KiB L2,
+so halving it to 270 KiB looked like the way to stop the serial
+state -> table-load -> new_state chain from missing L2 on every symbol.
+Byte-identical at every pinned level (sizes, l1 and l7 SHAs, ctest 4/4), but
+pinned interleaved A/B, 9 pairs, cycles: l1 min +0.26% (6/9 wins), l4 min
++2.81% / wall +2.28% (2/9). The extra shift/mask on the chain costs more than
+the smaller footprint saves, which also says the loop is not L2-miss-bound at
+all -- consistent with the earlier three-stream result, the bit-writer store
+is the real serialiser. Reverted whole (fse.c, seq.c, zgec_fse.h).
+
+Also tried and reverted: dropping the three vpgatherdd in
+zgec_seg_prep_build's staging loop in favour of the scalar path that already
+exists below it (same outputs, g != NULL still takes the granule histograms
+from the merge). l1 min +0.10% (5/9), l4 min +1.48% (4/9): the gathers are
+not the problem either. Reverted.
+
+Standing conclusion for the encode ladder: every remaining phase is within a
+few percent of the best shape found so far. The one measured lever left on
+this box is the measurement itself -- freebuff/GTA5 hold 30-60% of all cores,
+and even on-CPU cycle counts need 9+ interleaved pinned pairs to resolve 1%.
