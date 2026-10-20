@@ -699,3 +699,39 @@ signal here (lit vs seq separately); the changed phase moved 11% while the
 whole-file delta was inside the +/-1.5% run-to-run drift. The emit split at
 l1/l3/l7 is lit 612/344/937 Mticks and seq 418/704/1057 Mticks, i.e. the
 sequence coder is now the larger half of emit at main/high levels.
+
+Session 2026-10-20 (cont.) -- fast-tier rung: per-segment histograms from the
+merge.
+
+ACCEPTED -- reuse the greedy merge's per-segment histograms in
+zgec_seg_prep_build. The merge already accumulates exact LL/ML/OF and literal
+counts per granule (that is how it prices a merge), and its final granules are
+exactly the emitted segments: boundaries fall between sequences and merging
+only adds whole granules, so the per-segment literal span is the granule's
+lit_of_seq span. zgec_segment_greedy now also returns the final granule array
+inside the same allocation as the bounds (one zgec_free(bounds) releases
+both), and zgec_seg_prep_build takes it: the emit pass copies the four
+histograms plus extra_bits and ml_sum instead of re-deriving three coded
+streams and re-sweeping every literal. The gathering of ll/ml/of/mls still
+runs; only the counting disappears.
+
+Liveness guard: the D3 rewrite can change offbase values after the merge
+priced them. When the final rewrite reports a change (or the re-segment
+fails), use_grans is cleared and prep rebuilds everything exactly as before.
+Both paths produce identical output (verified by forcing use_grans = 0 and
+re-checking the pinned sizes).
+
+Byte-identical at every pinned level (l1-l10 sizes and the l7 SHA-256).
+Isolated prep-phase ticks (5 interleaved pairs, min): l1 325.8 -> 144.5 Mticks
+(-56%), l4 518.9 -> 236.1 (-54%). Whole file, 9 interleaved pairs: l1 min
+985.2 -> 903.6 ms (-8.3%), median -6.6%, 8/9 wins; l4 min 2057.9 -> 2033.1
+(-1.2%), median -2.1%, 7/9. ctest 4/4.
+
+Measured NEGATIVE (reverted) in the same session: 4-way replicated LL/ML/OF
+histogram accumulators in zgec_seg_prep_build (to break store-to-load
+forwarding on runs of equal codes). l1 prep min 316.7 -> 332.4, l4 516.2 ->
+527.7; the replica zero-fill, indexing and final sum cost more than the stalls
+they remove. Also NEGATIVE: assigning the FSE loop's next state before the bit
+writes to keep it out of a stack spill (same senc ticks as HEAD, 13.5
+ticks/symbol either way -- that loop is throughput-bound, not latency-bound,
+despite the spill).

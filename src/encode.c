@@ -591,6 +591,7 @@ typedef struct {
     uint64_t extra_bits;
     size_t n_seq;
     uint64_t lit_total; /* P4: sum of lit[] (literals owned by granule) */
+    uint64_t ml_sum;    /* sum of the real match lengths (raw_len) */
 } zgec_granule;
 
 static double zgec_granule_cost_bits(const zgec_granule *g)
@@ -643,6 +644,7 @@ static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
     dst->extra_bits += src->extra_bits;
     dst->n_seq += src->n_seq;
     dst->lit_total += src->lit_total;
+    dst->ml_sum += src->ml_sum;
 }
 
 /* Split the parse into ~16K-sequence granules with additive histograms,
@@ -650,7 +652,8 @@ static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
  * header) is no larger than two. Boundaries always fall between
  * sequences, so a segment owns its literals entirely. */
 static zgec_err zgec_segment_greedy(const zgec_parse *parse,
-                                    size_t **bounds_out, size_t *n_seg_out)
+                                    size_t **bounds_out, size_t *n_seg_out,
+                                    zgec_granule **grans_out)
 {
     const size_t granule_seqs = 16384;
     size_t n_gran;
@@ -662,7 +665,9 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
     size_t lit_pos;
     int changed;
 
-    if (!parse || !bounds_out || !n_seg_out) return ZGEC_ERR_INVAL;
+    if (!parse || !bounds_out || !n_seg_out || !grans_out) return ZGEC_ERR_INVAL;
+    *bounds_out = NULL;
+    *grans_out = NULL;
     if (parse->n_seq == 0) {
         size_t *b = (size_t *)zgec_alloc(2 * sizeof(size_t), _Alignof(size_t));
         if (!b) return ZGEC_ERR_NOMEM;
@@ -737,6 +742,7 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
             g->of[c]++;
             g->extra_bits += (uint64_t)nb;
             g->n_seq++;
+            g->ml_sum += (uint64_t)q->ml;
         }
         /* Granule literal histogram. Greedy litpos (PR #3): the literal range
          * of a granule is the LL prefix-sum span of its sequences, so it is
@@ -836,17 +842,34 @@ static zgec_err zgec_segment_greedy(const zgec_parse *parse,
     }
 
     {
-        size_t *b = (size_t *)zgec_alloc((n_gran + 1) * sizeof(*b),
-                                        _Alignof(size_t));
-        if (!b) {
+        /* The final bounds and the per-segment histograms share one
+         * allocation: the emit pass then reads exactly the counts this
+         * merge priced, instead of rescanning every sequence in
+         * zgec_seg_prep_build. Both are freed by the caller's single
+         * zgec_free(bounds). */
+        size_t nb = n_gran + 1;
+        size_t bytes = nb * sizeof(size_t);
+        if (n_gran > (SIZE_MAX - bytes) / sizeof(zgec_granule)) {
             zgec_free(grans);
             zgec_free(gstart);
             zgec_free(lit_of_seq);
             return ZGEC_ERR_NOMEM;
         }
+        uint8_t *mem = (uint8_t *)zgec_alloc(bytes + n_gran * sizeof(zgec_granule),
+                                             _Alignof(zgec_granule));
+        if (!mem) {
+            zgec_free(grans);
+            zgec_free(gstart);
+            zgec_free(lit_of_seq);
+            return ZGEC_ERR_NOMEM;
+        }
+        size_t *b = (size_t *)(void *)mem;
+        zgec_granule *gout = (zgec_granule *)(void *)(mem + bytes);
         for (gi = 0; gi <= n_gran; gi++) b[gi] = gstart[gi];
+        for (gi = 0; gi < n_gran; gi++) gout[gi] = grans[gi];
         *bounds_out = b;
         *n_seg_out = n_gran;
+        *grans_out = gout;
     }
     zgec_free(grans);
     zgec_free(gstart);
@@ -2152,7 +2175,8 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
                                     const uint8_t *seg_lit,
                                     size_t n_lit_slice,
                                     const uint8_t *vb,
-                                    size_t vb_seg_start)
+                                    size_t vb_seg_start,
+                                    const zgec_granule *g)
 {
     size_t n = (s1 > s0) ? (s1 - s0) : 0;
     size_t t;
@@ -2162,8 +2186,10 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
     if (n == 0) {
         /* Literals-only segment: still needs the plain-literal histogram
          * for coder selection and emission. */
-        if (seg_lit && n_lit_slice > 0)
-            zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
+        if (seg_lit && n_lit_slice > 0) {
+            if (g) memcpy(p->h_lit, g->lit, sizeof(p->h_lit));
+            else zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
+        }
         return ZGEC_OK;
     }
     if (n > SIZE_MAX / (5 * sizeof(uint32_t))) return ZGEC_ERR_NOMEM;
@@ -2202,12 +2228,14 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
 
         for (size_t k = 0; k < 8; k++) {
             uint8_t nb = 0;
-            p->h_ll[zgec_seq_code_of(p->ll[t + k], &nb)]++;
-            p->xbits += (uint64_t)nb;
-            p->h_ml[zgec_seq_code_of(p->ml[t + k], &nb)]++;
-            p->xbits += (uint64_t)nb;
-            p->h_of[zgec_seq_code_of(p->of[t + k], &nb)]++;
-            p->xbits += (uint64_t)nb;
+            if (g == NULL) {
+                p->h_ll[zgec_seq_code_of(p->ll[t + k], &nb)]++;
+                p->xbits += (uint64_t)nb;
+                p->h_ml[zgec_seq_code_of(p->ml[t + k], &nb)]++;
+                p->xbits += (uint64_t)nb;
+                p->h_of[zgec_seq_code_of(p->of[t + k], &nb)]++;
+                p->xbits += (uint64_t)nb;
+            }
         }
     }
     {
@@ -2228,17 +2256,30 @@ static zgec_err zgec_seg_prep_build(zgec_seg_prep *p,
         p->ml[t] = mlv;
         p->of[t] = ofv;
         p->mls[t] = mlv + 3u;
-        p->ml_sum += (uint64_t)q->ml;
-        p->h_ll[zgec_seq_code_of(q->ll, &nb)]++;
-        p->xbits += (uint64_t)nb;
-        p->h_ml[zgec_seq_code_of(mlv, &nb)]++;
-        p->xbits += (uint64_t)nb;
-        p->h_of[zgec_seq_code_of(ofv, &nb)]++;
-        p->xbits += (uint64_t)nb;
+        if (g == NULL) {
+            p->ml_sum += (uint64_t)q->ml;
+            p->h_ll[zgec_seq_code_of(q->ll, &nb)]++;
+            p->xbits += (uint64_t)nb;
+            p->h_ml[zgec_seq_code_of(mlv, &nb)]++;
+            p->xbits += (uint64_t)nb;
+            p->h_of[zgec_seq_code_of(ofv, &nb)]++;
+            p->xbits += (uint64_t)nb;
+        }
+    }
+    if (g != NULL) {
+        memcpy(p->h_ll, g->ll, sizeof(p->h_ll));
+        memcpy(p->h_ml, g->ml, sizeof(p->h_ml));
+        memcpy(p->h_of, g->of, sizeof(p->h_of));
+        p->xbits = g->extra_bits;
+        p->ml_sum = g->ml_sum;
     }
     p->rep0_tail = zgec_enc_rep0_both(p->rep0, &parse->seq[s0], n);
     if (seg_lit && n_lit_slice > 0) {
-        zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
+        /* The granule histogram covers exactly this segment's literal
+         * span (segment boundaries fall between sequences and the merge
+         * only adds whole granules), so the second sweep is a copy. */
+        if (g) memcpy(p->h_lit, g->lit, sizeof(p->h_lit));
+        else zgec_hist_lit_slice(p->h_lit, seg_lit, n_lit_slice);
     }
     if (want_resid && n_lit_slice > 0 && seg_lit && vb) {
         p->resid = (uint8_t *)zgec_alloc(n_lit_slice, 64);
@@ -2871,6 +2912,7 @@ typedef struct {
     uint8_t **seg_bufs;
     size_t *seg_sizes;
     zgec_err *errs;
+    const zgec_granule *grans;  /* per-segment histograms from the merge */
 } zgec_enc_seg_pass;
 
 static void zgec_enc_seg_job(void *ctx, size_t s)
@@ -2917,7 +2959,8 @@ static void zgec_enc_seg_job(void *ctx, size_t s)
         &prep, p->parse, s0, s1,
         p->params->use_sublit && p->vb_all != NULL && n_lit_slice > 0,
         (n_lit_slice > 0) ? p->parse->lit + l0 : NULL, n_lit_slice,
-        p->vb_all, p->vb_seg_base + out_base);
+        p->vb_all, p->vb_seg_base + out_base,
+        p->grans ? &p->grans[s] : NULL);
     if (err != ZGEC_OK) goto sjob_done;
 
     err = zgec_select_coder(
@@ -3229,8 +3272,11 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     filt = NULL;
     if (err != ZGEC_OK) return err;
 
-    /* Segmentation (11.5): granules + greedy merge. */
-    err = zgec_segment_greedy(parse, &bounds, &n_segments);
+    /* Segmentation (11.5): granules + greedy merge. The returned granule
+     * histograms are the merge's final per-segment counts. */
+    zgec_granule *grans = NULL;
+    int use_grans = 1;
+    err = zgec_segment_greedy(parse, &bounds, &n_segments, &grans);
     if (err != ZGEC_OK) {
         zgec_parse_free(parse);
         return err;
@@ -3274,15 +3320,28 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         if (offbase_changed) {
             size_t *bounds2 = NULL;
             size_t n_seg2 = 0;
-            if (zgec_segment_greedy(parse, &bounds2, &n_seg2) == ZGEC_OK) {
+            zgec_granule *grans2 = NULL;
+            if (zgec_segment_greedy(parse, &bounds2, &n_seg2, &grans2) == ZGEC_OK) {
                 zgec_free(bounds);
                 bounds = bounds2;
                 n_segments = n_seg2;
+                grans = grans2;   /* same allocation as bounds2 */
             }
             /* On re-segment failure keep the first bounds (still valid,
-             * just priced from pre-rewrite OF stats). */
+             * just priced from pre-rewrite OF stats). The first bounds'
+             * histograms no longer describe the rewritten sequences, so
+             * the emit pass rebuilds them. */
+            else {
+                use_grans = 0;
+            }
+            /* The sequences are rewritten for the final bounds here; when
+             * that changes an offbase the merged OF counts (and the extra
+             * bit totals they implied) no longer match what is emitted,
+             * so fall back to rebuilding the histograms per segment. */
+            int changed2 = 0;
             zgec_enc_rewrite_offbase_from_dist(parse, bounds, n_segments,
-                                               seg_dist, NULL);
+                                               seg_dist, &changed2);
+            if (changed2) use_grans = 0;
         }
         zgec_free(seg_dist);
     }
@@ -3572,6 +3631,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         sp.seg_bufs = seg_bufs;
         sp.seg_sizes = seg_sizes;
         sp.errs = seg_errs;
+        sp.grans = use_grans ? grans : NULL;
 
         zgec_enc_parallel_for(seg_threads, n_segments, zgec_enc_seg_job, &sp);
 
