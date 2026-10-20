@@ -658,6 +658,19 @@ uint32_t fast_match_len_tail(const uint8_t *a, const uint8_t *b, size_t cap)
     return (uint32_t)len;
 }
 
+/* Out-of-line form of the match-length scan for the lean core. Inlining
+ * the AVX2 loop into fast_parse_lite's position loop costs more than the
+ * call: the many live values of the accept path force `anchor` and the
+ * table base to spill and reload on every position, including the ~9 of
+ * 10 positions that find no candidate at all. Keeping the scan behind a
+ * call leaves the position loop's register set small. The scan itself is
+ * unchanged, so the parse (and the byte stream) is identical. */
+__attribute__((noinline))
+static uint32_t fast_match_len_out(const uint8_t *a, const uint8_t *b, size_t cap)
+{
+    return fast_match_len_tail(a, b, cap);
+}
+
 /* Lean-core table entries carry a hash tag above the 24-bit position:
  * entry = (tag << 24) | pos, with tag >= 1 (0 marks an empty slot). The tag
  * holds the hash bits the bucket index does not use, so a bucket hit whose
@@ -1238,7 +1251,7 @@ static zgec_err fast_parse_lite(zgec_parse *p, const uint8_t *vb, size_t prefix,
             if (cpos < ip) {
                 size_t d = ip - cpos;
                 if (zgec_rd64(vb + ip - d) == cur8) {
-                    best_len = 8u + fast_match_len_tail(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
+                    best_len = 8u + fast_match_len_out(vb + ip - d + 8u, vb + ip + 8u, cap - 8u);
                     best_off = (uint32_t)d;
                 }
             }

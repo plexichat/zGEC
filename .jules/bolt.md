@@ -805,3 +805,37 @@ affinity-pinned interleaved pairs with min/median over 7-15 repetitions gave a
 stable answer. Also re-measured NEGATIVE (reverted): raising ZGEC_POOL_MAX_BLOCK
 from 4 MiB to 16 MiB (l1 +0.5%, l4 flat) -- the per-thread pool already covers
 every transient the encoder allocates.
+
+Session 2026-10-20 (cont.) -- lean-core match scan out of line, no-literal-ref copy.
+
+ACCEPTED -- fast_match_len_out for fast_parse_lite (level 1). fast_parse_lite
+inlined fast_match_len_tail (always_inline, AVX2 scan) into its position loop,
+and the live values of the accept path cost more registers than the loop has:
+the miss path reloaded `anchor` from the stack, stored it back on every
+position, and reloaded the table base, i.e. three extra memory operations on
+the ~9 of 10 positions that find no candidate. The scan now sits behind a
+noinline wrapper: the miss path lost all three (verified in the objdump:
+movq 0x98(%rsp) store, movq 0x98(%rsp) reload and movq 0x88(%rsp) reload gone,
+anchor and tl stay in r13/r14), and the scan itself is byte-for-byte the same
+code. Pinned interleaved A/B, 9 pairs, thread-cycle counts (ZGEC_CPUTIME, which
+excludes descheduled time and is what this box needs): l1 min -0.7% / median
+-1.8%, 7/9 wins. Byte-identical (l1 SHA F28B157E..., l7 SHA 13AF5E25...).
+
+Rejected in the same session:
+
+- Same treatment for fast_parse (levels 4-6, all eight tail call sites).
+  The frame shrank (0x108 -> 0xc8) but the loop still spills the current word
+  and the dial-3 branch's state, so the win did not materialise: l4 min -1.6%
+  / median +1.9% (4/9), l6 min -0.4% / median +3.5% (3/9). Reverted.
+- Skipping the per-block literal buffer copy (zgec_alloc + memcpy of n_lit
+  bytes in zgec_encode_block_full) when use_litref is off, which looked like
+  pure waste. It is a consistent 1% *regression* (l1 min +1.1%, 15 pairs, 4/15
+  wins; 9 pairs +1.0%, 2/9), reproducibly, so the copy helps by touching the
+  pool block that a later phase reuses. Kept as is. Forcing res->exportable to
+  0 in that path is not an option anyway: the flag is emitted as
+  ZGEC_RFLAG_LIT_EXPORTABLE, so it changes the frame bytes at equal size.
+
+cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
+QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
+2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
+only usable signal; mins over 9+ interleaved pairs still needed.

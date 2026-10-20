@@ -99,6 +99,23 @@ static double cli_now(void)
 }
 #endif
 
+/* Thread cycle counter for benchmark use: cycles burned by the calling
+ * thread while it was actually running, so a background process that
+ * deschedules the measurement does not inflate it the way wall time does.
+ * Reporting only, and only under ZGEC_CPUTIME; 0 when unavailable. */
+static unsigned long long cli_cycles(void)
+{
+#if defined(_WIN32)
+    ULONG64 c = 0;
+    if (!QueryThreadCycleTime(GetCurrentThread(), &c)) return 0u;
+    return (unsigned long long)c;
+#elif defined(__x86_64__) || defined(__i386__)
+    return (unsigned long long)__builtin_ia32_rdtsc();
+#else
+    return 0u;
+#endif
+}
+
 /* MiB per second over a wall-clock interval; 0 when the interval is empty.
  * The divisor is binary, so the label this file prints for the value is MiB/s
  * and never the decimal MB/s. That rule is this file's alone: tests/bench.c
@@ -451,6 +468,7 @@ int main(int argc, char **argv)
     const char *outpath = NULL;
     zgec_err err;
     double enc_sec = 0.0;
+    unsigned long long enc_cyc = 0;
     double dec_sec = 0.0;
     double dec_t0 = 0.0;
 
@@ -732,7 +750,11 @@ int main(int argc, char **argv)
         }
         {
             double t0 = cli_now();
+            unsigned long long c0 = 0;
+            int cpu_timed = (getenv("ZGEC_CPUTIME") != NULL);
+            if (cpu_timed) c0 = cli_cycles();
             err = zgec_encode_frame(e, in, in_size, &out, &out_size);
+            if (cpu_timed) enc_cyc = cli_cycles() - c0;
             enc_sec = cli_now() - t0;
         }
         zgec_encoder_destroy(e);
@@ -757,6 +779,8 @@ int main(int argc, char **argv)
                         "zgec: level %d, %zu -> %zu bytes (%.4fx)  "
                         "timing unavailable\n",
                         level, in_size, out_size, ratio);
+            if (enc_cyc != 0u)
+                fprintf(stderr, "zgec: thread cycles %llu\n", enc_cyc);
         }
     }
 
