@@ -628,3 +628,24 @@ wins).
 REJECTED (decode) -- `bolt-decode-throughput-opt`, `bolt-decode-rans-match-opt`,
 `bolt-opt-decode-cache-atomic-sync`, `bolt/avx2-decode-path-opt`: l7 decode
 495 ms baseline -> 516 / 521 / 497 / 501 ms. Only the vise mem branch won.
+
+Session 2026-10-20 -- per-granule literal histogram cache for the D3 re-merge.
+
+IDEA -- zgec_segment_greedy runs twice per block (first from the whole-block
+rep chain, then again after the offbase rewrite). Per-granule lit histograms
+depend only on granule boundaries and the LL prefix sums, neither of which the
+rewrite changes, so the second call can read the first call's histograms.
+
+ATTEMPTED and REJECTED. Implemented with an explicit snapshot (the merge
+compacts grans in place, so it must be taken before merging), plus ownership
+on every error path. Byte-identical (all pinned sizes, l7 SHA, ctest 4/4).
+Confirmed live: 22 re-merges at l1 and the cache is consumed 116 times
+(~5 granules per call).
+
+Paired interleaved A/B (min of 10/6, pinned core): l1 +0.45% median, 3/10
+wins; l3 +0.07%, 5/10; l7 +0.84%, 2/6. No gain. The 8-accumulator literal
+sweep over the block literals (76 MB total at l1) is only a few ms even when
+repeated; the snapshot allocation, memcpy and extra live memory cancel it.
+Conclusion: the second greedy pass is already cheap -- do not revisit literal
+caching, and treat the remaining per-segment histogram rebuild as a ~1%
+ceiling, which does not justify caching the full granule build.
