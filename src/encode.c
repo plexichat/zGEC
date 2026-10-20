@@ -1513,7 +1513,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     size_t start[ZGEC_NLANES];
     size_t j;
     int g;
-    memset(cls_hist, 0, (size_t)64 * 256u * sizeof(uint32_t));
+    memset(cls_hist, 0, (size_t)(k + 1) * 256u * sizeof(uint32_t));
     memset(rs_hist, 0, sizeof(rs_hist));
     memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
