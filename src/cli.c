@@ -394,6 +394,9 @@ static void cli_apply_level(zgec_params *p, int level)
      * uses, through the two-table fast parser's shed-feature rungs. See
      * zgec_parse_block_dial. */
     p->fast_dial = (level >= 1 && level <= 3) ? (5 - level) : 0;
+    /* Rungs 15-25 are the high tier's ratio ladder: levels 15-25 progressively
+     * scale lazy match evaluation lookahead and short bucket search thresholds. */
+    p->high_dial = (level >= 15 && level <= 25) ? (level - 14) : 0;
 }
 
 static int cli_tier(const char *s, zgec_tier *out)

@@ -28,9 +28,11 @@ typedef struct zgec_matcher zgec_matcher;
 
 /* Create a matcher for the given tier and virtual
  * buffer size (the maximum offset the matcher can
- * reference). */
+ * reference). High-tier dial (high_dial) scales
+ * search depth thresholds for top levels. */
 zgec_matcher *zgec_matcher_create(zgec_tier tier,
-                                                size_t vb_capacity);
+                                                size_t vb_capacity,
+                                                int high_dial);
 void zgec_matcher_destroy(zgec_matcher *m);
 
 /* Reset the matcher for a new block, optionally

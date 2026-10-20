@@ -225,6 +225,7 @@ void zgec_params_default(zgec_params *p)
     p->block_checksums = 0;
     p->lambda = 0.0;
     p->fast_dial = 0;
+    p->high_dial = 0;
 }
 
 /* ---- encoder state ---- */
@@ -3267,7 +3268,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                               parse_dict_size,
                               filtered ? NULL : litref,
                               filtered ? 0 : litref_size,
-                              params.tier, params.lambda, params.fast_dial);
+                              params.tier, params.lambda, params.fast_dial, params.high_dial);
     zgec_free(filt); /* parse copied the literals it needs */
     filt = NULL;
     if (err != ZGEC_OK) return err;

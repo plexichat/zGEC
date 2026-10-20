@@ -74,18 +74,14 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                                       const uint8_t *litref, size_t litref_size,
                                       zgec_tier tier, double lambda);
 
-/* Extended form with the fast-tier speed dial (0 = the byte-identical default
- * every pinned level uses). fast_dial values 1-2 shrink the fast-tier hash
- * tables, 3 also drops the repeat-offset and short-table probes, and 4 runs a
- * separate single-table lean core; each rung trades ratio for encode
- * throughput and is only set by the new fast levels 1-3. Values outside 0-4
- * are clamped. Identical to zgec_parse_block_ex for fast_dial == 0. */
+/* Extended form with the fast-tier speed dial (fast_dial) and high-tier
+ * depth dial (high_dial). Identical to zgec_parse_block_ex for dials == 0. */
 zgec_err zgec_parse_block_dial(zgec_parse **out,
                                       const uint8_t *src, size_t raw_size,
                                       const uint8_t *dict, size_t dict_size,
                                       const uint8_t *litref, size_t litref_size,
                                       zgec_tier tier, double lambda,
-                                      int fast_dial);
+                                      int fast_dial, int high_dial);
 
 /* Segment a parse into segments (section 11.5).
  * Produces segment boundaries (indices into the

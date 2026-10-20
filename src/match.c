@@ -214,6 +214,7 @@
 
 struct zgec_matcher {
     zgec_tier      tier;
+    int            high_dial;   /* search depth dial for high-tier levels (0..11) */
     uint32_t       nbuckets;      /* short buckets */
     uint32_t       nbuckets_mask;
     uint32_t       nlanes;
@@ -709,7 +710,7 @@ static int mf_is_pow2_u32(uint32_t x)
     return x != 0u && (x & (x - 1u)) == 0u;
 }
 
-zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
+zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity, int high_dial)
 {
     zgec_matcher *m;
     size_t short_n;
@@ -726,6 +727,7 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
         return NULL;
     }
     m->tier = tier;
+    m->high_dial = (high_dial < 0) ? 0 : ((high_dial > 11) ? 11 : high_dial);
     m->vb_capacity = vb_capacity;
     m->vb = NULL;
     m->vb_size = 0;
@@ -1185,7 +1187,12 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * qualify -- decided before the rep scan so that the bucket line
      * could be prefetched early; `b`, `sbucket` and `hshort` come from
      * the same prelude. */
-    if (want_short && best.length < 32u) {
+    uint32_t short_cutoff = 32u;
+    if (m->high_dial > 0) {
+        static const uint32_t short_cutoff_table[12] = { 0, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 2048 };
+        short_cutoff = (m->high_dial <= 11) ? short_cutoff_table[m->high_dial] : 2048u;
+    }
+    if (want_short && best.length < short_cutoff) {
         uint32_t tag = (hshort >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         uint32_t mask;
         uint32_t head;

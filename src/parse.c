@@ -397,7 +397,7 @@ static float parse_lbar(const uint32_t *lit_hist, size_t total)
  * two-thirds more accepted matches) gains 0.3% of ratio for 8% of encode
  * wall time. Matches longer than the ceiling are kept outright. */
 #ifndef PARSE_LAZY_MAX_LEN
-#define PARSE_LAZY_MAX_LEN 16u
+#define PARSE_LAZY_MAX_LEN 256u
 #endif
 
 /* ---- actual parse with match finder ---- */
@@ -1314,7 +1314,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
                           const uint8_t *dict, size_t dict_size,
                           const uint8_t *litref, size_t litref_size,
-                          zgec_tier tier, double lambda, int fast_dial)
+                          zgec_tier tier, double lambda, int fast_dial, int high_dial)
 {
     if (!out) return ZGEC_ERR_INVAL;
     /* Never leave a stale pointer behind on the failure paths below. */
@@ -1442,7 +1442,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
     p->seq = (zgec_sequence *)zgec_alloc(seq_cap * sizeof(zgec_sequence), _Alignof(zgec_sequence));
     if (!p->seq) { zgec_free(vb); zgec_parse_free(p); return ZGEC_ERR_NOMEM; }
 
-    m = zgec_matcher_create(tier, vb_size);
+    m = zgec_matcher_create(tier, vb_size, high_dial);
     if (!m) {
         zgec_free(vb);
         zgec_parse_free(p);
@@ -1606,11 +1606,17 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
             }
         }
 
+        uint32_t lazy_max = 16u;
+        if (high_dial > 0) {
+            static const uint32_t lazy_max_table[12] = { 0, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 1024 };
+            lazy_max = (high_dial <= 11) ? lazy_max_table[high_dial] : 1024u;
+        }
+
         /* Lazy evaluation at ip + 1, driven by the
          * same price score and selected with a
          * conditional move on the score. */
-        if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
-            cur_len <= PARSE_LAZY_MAX_LEN &&
+        if (lazy_max > 0u && cur_len > 0u &&
+            cur_len <= lazy_max &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;
@@ -1805,5 +1811,5 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                           zgec_tier tier, double lambda)
 {
     return zgec_parse_block_dial(out, src, raw_size, dict, dict_size,
-                                 litref, litref_size, tier, lambda, 0);
+                                 litref, litref_size, tier, lambda, 0, 0);
 }

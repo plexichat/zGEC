@@ -839,3 +839,13 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-21 - High-Tier Compression Ratio Ladder Scaling (Levels 15-25)
+
+**Learning:**
+1. Levels 15 through 25 previously shared static parameter defaults (same lazy evaluation ceiling `PARSE_LAZY_MAX_LEN = 16u` and short bucket bypass cutoff `32u`), resulting in flat compression ratios across top-tier preset rungs.
+2. Introducing `high_dial` into `zgec_params` and threading it through `zgec_parse_block_dial` and `zgec_matcher_create` allows levels 15-25 (`high_dial` 1..11) to scale `lazy_max` up to 1024 bytes and `short_cutoff` up to 2048 bytes.
+3. On the Silesia benchmark corpus, scaling `high_dial` reduces compressed payload size by over 2.32 MB (improving Silesia overall ratio from 3.520x at level 14 to 3.661x at level 24/25) while maintaining fast decompression speed (~150-200 MB/s single-threaded, ~3.8 GB/s multi-threaded).
+
+**Action:**
+When configuring top-tier compression levels, use `high_dial` to progressively scale lazy match lookahead and short bucket candidate search depth.
