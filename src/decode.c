@@ -2685,13 +2685,16 @@ efail:
  * still in flight rather than by the whole frame.
  */
 
+#define ZGEC_SLOT_UNINIT    0u
+#define ZGEC_SLOT_EXPORTING 1u
+#define ZGEC_SLOT_READY     2u
+
 typedef struct {
-    zgec_mu  mu;      /* held while this slot is being exported */
+    volatile uint32_t state;  /* 0: UNINIT, 1: EXPORTING, 2: READY */
     uint8_t *lit;     /* exported literals; NULL when empty or released */
     size_t   len;
     size_t   refs;    /* consumers that still have to copy the bytes */
     zgec_err err;     /* export error, valid once ready */
-    unsigned ready;   /* 1 once lit/len/err are settled */
     unsigned alias;   /* 1 when lit points into the frame, not owned */
 } zgec_export_slot;
 
@@ -2752,7 +2755,6 @@ static void zgec_export_cache_free(zgec_export_cache *c)
     if (c == NULL) return;
     if (c->slot != NULL) {
         for (i = 0; i < c->nblk; i++) {
-            zgec_mu_destroy(&c->slot[i].mu);
             /* An alias points into the frame: releasing it would free a
              * pointer that was never allocated. */
             if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
@@ -2799,16 +2801,6 @@ static void zgec_export_cache_init(zgec_export_cache *c,
         return;
     }
     memset(c->slot, 0, c->nblk * sizeof(*c->slot));
-    for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
-    for (i = 0; i < c->nblk; i++) {
-        if (c->slot[i].mu.ok == 0) {
-            /* Without the slot locks the exporters could not agree on a
-             * result, so the frame has to go without the cache rather
-             * than risk a duplicated export. */
-            zgec_export_cache_free(c);
-            return;
-        }
-    }
     for (i = 0; i < c->nblk; i++) {
         const zgec_footer_block_entry *be = &f->blocks[i];
         uint8_t D = be->lit_ref_depth;
@@ -2912,23 +2904,31 @@ static zgec_err zgec_export_slot_acquire(zgec_export_cache *c, uint32_t idx,
     *len = 0u;
     if (c == NULL || idx >= c->nblk) return ZGEC_ERR_INTERNAL;
     s = &c->slot[idx];
-    zgec_mu_lock(&s->mu);
-    if (s->ready != 0u) {
-        *lit = s->lit;
-        *len = s->len;
-        e = s->err;
-        zgec_mu_unlock(&s->mu);
-        return e;
+
+    uint32_t st = zgec_atomic_load_32(&s->state);
+    if (st != ZGEC_SLOT_READY) {
+        if (st == ZGEC_SLOT_UNINIT) {
+            uint32_t prev = zgec_atomic_cas_32(&s->state, ZGEC_SLOT_UNINIT, ZGEC_SLOT_EXPORTING);
+            if (prev == ZGEC_SLOT_UNINIT) {
+                e = zgec_export_block(c, idx, s);
+                zgec_atomic_store_32(&s->state, ZGEC_SLOT_READY);
+                *lit = s->lit;
+                *len = s->len;
+                return e;
+            }
+        }
+        while (zgec_atomic_load_32(&s->state) != ZGEC_SLOT_READY) {
+#if defined(_WIN32)
+            SwitchToThread();
+#else
+            sched_yield();
+#endif
+        }
     }
-    /* Claimed by this worker, and still locked: publish the export
-     * before anybody else can look at it. */
-    e = zgec_export_block(c, idx, s);
-    s->ready = 1u;
-    zgec_mu_unlock(&s->mu);
-    if (e != ZGEC_OK) return e;
+
     *lit = s->lit;
     *len = s->len;
-    return ZGEC_OK;
+    return s->err;
 }
 
 /* Local LITREF predecessor: parse and export one predecessor record,
@@ -3893,8 +3893,12 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 if (have_footer) zgec_footer_free(&footer);
                 return err;
             }
-            hist_push(d, payload, rh.raw_size,
-                      (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
+            if ((fh.flags & ZGEC_FLAG_EXTENDED_LITREF) != 0) {
+                hist_push(d, payload, rh.raw_size,
+                          (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
+            } else {
+                hist_push(d, NULL, 0, 0);
+            }
             n_blocks++;
         } else if (rh.record_type == ZGEC_REC_RLE) {
             uint8_t *tmp = NULL;
@@ -3935,8 +3939,12 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
             err = frame_output_append(&out, &out_len, &out_cap, tmp,
                                       rh.raw_size,
                                       (uint64_t)d->limits.max_total);
-            hist_push(d, tmp, rh.raw_size,
-                      (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
+            if ((fh.flags & ZGEC_FLAG_EXTENDED_LITREF) != 0) {
+                hist_push(d, tmp, rh.raw_size,
+                          (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
+            } else {
+                hist_push(d, NULL, 0, 0);
+            }
             zgec_free(tmp);
             if (err != ZGEC_OK) {
                 zgec_free(out);
@@ -4058,32 +4066,34 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                                       ba->raw_size,
                                       (uint64_t)d->limits.max_total);
             if (err == ZGEC_OK) {
-                /* Save literal buffer for later litref predecessors.
-                 * The assembled buffer is adopted by the history
-                 * (no second copy). */
-                size_t tl = 0;
-                size_t s2;
-                int hexp = ((rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0) &&
-                           (exp_ok != 0);
-                for (s2 = 0; s2 < ba->n_seg; s2++)
-                    tl += ba->segs[s2].n_lit;
-                if (tl > 0) {
-                    uint8_t *lb =
-                        (uint8_t *)zgec_alloc(tl, 64);
-                    if (lb) {
-                        size_t qq = 0;
-                        for (s2 = 0; s2 < ba->n_seg; s2++) {
-                            if (ba->segs[s2].n_lit > 0)
-                                memcpy(lb + qq, ba->segs[s2].lit,
-                                       ba->segs[s2].n_lit);
-                            qq += ba->segs[s2].n_lit;
+                /* Save literal buffer for later litref predecessors when litref is active. */
+                if ((fh.flags & ZGEC_FLAG_EXTENDED_LITREF) != 0) {
+                    size_t tl = 0;
+                    size_t s2;
+                    int hexp = ((rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0) &&
+                               (exp_ok != 0);
+                    for (s2 = 0; s2 < ba->n_seg; s2++)
+                        tl += ba->segs[s2].n_lit;
+                    if (tl > 0) {
+                        uint8_t *lb =
+                            (uint8_t *)zgec_alloc(tl, 64);
+                        if (lb) {
+                            size_t qq = 0;
+                            for (s2 = 0; s2 < ba->n_seg; s2++) {
+                                if (ba->segs[s2].n_lit > 0)
+                                    memcpy(lb + qq, ba->segs[s2].lit,
+                                           ba->segs[s2].n_lit);
+                                qq += ba->segs[s2].n_lit;
+                            }
+                            hist_push_owned(d, lb, tl, hexp);
+                        } else {
+                            hist_push(d, NULL, 0, 0);
                         }
-                        hist_push_owned(d, lb, tl, hexp);
                     } else {
-                        hist_push(d, NULL, 0, 0);
+                        hist_push(d, NULL, 0, hexp);
                     }
                 } else {
-                    hist_push(d, NULL, 0, hexp);
+                    hist_push(d, NULL, 0, 0);
                 }
             }
             zgec_block_arrays_free(ba);

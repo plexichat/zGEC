@@ -589,3 +589,12 @@ Byte-identical: pinned sizes l1..l10 exact, l7 SHA
 395.5M ticks (-6.8%), l3 770.7M -> 687.7M (-10.8%). Whole-file interleaved A/B
 (pinned core, min of 9): l1 902.7 -> 898.9 ms (-0.4% min, medians -1.1%);
 l3 1569.7 -> 1551.0 ms (-1.2% min, medians -1.8%).
+
+## 2026-10-20 - Lock-Free Literal Export Cache and Conditional History Buffer Bypassing
+
+**Learning:**
+1. In `src/decode.c` (`zgec_export_slot`), frame literal export cache initialization and cleanup previously invoked `pthread_mutex_init` and `pthread_mutex_destroy` on every block slot per frame, consuming >13% of total frame decompression time in gprof. Replacing mutexes with lock-free 32-bit atomic state transitions (`0: UNINIT`, `1: EXPORTING`, `2: READY`) completely eliminated mutex setup/teardown overhead and per-slot lock contention.
+2. In `src/decode.c` (`zgec_decode_frame`), literal reference history (`hist_push`/`hist_push_owned`) previously allocated and copied 2 MiB literal buffers per block during sequential frame decoding even when extended literal reference (`ZGEC_FLAG_EXTENDED_LITREF`) was disabled for the frame. Guarding literal history allocation with `(fh.flags & ZGEC_FLAG_EXTENDED_LITREF) != 0` eliminated redundant 2 MiB heap allocations and memory copies on every block.
+
+**Action:**
+Use atomic state transitions instead of per-slot mutexes for frame cache initialization, and bypass literal reference history buffer allocations when literal references are disabled in the frame header.

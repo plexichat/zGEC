@@ -94,6 +94,35 @@ static inline size_t zgec_atomic_fetch_add_size(volatile size_t *ptr, size_t val
 #endif
 }
 
+static inline uint32_t zgec_atomic_cas_32(volatile uint32_t *ptr, uint32_t expected, uint32_t desired)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+    return (uint32_t)InterlockedCompareExchange((LONG volatile *)ptr, (LONG)desired, (LONG)expected);
+#else
+    uint32_t exp = expected;
+    (void)__atomic_compare_exchange_n(ptr, &exp, desired, 0, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED);
+    return exp;
+#endif
+}
+
+static inline uint32_t zgec_atomic_load_32(volatile uint32_t *ptr)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+    return (uint32_t)InterlockedCompareExchange((LONG volatile *)ptr, 0, 0);
+#else
+    return __atomic_load_n(ptr, __ATOMIC_ACQUIRE);
+#endif
+}
+
+static inline void zgec_atomic_store_32(volatile uint32_t *ptr, uint32_t val)
+{
+#if defined(_WIN32) && defined(_MSC_VER) && !defined(__clang__)
+    InterlockedExchange((LONG volatile *)ptr, (LONG)val);
+#else
+    __atomic_store_n(ptr, val, __ATOMIC_RELEASE);
+#endif
+}
+
 static inline unsigned zgec_cpu_count(void)
 {
 #if defined(_WIN32)
