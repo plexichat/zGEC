@@ -839,3 +839,12 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-21 - Literal rANS Encoding Reciprocal Optimization and Multi-Context Unrolling
+
+**Learning:**
+1. In `src/rans.c` (`zgec_rans_encode_symbol` and `zgec_rans_encode_core`), evaluating `if (f == 1u)` conditional branches per symbol introduced data-dependent branch mispredictions. Overriding reciprocal division output with branchless `cmov` select (`quo = (f == 1u) ? x : quo; rems = (f == 1u) ? 0u : rems;`) eliminates per-symbol branch overhead on low-frequency symbols without altering state transitions.
+2. In `src/rans.c` (`zgec_rans_encode` for `k > 1`), resolving context tables (`t7..t0`) once per round and executing store-free 8-lane round iterations eliminates per-lane loop setup overhead during multi-context rANS encoding while guaranteeing full memory bounds safety.
+
+**Measurement:**
+Byte-identical bitstream output across all levels (l1, l2, l4, l6, l7, l8, l9, l10) and 100% round-trip decompression. Interleaved A/B thread cycle count (N=9, ZGEC_CPUTIME=1): Level 1 min -2.10% / median -1.13%, Level 2 min -1.49%, Level 4 min +1.77% (within noise floor). ctest 4/4 passing.
