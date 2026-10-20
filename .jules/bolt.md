@@ -649,3 +649,53 @@ repeated; the snapshot allocation, memcpy and extra live memory cancel it.
 Conclusion: the second greedy pass is already cheap -- do not revisit literal
 caching, and treat the remaining per-segment histogram rebuild as a ~1%
 ceiling, which does not justify caching the full granule build.
+
+Session 2026-10-20 (cont.) -- parse insert prefetch, LTO, FSE entry load,
+conditioned-stream drains.
+
+REJECTED -- prefetch pipeline for the dense insert walk (mf_insert_dense):
+issue zgec_matcher_prefetch 8 positions ahead while inserting. Insert is 22%
+of l7 parse (5.1G of 23.1G ticks), and the write-allocate misses looked
+exposed. Paired l7: +2.3% min, 3/8 wins; l10 -0.9% min / +0.35% median, 4/8;
+l3 neutral. The extra hash computations and the doubled table touch cost more
+than the hidden latency. Do not batch/lead-prefetch the insert grid.
+
+REJECTED -- LTO (-flto on compile and link, separate build dir). l1 -0.3%,
+l3 +1.1% (worse), l7 -2.1% min / -1.4% median (4/6). Mixed and the l3
+regression is real; not worth the build-time cost. Note: -flto produced
+byte-identical output at all pinned levels.
+
+REJECTED -- single 8-byte load of zgec_fse_enc_entry in the plain FSE loop
+(__builtin_memcpy of the entry, field extraction by shift). The disassembly
+showed three loads (offsets 0/2/4) and a spill of new_state through the stack
+on the state chain. One word load did not remove the spill and lengthened the
+chain: l1 +2.1% median, l3 +3.0% min (2/8 wins), l7 +3.7% min. The existing
+field-wise loads schedule better; leave the loop alone.
+
+REJECTED -- hoisting the per-symbol row[0].pad check to a once-per-row prescan
+over [0, nsym). Absent symbols own a zero-filled row and legitimately have
+pad == 0, so the prescan rejects valid tables (caught immediately as
+"compress failed: internal error" at every level). pad is also per-row only
+because every cell of a present row is rewritten; it is not derivable from the
+entry that row[state] loads. Keep the per-symbol check.
+
+ACCEPTED -- branchless drains in zgec_seq_stream_encode_cond (seq.c). The
+conditioned LL/OF encoder wrote the transition field and the value's extra
+bits with two WRITE_BITS_COND flushes per symbol; each branched on the
+word-complete coin flip and on nbits[s] > 0, so it mispredicted roughly once
+per symbol. Replaced with the same unconditional-store/branchless-advance
+drain the plain FSE loop uses (two drains, so the fused 64-bit shift bound is
+never approached), and hoisted the three table pointers, the shared nsym and
+the use_prev back-offset out of the loop.
+
+Byte-identical at every pinned level (l1-l10 sizes and the l7 SHA).
+Isolated emit-phase ticks (4 interleaved pairs, min): cond stream encode
+-11.6% at l7 and -4.4% at l3, with the literal phase flat (control). Whole
+file l7: -1.1% min / -0.25% median, 7/12 paired wins -- the phase change is
+~1.7% of l7 and the wall clock is at the noise floor. ctest 4/4.
+
+Profiling note: an env-gated rdtsc split of zgec_emit_segment is the useful
+signal here (lit vs seq separately); the changed phase moved 11% while the
+whole-file delta was inside the +/-1.5% run-to-run drift. The emit split at
+l1/l3/l7 is lit 612/344/937 Mticks and seq 418/704/1057 Mticks, i.e. the
+sequence coder is now the larger half of emit at main/high levels.
