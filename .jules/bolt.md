@@ -765,3 +765,16 @@ process runs ~2.1x slower than alone. The per-worker slowdown at 6 workers is
 therefore a shared memory/L3 limit, not thread-pool overhead; the pool is
 already near that ceiling, and only the SMT oversubscription above was
 recoverable.
+
+Measured NEGATIVE (reverted) in the same session: three-stream fused FSE encode.
+zgec_fse_encode3 interleaved the LL, ML and OF state chains (all one symbol per
+sequence) in a single loop, on the theory that the standalone loop's ~13.5
+ticks/symbol is one dependent encode-table load and three chains would keep
+three loads in flight. Pinned single-core A/B against the same binary with the
+fused branch forced off (9 interleaved pairs, min): l1 872.5 vs 865.8 ms (+0.8%,
+2/9 wins) and l4 1930.4 vs 1923.6 (+0.4%, 4/9). Neutral-to-worse, so the loop
+really is store/throughput-bound as the earlier spill experiment suggested,
+and the third table's L2 footprint cancels any latency it could have hidden.
+Unpinned runs had shown a bogus 4-7% "win" at l2/l4; whole-file wall clock
+must be affinity-pinned here, the unpinned medians swing by more than the
+effect.
