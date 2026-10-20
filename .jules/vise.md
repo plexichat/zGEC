@@ -69,3 +69,7 @@ range check. Treat "deleted bounds check" as a failed review even if the
 reported speedup is large; a decode optimisation must be re-done with the checks
 in place. (The match-copy dispatch rewrite in that branch is otherwise sound and
 can be ported separately.)
+
+2026-10-20 - Gating Frame Literal History Allocation and Stack Fallbacks
+Learning: Unconditionally allocating multi-hundred-KiB literal history buffers (`lb`) during sequential frame decoding when `EXTENDED_LITREF` is disabled in `fh.flags` caused massive heap allocation churn and peak RSS inflation across all multi-block decompression paths, only to free the buffers without ever reading them. Checking `(fh.flags & ZGEC_FLAG_EXTENDED_LITREF)` before allocating literal history buffers completely eliminates this overhead. Additionally, providing stack fallback buffers for segment directory parsing (`stack_dir[64]`), filter inversion (`stack_tmp[8192]`), and dictionary chunk selection (`stack_sel[256]`) eliminates per-block heap allocation churn across hot decode and training loops.
+Action: Always check `EXTENDED_LITREF` flag before storing literal history during frame decoding, and use stack fallback buffers for bounded segment directory and filter temporary buffers.
