@@ -156,6 +156,18 @@ static void test_cpu_count(void)
     printf("cpucount ok (%u)\n", n);
 }
 
+static void test_cpu_physical_count(void)
+{
+    /* Unlike zgec_cpu_count this one has a per-platform query and a
+     * logical-count fallback, so the two invariants that must hold
+     * everywhere are the range checks below. */
+    unsigned p = zgec_cpu_physical_count();
+    unsigned n = zgec_cpu_count();
+    CHECK(p >= 1u, "physical cpu count >= 1");
+    CHECK(p <= n, "physical cpu count <= logical");
+    printf("physcpucount ok (%u of %u)\n", p, n);
+}
+
 static void test_reps_shared(void)
 {
     zgec_reps r;
@@ -178,6 +190,7 @@ int main(void)
     test_runstart();
     test_class_map_shared();
     test_cpu_count();
+    test_cpu_physical_count();
     test_reps_shared();
     if (fails == 0) printf("ALL DEDUP CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);

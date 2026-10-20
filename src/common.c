@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <stdio.h> /* Linux physical-core probe reads sysfs */
 #include <stdlib.h>
 #include <string.h>
 #include <stdint.h>
@@ -21,6 +22,59 @@ const char *zgec_version(void)
 {
     return ZGEC_VER_STR(ZGEC_VERSION_MAJOR) "."
            ZGEC_VER_STR(ZGEC_VERSION_MINOR);
+}
+
+/* Physical cores, with SMT siblings folded. Windows and Darwin name them
+ * directly; Linux reports the sibling set of cpu0 and derives the ratio.
+ * Any other platform, or a failed query, falls back to the logical count,
+ * which is the old behaviour. */
+unsigned zgec_cpu_physical_count(void)
+{
+#if defined(_WIN32)
+    DWORD len = 0;
+    unsigned cores = 0;
+    if (GetLogicalProcessorInformation(NULL, &len) == 0 &&
+        GetLastError() == ERROR_INSUFFICIENT_BUFFER && len > 0) {
+        SYSTEM_LOGICAL_PROCESSOR_INFORMATION *info =
+            (SYSTEM_LOGICAL_PROCESSOR_INFORMATION *)malloc((size_t)len);
+        if (info != NULL) {
+            if (GetLogicalProcessorInformation(info, &len) != 0) {
+                size_t n = (size_t)len / sizeof(*info);
+                size_t i;
+                for (i = 0; i < n; i++) {
+                    if (info[i].Relationship == RelationProcessorCore) cores++;
+                }
+            }
+            free(info);
+        }
+    }
+    return (cores >= 1u) ? cores : zgec_cpu_count();
+#elif defined(__APPLE__)
+    int ncore = 0;
+    size_t ncore_len = sizeof(ncore);
+    if (sysctlbyname("hw.physicalcpu", &ncore, &ncore_len, NULL, 0) == 0 &&
+        ncore >= 1 && ncore <= 1024)
+        return (unsigned)ncore;
+    return zgec_cpu_count();
+#elif defined(__linux__)
+    FILE *f = fopen("/sys/devices/system/cpu/cpu0/topology/"
+                    "thread_siblings_list", "r");
+    if (f != NULL) {
+        /* "0,6" -> 2 threads per core; a "-" range appears on large
+         * machines ("0-1"), so count both separators. */
+        unsigned per_core = 1;
+        unsigned logical = zgec_cpu_count();
+        int c;
+        while ((c = fgetc(f)) != EOF) {
+            if (c == ',' || c == '-') per_core++;
+        }
+        (void)fclose(f);
+        if (per_core > 1u && logical > per_core) return logical / per_core;
+    }
+    return zgec_cpu_count();
+#else
+    return zgec_cpu_count();
+#endif
 }
 
 const char *zgec_strerror(zgec_err e)

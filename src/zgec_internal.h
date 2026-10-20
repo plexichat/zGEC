@@ -119,6 +119,12 @@ static inline unsigned zgec_cpu_count(void)
 #endif
 }
 
+/* Physical cores available to the process, with SMT siblings folded, when
+ * the platform can name them; the logical count otherwise. The fast
+ * parser's default tables fill a core's L2, so its worker count keys off
+ * this rather than zgec_cpu_count (see zgec_encode_frame). */
+unsigned zgec_cpu_physical_count(void);
+
 /* Histogram normalisation to 2^al (Annex A). Canonical implementation
  * lives in src/seq.c; src/encode.c used to carry a byte-identical copy. */
 int zgec_normalize_counts(int16_t *counts, const uint32_t *hist,

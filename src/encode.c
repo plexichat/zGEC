@@ -3877,9 +3877,22 @@ static zgec_err zgec_params_sanitise(zgec_params *p)
         return ZGEC_ERR_INVAL;
     }
     /* 0 selects one worker per core (11.8); the pool is capped below
-     * the static worker limit, and a single worker stays serial. */
+     * the static worker limit, and a single worker stays serial. The
+     * two-table fast parser at its default dial (the rungs that use
+     * --tier fast without a speed dial) keeps two 256 KiB tables in the
+     * same 512 KiB L2 as the block it is reading, so an SMT sibling on
+     * that physical core evicts them instead of filling the first
+     * thread's stalls. One worker per physical core measured 25% faster
+     * at level 4 and 12-18% at 5-6; the lean dial rungs (1-3) and the
+     * main/high tiers are issue- or L3-latency-bound and still gain
+     * from the SMT threads, so they keep the logical count. */
     if (p->n_threads < 0) p->n_threads = 1;
-    if (p->n_threads == 0) p->n_threads = (int)zgec_cpu_count();
+    if (p->n_threads == 0) {
+        if (p->tier == ZGEC_TIER_FAST && p->fast_dial == 0)
+            p->n_threads = (int)zgec_cpu_physical_count();
+        else
+            p->n_threads = (int)zgec_cpu_count();
+    }
     if (p->n_threads > (int)ZGEC_MAX_WORKERS)
         p->n_threads = (int)ZGEC_MAX_WORKERS;
     /* S4: a negative or NaN lambda inverts the bits+lambda*cycles

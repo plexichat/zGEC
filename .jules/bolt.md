@@ -735,3 +735,33 @@ they remove. Also NEGATIVE: assigning the FSE loop's next state before the bit
 writes to keep it out of a stack spill (same senc ticks as HEAD, 13.5
 ticks/symbol either way -- that loop is throughput-bound, not latency-bound,
 despite the spill).
+
+Session 2026-10-20 (cont.) -- default worker count for the full fast parser.
+
+ACCEPTED -- resolve n_threads == 0 to one worker per PHYSICAL core for the
+fast tier at its default speed dial (rungs 4-6), and keep the logical count
+everywhere else. zgec_cpu_physical_count() folds SMT siblings (Windows
+GetLogicalProcessorInformation, Darwin hw.physicalcpu, Linux
+/.../cpu0/topology/thread_siblings_list) and falls back to the logical count,
+i.e. the old behaviour, when the platform cannot name them.
+
+Why only that slice of the ladder: the default fast parse keeps two 256 KiB
+tables, which is exactly the 512 KiB L2 a Zen 3 core owns; a second SMT thread
+on that core evicts the tables instead of filling the first thread's stalls.
+The lean-dial rungs (1-3) use 64-256 KiB of table and are issue-bound, and
+the main/high parsers have L3-resident tables and are latency-bound, so all of
+those still gain from the SMT threads (measured: l1 1,023 -> 1,160 MB/s and
+l7 107 -> 138 MB/s from 6 to 12 workers).
+
+Interleaved A/B, min of 5 (6 vs 12 workers, full corpus): l4 654.1 vs 826.8 ms
+(324.0 vs 256.3 MB/s, 1.26x), l5 724.2 vs 866.4 (1.20x), l6 853.5 vs 926.1
+(1.09x). Byte-identical at every pinned level (l1-l10 sizes, l7 SHA). ctest
+4/4; dedup gained a range check for the new counter.
+
+Scaling diagnostic worth remembering: six single-threaded encoder processes
+pinned to six distinct physical cores take 4.95 s wall for the corpus, i.e.
+257 MB/s aggregate against 324 MB/s for one in-process six-worker run -- each
+process runs ~2.1x slower than alone. The per-worker slowdown at 6 workers is
+therefore a shared memory/L3 limit, not thread-pool overhead; the pool is
+already near that ceiling, and only the SMT oversubscription above was
+recoverable.

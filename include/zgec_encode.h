@@ -28,7 +28,9 @@ typedef struct {
     int          max_dict_log2;  /* 0 = default (20, i.e. 1 MiB) */
     int          seg_hint_log2;  /* 14..22; 0 = default (18) */
     zgec_tier    tier;           /* match finder tier */
-    int          n_threads;      /* 0 = one per core (default), 1 = serial */
+    int          n_threads;      /* 0 = one per core (default; the fast
+                                  * parser's default dial uses physical
+                                  * cores), 1 = serial */
     int          use_dicts;      /* 0 = never, 1 = epoch dictionaries */
     int          use_litref;     /* 0 = never, 1 = literal references.
                                   * A LITREF predecessor must stay plain and
