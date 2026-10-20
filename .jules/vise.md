@@ -73,3 +73,12 @@ can be ported separately.)
 2026-10-20 - Gating Frame Literal History Allocation and Stack Fallbacks
 Learning: Unconditionally allocating multi-hundred-KiB literal history buffers (`lb`) during sequential frame decoding when `EXTENDED_LITREF` is disabled in `fh.flags` caused massive heap allocation churn and peak RSS inflation across all multi-block decompression paths, only to free the buffers without ever reading them. Checking `(fh.flags & ZGEC_FLAG_EXTENDED_LITREF)` before allocating literal history buffers completely eliminates this overhead. Additionally, providing stack fallback buffers for segment directory parsing (`stack_dir[64]`), filter inversion (`stack_tmp[8192]`), and dictionary chunk selection (`stack_sel[256]`) eliminates per-block heap allocation churn across hot decode and training loops.
 Action: Always check `EXTENDED_LITREF` flag before storing literal history during frame decoding, and use stack fallback buffers for bounded segment directory and filter temporary buffers.
+
+2026-10-20 - Reintegration and verification of the decode memory branch
+Measured after cherry-picking fb530e2 onto current main: single-threaded l7
+decode 495.3 -> 488.7 ms in the acceptance run; rigorous paired interleaved
+(8 reps l7 / 6 reps l4, pinned core) median delta -11.3 ms (-2.3%, 7/8 wins)
+at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
+exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
+Note: branches that delete decoder range checks remain rejected regardless of
+speed -- see the 2026-10-19 audit entry.

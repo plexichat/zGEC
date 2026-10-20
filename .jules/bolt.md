@@ -589,3 +589,42 @@ Byte-identical: pinned sizes l1..l10 exact, l7 SHA
 395.5M ticks (-6.8%), l3 770.7M -> 687.7M (-10.8%). Whole-file interleaved A/B
 (pinned core, min of 9): l1 902.7 -> 898.9 ms (-0.4% min, medians -1.1%);
 l3 1569.7 -> 1551.0 ms (-1.2% min, medians -1.8%).
+
+Session 2026-10-20 -- inbound agent branch triage (12 single-commit branches).
+
+MEASUREMENT METHOD FIX (important). A fresh `git worktree` has no CMake
+compiler cache, so `cmake -G Ninja` silently picked gcc from PATH while the
+main build tree uses clang. The gcc binaries were ~12% slower at l1 than the
+clang ones, which initially made every candidate look like a regression at
+l1. Always configure worktrees with the explicit clang path and verify with
+`ninja -t commands ... | select-string clang` before trusting any A/B.
+
+ACCEPTED -- `avx2-encode-optimization` (d9e16b7), fast-forwarded. AVX2
+histogram banks in `zgec_hist_lit_slice`/`zgec_enc_sample_stats`, factored
+`total*log(total)` entropy estimate, vectorised runstart sum and seq code
+lookups. Byte-identical (all pinned sizes + l7 SHA), ctest 4/4, -T 4
+round-trip clean. Paired interleaved l7 (10 reps, median of pair deltas):
+-192 ms on ~7.3 s (-2.6%), 8/10 wins; l1/l3 neutral.
+
+ACCEPTED (match.c only) -- `jules-2393332296035115024` (c60687c). Candidate
+filter takes the 64-bit difference first and derives short-target length from
+ctz, dropping the pre-filter gate. Byte-identical at l1..l10 + l7 SHA, ctest
+4/4. Paired l7 (10 reps): median -1.53%, 7/10 wins; l3 neutral. The branch's
+`cli.c` change (filter = 0 for levels 15-25) was dropped: it is a
+compression-quality regression on the top tiers and unrelated to speed.
+
+REJECTED -- `bolt-3-literal-rans-encode-opt` (manual 8-lane k==1 step): +4.4%
+l1 / +3.5% l3, 0-1/6 wins. The compiler's SLP form of the existing round is
+better; do not hand-roll the lane step.
+REJECTED -- `jules-11811750267246473172` (unrolled k>1 rounds): +3-4% l7/l9.
+REJECTED -- `bolt/opt-match-finder-tag-fast-path`: tag!=0 probe fast path,
+l1 +0.5% min (median dominated by an outlier), l3/l7 within noise.
+REJECTED -- `bolt/encode-throughput-fast-ctx-opt` as-is: its
+`ZGEC_FAST_INS_SPAN 0 -> 256` changes the fast-tier parse and moves l2
+(79,097,254) and l3 (68,007,671). With parse.c reverted the rest measured
+l1 -0.7%, l3 -0.9%, l7 +2.2% (worse) -- not worth the split.
+REJECTED -- `avx2-encode-path-simd-opt`: neutral everywhere (l7 median 2/5
+wins).
+REJECTED (decode) -- `bolt-decode-throughput-opt`, `bolt-decode-rans-match-opt`,
+`bolt-opt-decode-cache-atomic-sync`, `bolt/avx2-decode-path-opt`: l7 decode
+495 ms baseline -> 516 / 521 / 497 / 501 ms. Only the vise mem branch won.
