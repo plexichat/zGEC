@@ -314,17 +314,41 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         if (!syms) return 0;
         syms_allocated = 1;
     }
-    for (i = 0; i < n; i++) {
+    i = 0;
+#if defined(__AVX2__)
+    __m256i vmask = _mm256_set1_epi32((int)~511u);
+    while (i + 8 <= n) {
+        __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
+        if (_mm256_testz_si256(vv, vmask)) {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t code = (uint8_t)(zgec_seq_lut512[values[i + k]] >> 8);
+                uint32_t extra;
+                if ((int)code >= nsym || !zgec_seq_get_extra(values[i + k], code, base, nbits, &extra)) {
+                    if (syms_allocated) zgec_free(syms);
+                    return 0;
+                }
+                syms[i + k] = code;
+            }
+        } else {
+            for (size_t k = 0; k < 8; k++) {
+                uint8_t nb;
+                uint8_t code = zgec_seq_code_of(values[i + k], &nb);
+                uint32_t extra;
+                if ((int)code >= nsym || !zgec_seq_get_extra(values[i + k], code, base, nbits, &extra)) {
+                    if (syms_allocated) zgec_free(syms);
+                    return 0;
+                }
+                syms[i + k] = code;
+            }
+        }
+        i += 8;
+    }
+#endif
+    for (; i < n; i++) {
         uint8_t nb;
         uint8_t code = zgec_seq_code_of(values[i], &nb);
         uint32_t extra;
         if ((int)code >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
-        /* Bound the value against its symbol's range here too, not only in
-           the write loop below: the range test can reject for a custom
-           base/nbits pair, and doing it here is what keeps the promise that
-           a failed encode leaves the bitstream untouched (finding 3). The
-           accepted set is identical to the loop's, so this rejects nothing
-           the loop would have accepted. */
         if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra)) {
             if (syms_allocated) zgec_free(syms);
             return 0;

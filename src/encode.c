@@ -1531,7 +1531,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             } else {
                 /* Fast path: no runstarts and no lane boundary checks in interior */
                 j = l_start + 1;
-                for (; j + 4 <= l_end; j += 4) {
+                for (; j + 8 <= l_end; j += 8) {
                     unsigned ga = (unsigned)grp_lut[z[j - 1]];
                     cls_hist[(size_t)ga * 256u + (uint32_t)z[j]]++;
                     grp_total[ga]++;
@@ -1547,6 +1547,22 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                     unsigned gd = (unsigned)grp_lut[z[j + 2]];
                     cls_hist[(size_t)gd * 256u + (uint32_t)z[j + 3]]++;
                     grp_total[gd]++;
+
+                    unsigned ge = (unsigned)grp_lut[z[j + 3]];
+                    cls_hist[(size_t)ge * 256u + (uint32_t)z[j + 4]]++;
+                    grp_total[ge]++;
+
+                    unsigned gf = (unsigned)grp_lut[z[j + 4]];
+                    cls_hist[(size_t)gf * 256u + (uint32_t)z[j + 5]]++;
+                    grp_total[gf]++;
+
+                    unsigned gg = (unsigned)grp_lut[z[j + 5]];
+                    cls_hist[(size_t)gg * 256u + (uint32_t)z[j + 6]]++;
+                    grp_total[gg]++;
+
+                    unsigned gh = (unsigned)grp_lut[z[j + 6]];
+                    cls_hist[(size_t)gh * 256u + (uint32_t)z[j + 7]]++;
+                    grp_total[gh]++;
                 }
                 for (; j < l_end; j++) {
                     unsigned grp = (unsigned)grp_lut[z[j - 1]];
