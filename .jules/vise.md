@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Coder Selection Stack Allocation and Early Repeat Score Ceiling
+Learning: Dynamic heap allocation of small per-segment structures in `zgec_select_coder` (`hist`, `runstart`, and `cond_hist`) produced high heap allocation churn during block encoding. Using bounded stack buffers (`stack_hist[256]`, `stack_rs[8192]`, and `stack_cond[3 * ZGEC_NSYM_SEQ]`) completely eliminates these heap allocations on hot encoding paths. Additionally, in `zgec_parse_block_dial`, inserting an early score ceiling check `if ((float)rep_len[ri] * lbar <= cur_score) continue;` skips candidate score evaluations on repeat matches that cannot beat the current best score, reducing CPU instructions without affecting candidate selection or compression density.
+Action: Use stack fallbacks for small per-segment entropy buffers in encoder selection routines, and short-circuit candidate score evaluations when theoretical upper bounds cannot beat the best candidate score.

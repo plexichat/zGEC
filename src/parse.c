@@ -1584,22 +1584,20 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
                 uint32_t roff = reps.rep[ri];
                 if (roff != 0u && (size_t)roff <= ip && (size_t)roff <= (1u << 24)) {
                     if (cap >= 4u && rep_len[ri] >= 4u) {
-                        /* A repeat's score is rlen * lbar minus a
-                         * non-negative sequence cost, so it can never
-                         * exceed rlen * lbar: when that does not clear
-                         * cur_score the rep cannot win and the score is
-                         * skipped rather than computed and discarded.
-                         * The test is exact, so the choice is unchanged. */
-                        if ((float)rep_len[ri] * lbar > cur_score) {
-                            uint32_t rlen = rep_len[ri];
-                            float rscore = parse_score_rep_fast(rlen, ll_cost, ri,
-                                                                l2tot, ml_base, of_base,
-                                                                lbar, lscale);
-                            if (rscore > cur_score) {
-                                cur_score = rscore;
-                                cur_len = rlen;
-                                cur_off = roff;
-                            }
+                        /* Early score ceiling check: A repeat match's score is
+                         * rlen * lbar minus non-negative sequence encoding costs.
+                         * If rlen * lbar <= cur_score, it cannot possibly exceed
+                         * cur_score, so skip evaluating parse_score_rep_fast. */
+                        if ((float)rep_len[ri] * lbar <= cur_score) continue;
+
+                        uint32_t rlen = rep_len[ri];
+                        float rscore = parse_score_rep_fast(rlen, ll_cost, ri,
+                                                            l2tot, ml_base, of_base,
+                                                            lbar, lscale);
+                        if (rscore > cur_score) {
+                            cur_score = rscore;
+                            cur_len = rlen;
+                            cur_off = roff;
                         }
                     }
                 }
@@ -1608,13 +1606,16 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
 
         /* Lazy evaluation at ip + 1, driven by the
          * same price score and selected with a
-         * conditional move on the score. */
+         * conditional move on the score.
+         * Safety invariant: ip + 5 <= end ensures ip + 1 + 4 <= end, so
+         * probing match length at ip + 1 has at least 4 bytes remaining in vb. */
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;
             uint32_t nrep_len[3] = { 0u, 0u, 0u };
+            /* Lookahead probe at position ip + 1 in virtual buffer vb. */
             zgec_match nm = zgec_matcher_find_lens(m, vb, ip + (size_t)1,
                                                    reps.rep[0], reps.rep[1], reps.rep[2],
                                                    min_lazy_len,
