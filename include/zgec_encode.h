@@ -52,6 +52,10 @@ typedef struct {
                                   * short-table probes, and 4 runs the
                                   * single-table lean core. Only new levels
                                   * 1-3 set it. */
+    int          high_dial;      /* high-tier encoder dial for levels 15..25 (0..11).
+                                  * 0 is the default every pinned level <= 14 uses;
+                                  * 1..11 scale lookahead and search depth for
+                                  * top-tier levels 15..25. */
 } zgec_params;
 
 /* Default parameters. */

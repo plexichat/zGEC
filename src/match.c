@@ -224,6 +224,7 @@ struct zgec_matcher {
     uint8_t       *short_head;  /* per-bucket next write lane (ring) */
     uint32_t      *long_tab;    /* long_buckets entries */
     int            is_binary;   /* short hash uses 4 bytes */
+    uint32_t       short_cutoff;/* best.length threshold below which short bucket is probed */
     /* Invariant: an attached buffer always satisfies vb_size <= vb_capacity.
      * zgec_matcher_create rejects capacity > 2^24 and reset refuses to attach
      * when vb_size > vb_capacity, so every offset d <= ip < vb_size also
@@ -797,6 +798,7 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     memset(m->short_head, 0, m->nbuckets);
     memset(m->long_tab, 0, long_n * sizeof(uint32_t));
     /* No position has cached hashes yet. */
+    m->short_cutoff = 32u;
     m->c_ip[0] = (size_t)-1;
     m->c_ip[1] = (size_t)-1;
     m->c_hs[0] = 0u;
@@ -806,6 +808,13 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     m->c_flags[0] = 0u;
     m->c_flags[1] = 0u;
     return m;
+}
+
+void zgec_matcher_set_short_cutoff(zgec_matcher *m, uint32_t short_cutoff)
+{
+    if (m) {
+        m->short_cutoff = (short_cutoff < 4u) ? 4u : short_cutoff;
+    }
 }
 
 void zgec_matcher_destroy(zgec_matcher *m)
@@ -1185,7 +1194,7 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
      * qualify -- decided before the rep scan so that the bucket line
      * could be prefetched early; `b`, `sbucket` and `hshort` come from
      * the same prelude. */
-    if (want_short && best.length < 32u) {
+    if (want_short && best.length < m->short_cutoff) {
         uint32_t tag = (hshort >> ZGEC_MF_TAG_SHIFT) & ZGEC_MF_TAG_MASK;
         uint32_t mask;
         uint32_t head;
@@ -1256,11 +1265,12 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
-                        if (target_len > 8u &&
-                            (target_len > cap ||
-                             vb[ip - (size_t)d + (size_t)target_len - 1u] !=
-                             vb[ip + (size_t)target_len - 1u])) {
-                            continue;
+                        if (target_len > 8u) {
+                            uint8_t cur_target_byte = vb[ip + (size_t)target_len - 1u];
+                            if (target_len > cap ||
+                                vb[ip - (size_t)d + (size_t)target_len - 1u] != cur_target_byte) {
+                                continue;
+                            }
                         }
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
