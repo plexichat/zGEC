@@ -634,6 +634,37 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
         nwords = (size_t)base + off;                                            \
     } while (0)
 
+/* The same round for k > 1, where the table depends on the symbol: the
+ * predecessor's context class maps through idx_lut, except at a lane start
+ * and at a run start, which take the last (own) table -- exactly the choice
+ * the symbol-by-symbol loop below makes. Words are still committed lane 7
+ * down to lane 0, so the stream is byte-identical to that loop. */
+#define ZGEC_RANS_CTX_STEP(CORE, N)                                             \
+    do {                                                                        \
+        size_t jN = start[N] + round;                                           \
+        int tiN = (round == 0 || zgec_rs_get(runstart, jN))                     \
+                      ? k                                                       \
+                      : (int)idx_lut[Z[jN - 1]];                                \
+        if (tiN < 0 || tiN > k) goto fail_words;                                \
+        if (CORE(&tables[tiN], Z[jN], state[N], &ns, &wv, &nd) != 0)            \
+            goto fail_words;                                                    \
+        state[N] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
+    } while (0)
+#define ZGEC_RANS_ROUND_CTX(CORE)                                               \
+    do {                                                                        \
+        uint32_t base = (uint32_t)nwords;                                       \
+        uint32_t off = 0;                                                       \
+        uint32_t ns, wv, nd;                                                    \
+        ZGEC_RANS_CTX_STEP(CORE, 7);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 6);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 5);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 4);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 3);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 2);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 1);                                            \
+        ZGEC_RANS_CTX_STEP(CORE, 0);                                            \
+        nwords = (size_t)base + off;                                            \
+    } while (0)
     if (k == 1) {
         const zgec_rans_enc_table *tab = &tables[0];
         size_t full = len[7];
@@ -674,27 +705,35 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
             }
         }
     } else {
+        /* Same eight-lane schedule as k == 1; only the table lookup is
+         * conditional. The tail rounds (where the lanes are no longer all
+         * full) stay symbol-by-symbol. */
+        size_t full = len[7];
         for (size_t round_p1 = max_rounds; round_p1 > 0; round_p1--) {
             size_t round = round_p1 - 1;
-            for (int lane = 7; lane >= 0; lane--) {
-                int table_idx = 0;
-                size_t j;
-                if (round >= len[lane]) continue;
-                j = start[lane] + round;
-                if (j >= n_lit) { if (words_owned) zgec_free(words); return 0; }
-                if (j == start[lane] || zgec_rs_get(runstart, j)) {
-                    table_idx = k;
-                } else {
-                    uint8_t pidx = idx_lut[Z[j - 1]];
-                    if (pidx == 0xFFu) { if (words_owned) zgec_free(words); return 0; }
-                    table_idx = (int)pidx;
-                }
-                if (table_idx < 0 || table_idx > k) { if (words_owned) zgec_free(words); return 0; }
-                const zgec_rans_enc_table *tab = &tables[table_idx];
-                uint8_t s = Z[j];
-                if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
-                    if (words_owned) zgec_free(words);
-                    return 0;
+            if (round < full) {
+                ZGEC_RANS_ROUND_CTX(zgec_rans_encode_core);
+            } else {
+                for (int lane = 7; lane >= 0; lane--) {
+                    int table_idx = 0;
+                    size_t j;
+                    if (round >= len[lane]) continue;
+                    j = start[lane] + round;
+                    if (j >= n_lit) { if (words_owned) zgec_free(words); return 0; }
+                    if (j == start[lane] || zgec_rs_get(runstart, j)) {
+                        table_idx = k;
+                    } else {
+                        uint8_t pidx = idx_lut[Z[j - 1]];
+                        if (pidx == 0xFFu) { if (words_owned) zgec_free(words); return 0; }
+                        table_idx = (int)pidx;
+                    }
+                    if (table_idx < 0 || table_idx > k) { if (words_owned) zgec_free(words); return 0; }
+                    const zgec_rans_enc_table *tab = &tables[table_idx];
+                    uint8_t s = Z[j];
+                    if (zgec_rans_encode_symbol(tab, s, &state[lane], words, &nwords, words_cap) != 0) {
+                        if (words_owned) zgec_free(words);
+                        return 0;
+                    }
                 }
             }
         }
