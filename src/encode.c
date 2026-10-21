@@ -1604,14 +1604,26 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             rs_total++;
 
             if (has_rs) {
-                for (j = l_start + 1; j < l_end; j++) {
-                    if (zgec_rs_get(runstart, j)) {
-                        rs_hist[z[j]]++;
-                        rs_total++;
+                j = l_start + 1;
+                while (j < l_end) {
+                    /* If current j is byte-aligned and remaining runstart bytes are zero,
+                     * run unrolled 8-wide loop without per-byte zgec_rs_get calls. */
+                    if ((j & 7u) == 0u && j + 8u <= l_end && runstart[j >> 3u] == 0u) {
+                        for (size_t u = 0; u < 8u; u++, j++) {
+                            unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                            cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                            grp_total[grp]++;
+                        }
                     } else {
-                        unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                        cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                        grp_total[grp]++;
+                        if (zgec_rs_get(runstart, j)) {
+                            rs_hist[z[j]]++;
+                            rs_total++;
+                        } else {
+                            unsigned grp = (unsigned)grp_lut[z[j - 1]];
+                            cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
+                            grp_total[grp]++;
+                        }
+                        j++;
                     }
                 }
             } else {
