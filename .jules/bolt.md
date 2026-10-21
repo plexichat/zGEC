@@ -839,3 +839,12 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-21 - Short-Bucket Non-Zero Tag Fast-Path and Branchless Mask Bit Rotation
+
+**Learning:**
+1. In `mf_bucket_hits` (`src/match.c`), when `tag != 0u` (99.6% of calls), empty bucket slots (stored as 0) naturally fail equal-tag comparisons. Guarding the zero-vector load, zero comparison, and `andnot` SIMD bitwise masking behind `if (__builtin_expect(tag != 0u, 1))` bypasses 2 vector SIMD instructions per 4/8/16-lane bucket comparison without altering bitmask output.
+2. In `zgec_matcher_find_lens` (`src/match.c`), replacing branchy mask rotation (`s = (n - head) & (n - 1u); if (s == 0u) ...`) with a double-width bitwise shift `((mask | (mask << n)) >> head) & ((1u << n) - 1u)` for `n < 32u` eliminates branch mispredictions inside short-bucket hit walks.
+
+**Action:**
+In SIMD match finders, bypass empty-slot zero-mask comparisons when tag is non-zero, and use double-width bitwise shifts for branchless ring mask rotations.
