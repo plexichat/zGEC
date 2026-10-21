@@ -23,6 +23,14 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Portable thread-local storage (S3): MSVC's C11 mode historically lacks
+ * _Thread_local, so use __declspec(thread) there. */
+#if defined(_MSC_VER)
+#define ZGEC_ENC_TLS __declspec(thread)
+#else
+#define ZGEC_ENC_TLS _Thread_local
+#endif
+
 /*
  * Encoder pipeline per spec sections 11.1, 11.5-11.8 and 5.3-5.5.
  *
@@ -336,8 +344,51 @@ static zgec_err zgec_payload_grow(uint8_t **buf, size_t *cap, size_t used, size_
 /* Shannon entropy estimate in bits of a histogram. P4: callers that
  * already know the symbol total pass it so the accumulation loop over
  * nsym entries is skipped; pass ZGEC_ENC_TOTAL_UNKNOWN to accumulate.
- * Bit-identical either way (debug builds verify the supplied total). */
+ * Bit-identical either way (debug builds verify the supplied total).
+ *
+ * The logarithm is zgec_fast_log2_u64: e + mant/256, exactly representable,
+ * so every product c*log2(c) and every partial sum below is an exact
+ * multiple of 1/256 (counts here are block-sized, so the partial sums stay
+ * far below 2^53). The entropy is therefore accumulated as exact integers:
+ * 256*log2 is L(c), the table below, and the sum is divided by 256 once at
+ * the end. That is the same double the floating-point form returns, with no
+ * dependence on summation order, and it replaces a 256-step loop of clz,
+ * double multiply and double add with one table lookup per symbol. */
 #define ZGEC_ENC_TOTAL_UNKNOWN UINT64_MAX
+
+static inline uint32_t zgec_l256_u64(uint64_t x)
+{
+    unsigned e, shift;
+    if (x < 2u) return 0;
+    e = 63u - (unsigned)__builtin_clzll(x);
+    shift = (e >= 8u) ? (e - 8u) : 0u;
+    return ((uint32_t)(x >> shift) & 0xFFu) + 256u * e;
+}
+
+#define ZGEC_L256_TAB 65536u
+static ZGEC_ENC_TLS uint16_t zgec_l256_tab[ZGEC_L256_TAB];
+static ZGEC_ENC_TLS int zgec_l256_ready;
+
+/* One symbol's contribution c*log2(c), in exact 256*log2 units. */
+static inline uint64_t zgec_l256_term(uint32_t c, const uint16_t *lt)
+{
+    if (c <= 1u) return 0;
+    if (c < ZGEC_L256_TAB) return (uint64_t)c * (uint64_t)lt[c];
+    return (uint64_t)c * (uint64_t)zgec_l256_u64((uint64_t)c);
+}
+
+static const uint16_t *zgec_l256_get(void)
+{
+    if (!zgec_l256_ready) {
+        uint32_t i;
+        for (i = 0; i < ZGEC_L256_TAB; i++) {
+            zgec_l256_tab[i] = (uint16_t)zgec_l256_u64((uint64_t)i);
+        }
+        zgec_l256_ready = 1;
+    }
+    return zgec_l256_tab;
+}
+
 static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym,
                                         uint64_t known_total)
 {
@@ -369,15 +420,25 @@ static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym,
 #endif
     if (total == 0) return 0.0;
     {
-        double tlog = zgec_fast_log2_u64(total);
-        double sum_hlog = 0.0;
-        for (int s = 0; s < nsym; s++) {
-            uint32_t c = hist[s];
-            if (c > 1u) {
-                sum_hlog += (double)(uint64_t)c * zgec_fast_log2_u64((uint64_t)c);
-            }
+        const uint16_t *lt = zgec_l256_get();
+        uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        int s = 0;
+        /* Four accumulators: the adds are exact integers, so the split
+         * cannot change the value, and it keeps the sum off a single
+         * nsym-deep dependency chain. */
+        for (; s + 4 <= nsym; s += 4) {
+            a0 += zgec_l256_term(hist[s + 0], lt);
+            a1 += zgec_l256_term(hist[s + 1], lt);
+            a2 += zgec_l256_term(hist[s + 2], lt);
+            a3 += zgec_l256_term(hist[s + 3], lt);
         }
-        return (double)total * tlog - sum_hlog;
+        for (; s < nsym; s++) a0 += zgec_l256_term(hist[s], lt);
+        {
+            uint64_t acc = (a0 + a1) + (a2 + a3);
+            int64_t diff = (int64_t)(total * (uint64_t)zgec_l256_u64(total))
+                         - (int64_t)acc;
+            return (double)diff * (1.0 / 256.0);
+        }
     }
 }
 
