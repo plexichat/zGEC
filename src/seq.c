@@ -246,7 +246,8 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
 #endif
     for (; i < n; i++) {
         uint8_t nb_dummy;
-        syms[i] = zgec_seq_code_of(values[i], &nb_dummy);
+        uint32_t v = values[i];
+        syms[i] = (v < 512u) ? (uint8_t)(zgec_seq_lut512[v] >> 8) : zgec_seq_code_of(v, &nb_dummy);
     }
 
     zgec_err err = zgec_fse_encode(t, bw, values, syms, n, base, nbits);
@@ -346,10 +347,11 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
 #endif
     for (; i < n; i++) {
         uint8_t nb;
-        uint8_t code = zgec_seq_code_of(values[i], &nb);
+        uint32_t v = values[i];
+        uint8_t code = (v < 512u) ? (uint8_t)(zgec_seq_lut512[v] >> 8) : zgec_seq_code_of(v, &nb);
         uint32_t extra;
         if ((int)code >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
-        if (!zgec_seq_get_extra(values[i], code, base, nbits, &extra)) {
+        if (!zgec_seq_get_extra(v, code, base, nbits, &extra)) {
             if (syms_allocated) zgec_free(syms);
             return 0;
         }
@@ -422,53 +424,71 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
         };
         const unsigned back = use_prev ? 2u : 1u;
 
-        for (i = n - 1; i > 0; i--) {
-            uint8_t s = syms[i - 1];
-            const zgec_fse_enc_entry *row;
-            zgec_fse_enc_entry entry;
-            uint32_t bits;
-            uint32_t val;
-            uint32_t lo;
-            uint32_t extra;
-            unsigned c;
-            unsigned cn;
-            unsigned nb;
+        if (n > 1 && (size_t)(bw_end - bw_ptr) >= n * 12u + 16u) {
+            for (i = n - 1; i > 0; i--) {
+                uint8_t s = syms[i - 1];
+                unsigned c = (i >= back) ? zgec_mlclass(ml[i - back]) : 0u;
+                const zgec_fse_enc_entry *row = etab[c] + ((size_t)s << (unsigned)al);
+                zgec_fse_enc_entry entry = row[(size_t)state];
+                uint32_t bits = (uint32_t)(state - (uint32_t)entry.baseline);
+                uint32_t val = values[i - 1];
+                uint32_t lo = base[s];
+                uint32_t extra = val - lo;
+                unsigned cn = (unsigned)entry.nb_bits;
+                unsigned nb = (unsigned)nbits[s];
 
-            c = (i >= back) ? zgec_mlclass(ml[i - back]) : 0u;
-            if (c >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
-            if ((int)s >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
-            row = etab[c] + ((size_t)s << (unsigned)al);
-            entry = row[(size_t)state];
-            bits = (state >= (uint32_t)entry.baseline)
-                       ? (uint32_t)(state - (uint32_t)entry.baseline)
-                       : 0u;
-            cn = (unsigned)entry.nb_bits;
-            if (cn < 32u && bits >= (UINT32_C(1) << cn)) {
-                if (syms_allocated) zgec_free(syms);
-                return 0;
+                bw_acc |= (uint64_t)bits << bw_nacc;
+                bw_nacc += cn;
+                COND_DRAIN();
+                bw_acc |= (uint64_t)extra << bw_nacc;
+                bw_nacc += nb;
+                COND_DRAIN();
+                state = entry.new_state;
             }
-            val = values[i - 1];
-            lo = base[s];
-            if (val < lo) { if (syms_allocated) zgec_free(syms); return 0; }
-            extra = val - lo;
-            nb = (unsigned)nbits[s];
-            if (nb < 32u && extra >= (UINT32_C(1) << nb)) {
-                if (syms_allocated) zgec_free(syms);
-                return 0;
+        } else {
+            for (i = n - 1; i > 0; i--) {
+                uint8_t s = syms[i - 1];
+                const zgec_fse_enc_entry *row;
+                zgec_fse_enc_entry entry;
+                uint32_t bits;
+                uint32_t val;
+                uint32_t lo;
+                uint32_t extra;
+                unsigned c;
+                unsigned cn;
+                unsigned nb;
+
+                c = (i >= back) ? zgec_mlclass(ml[i - back]) : 0u;
+                if (c >= 3u) { if (syms_allocated) zgec_free(syms); return 0; }
+                if ((int)s >= nsym) { if (syms_allocated) zgec_free(syms); return 0; }
+                row = etab[c] + ((size_t)s << (unsigned)al);
+                entry = row[(size_t)state];
+                bits = (state >= (uint32_t)entry.baseline)
+                           ? (uint32_t)(state - (uint32_t)entry.baseline)
+                           : 0u;
+                cn = (unsigned)entry.nb_bits;
+                if (cn < 32u && bits >= (UINT32_C(1) << cn)) {
+                    if (syms_allocated) zgec_free(syms);
+                    return 0;
+                }
+                val = values[i - 1];
+                lo = base[s];
+                if (val < lo) { if (syms_allocated) zgec_free(syms); return 0; }
+                extra = val - lo;
+                nb = (unsigned)nbits[s];
+                if (nb < 32u && extra >= (UINT32_C(1) << nb)) {
+                    if (syms_allocated) zgec_free(syms);
+                    return 0;
+                }
+                bw_acc |= (uint64_t)bits << bw_nacc;
+                bw_nacc += cn;
+                COND_DRAIN();
+                bw_acc |= (uint64_t)extra << bw_nacc;
+                bw_nacc += nb;
+                COND_DRAIN();
+                state = entry.new_state;
+                if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
             }
-            /* Two separate branchless writes: bits is at most al (<= 11)
-             * and extra at most 32 wide, so each shift stays inside the
-             * 64-bit accumulator even when the unshifted fused form
-             * would not. A zero nb contributes nothing and costs no
-             * branch. */
-            bw_acc |= (uint64_t)bits << bw_nacc;
-            bw_nacc += cn;
-            COND_DRAIN();
-            bw_acc |= (uint64_t)extra << bw_nacc;
-            bw_nacc += nb;
-            COND_DRAIN();
-            state = entry.new_state;
-            if (state >= S) { if (syms_allocated) zgec_free(syms); return 0; }
         }
     }
 #undef COND_DRAIN
