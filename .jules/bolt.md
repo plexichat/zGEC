@@ -865,3 +865,56 @@ Standing conclusion for the encode ladder: every remaining phase is within a
 few percent of the best shape found so far. The one measured lever left on
 this box is the measurement itself -- freebuff/GTA5 hold 30-60% of all cores,
 and even on-CPU cycle counts need 9+ interleaved pinned pairs to resolve 1%.
+
+Session 2026-10-21 -- quiet box, fresh phase split, one real win.
+
+freebuff settled to ~8-40% of a core instead of 30-60%, so pinned on-CPU cycle
+counts finally resolve 1% with 9 pairs. Re-instrumented encode.c (temporary
+ZGEC_PHASE_LOG=1 rdtsc block, removed before committing) and got this split at
+-T1, pinned 0x200, 211,938,580-byte corpus (Mticks = 1e6 ticks):
+
+  l1 (3.40G): parse 1325, emit 1287 [lit 660, tbl 74, seq 417], seg 387,
+              prep 161, other 156
+  l4 (7.69G): parse 5407, emit 1263 [lit 299, tbl 114, seq 800], seg 683,
+              prep 260
+  l5 (9.52G): parse 5103, ctx 1291, emit 1761 [lit 880, seq 731], seg 647,
+              prep 266, sel 329
+  l6 (12.9G): parse 5496, d6 2295 (residual build 0.8G + select 0.93G),
+              ctx 1319, emit 1792 [lit 865, seq 774], seg 760, prep 683,
+              sel 603, vb 132
+
+select_contexts splits [hist 381 / cluster 877] per call at l5, so the class
+histogram build (4 modes x 64 KiB, 31.3M literals) and the greedy merge with
+its thousands of 256-entry entropies were each ~9% of l5 and ~8% of l6 x2.
+
+ACCEPTED a365f84 encode: exact integer entropy in the cost models.
+zgec_fast_log2_u64 is e + mant/256, exactly representable, so c*log2(c) and
+every partial sum are exact multiples of 1/256 well under 2^53: accumulate
+256*log2(c) as integers (u16 table over 64K counts, four accumulators) and
+divide by 256 once. Bit-identical, summation-order independent, and it drops
+the 256-step clz + double multiply + add loop per entropy call.
+Pinned interleaved A/B, 9 pairs, cycles: l1 -0.55% (5/9), l5 -2.45% (7/9),
+l6 -5.72% (9/9), l9 -2.59% (5/9). select_contexts entropy work at l6 fell
+from 2220 to 1764 Mticks total (both calls).
+
+ACCEPTED f276867 rans: eight-lane round for the k > 1 literal coder.
+The multi-table coder was the last serial path in emit; only the table choice
+differs per lane (idx_lut of the predecessor, else the own table at lane/run
+start), word commit order stays lane 7 down to lane 0, tail rounds stay
+serial. Byte-identical. l6 -0.8% min / -1.4% median, 11/15 pairs; l5, l7
+noise. Below the 2% bar but kept: it deletes a duplicate slow implementation
+rather than trading one shape for another.
+
+REJECTED (reverted): building the four select_contexts class histograms in
+four passes instead of one fused pass, so each pass' table is 64 KiB instead
+of 256 KiB. Literal re-reads and 4x loop overhead swamp the locality gain:
+l5 min +4.53% (0/9), l6 min +7.30% (1/9). The fused 4-table pass is right,
+which also says those increments are not L2-latency-bound.
+
+Still the three biggest blocks after these two commits: fast_parse (43% of l6,
+56% of l5, 70% of l4 -- the two 1 MiB hash tables are random-touch and
+L3-latency-bound; dense-insert prefetch and the match-length out-line were
+already measured negative), the l6 D6 residual build (the same residuals are
+built again in zgec_seg_prep_build; sharing the block-level buffer needs a
+per-segment "built" flag because D6 skips segments with no sequences), and
+emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
