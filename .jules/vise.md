@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Allocator Hardening and Encoder Table Lifetime Audit (vise-2)
+Learning: Audited `zgec_alloc`/`zgec_free` in `src/common.c` and `zgec_fse_enc_rent`/`zgec_fse_enc_return` in `src/fse.c`. The thread-local block cache in `src/common.c` is bounded at 8 slots per thread with a 4 MiB maximum block size (at most 32 MiB retained memory per thread), and `zgec_pool_take` removes the claimed slot so blocks cannot be shared by multiple threads. Added debug assertions in `src/common.c` and `src/fse.c` to verify allocation prefix bounds and catch duplicate list insertions. In `src/encode.c`, verified that all encoder table pointers (`enc_ll`, `enc_ml`, `enc_of`, `enc_ll3`, `enc_of3`) are initialized to `NULL` and set to `NULL` immediately after `zgec_fse_free_enc` calls so error paths (`seg_fail_tables`) safely handle re-entrancy without double-freeing.
+Action: Add debug assertions for allocation headers and double-free detection, and ensure all table pointers are set to NULL immediately after freeing.

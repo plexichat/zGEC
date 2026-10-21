@@ -5,6 +5,7 @@
 #include "zgec_seq.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -47,6 +48,16 @@ static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
 
 static void zgec_fse_enc_return(zgec_fse_enc_table *t)
 {
+    if (!t) return;
+#ifndef NDEBUG
+    {
+        zgec_fse_enc_table *p = zgec_fse_enc_pool;
+        while (p) {
+            assert(p != t && "double return/free of fse encoder table");
+            p = (zgec_fse_enc_table *)(void *)p->e;
+        }
+    }
+#endif
     t->e = (zgec_fse_enc_entry *)(void *)zgec_fse_enc_pool;
     zgec_fse_enc_pool = t;
 }

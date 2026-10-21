@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdio.h> /* Linux physical-core probe reads sysfs */
 #include <stdlib.h>
 #include <string.h>
@@ -193,6 +194,7 @@ static void *zgec_pool_take(size_t total)
 /* Offer a block to the cache; returns 0 if it was not taken (caller frees). */
 static int zgec_pool_put(void *raw, size_t total)
 {
+    assert(zgec_pool_n <= ZGEC_POOL_SLOTS);
     if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
     zgec_pool[zgec_pool_n].raw = raw;
     zgec_pool[zgec_pool_n].total = total;
@@ -251,11 +253,13 @@ void *zgec_alloc(size_t n, size_t align)
     prefix = 2u * sizeof(void *) + align - 1;
     if (zgec_add_overflows(n, prefix)) return NULL;
     total = n + prefix;
+    assert(total >= n + prefix);
     raw = zgec_pool_take(total);
     if (!raw) {
         raw = malloc(total);
         if (!raw) return NULL;
     }
+    assert(raw != NULL);
     base = (uintptr_t)raw;
     if (__builtin_add_overflow(base, prefix, &sum)) {
         free(raw);
@@ -280,6 +284,8 @@ void zgec_free(void *p)
     if (!p) return;
     void *raw = ((void **)p)[-1];
     size_t total = ((size_t *)p)[-2];
+    assert(raw != NULL);
+    assert(total >= 2u * sizeof(void *));
     if (total >= ZGEC_POOL_MIN && total <= ZGEC_POOL_MAX_BLOCK &&
         zgec_pool_put(raw, total)) {
         return;
