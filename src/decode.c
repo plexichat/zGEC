@@ -1032,10 +1032,54 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     }
     if (use_prev) {
         clsbuf[0] = 0;
-        for (i = 1; i < n; i++)
+        i = 1;
+#if defined(__AVX2__)
+        __m256i v3 = _mm256_set1_epi32(3);
+        __m256i vmin = _mm256_set1_epi32((int)0x80000000u);
+        __m256i v3_u = _mm256_xor_si256(_mm256_set1_epi32(3), vmin);
+        __m256i v15_u = _mm256_xor_si256(_mm256_set1_epi32(15), vmin);
+        while (i + 8 <= n) {
+            __m256i vml = _mm256_loadu_si256((const __m256i *)(const void *)(ml + i - 1));
+            __m256i vm = _mm256_sub_epi32(vml, v3);
+            __m256i vm_u = _mm256_xor_si256(vm, vmin);
+            __m256i c0 = _mm256_cmpgt_epi32(vm_u, v3_u);
+            __m256i c1 = _mm256_cmpgt_epi32(vm_u, v15_u);
+            __m256i cls32 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(c0, c1));
+
+            __m128i lo = _mm256_castsi256_si128(cls32);
+            __m128i hi = _mm256_extracti128_si256(cls32, 1);
+            __m128i packed16 = _mm_packs_epi32(lo, hi);
+            __m128i packed8 = _mm_packus_epi16(packed16, packed16);
+            _mm_storel_epi64((__m128i *)(clsbuf + i), packed8);
+            i += 8;
+        }
+#endif
+        for (; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
     } else {
-        for (i = 0; i < n; i++)
+        i = 0;
+#if defined(__AVX2__)
+        __m256i v3 = _mm256_set1_epi32(3);
+        __m256i vmin = _mm256_set1_epi32((int)0x80000000u);
+        __m256i v3_u = _mm256_xor_si256(_mm256_set1_epi32(3), vmin);
+        __m256i v15_u = _mm256_xor_si256(_mm256_set1_epi32(15), vmin);
+        while (i + 8 <= n) {
+            __m256i vml = _mm256_loadu_si256((const __m256i *)(const void *)(ml + i));
+            __m256i vm = _mm256_sub_epi32(vml, v3);
+            __m256i vm_u = _mm256_xor_si256(vm, vmin);
+            __m256i c0 = _mm256_cmpgt_epi32(vm_u, v3_u);
+            __m256i c1 = _mm256_cmpgt_epi32(vm_u, v15_u);
+            __m256i cls32 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(c0, c1));
+
+            __m128i lo = _mm256_castsi256_si128(cls32);
+            __m128i hi = _mm256_extracti128_si256(cls32, 1);
+            __m128i packed16 = _mm_packs_epi32(lo, hi);
+            __m128i packed8 = _mm_packus_epi16(packed16, packed16);
+            _mm_storel_epi64((__m128i *)(clsbuf + i), packed8);
+            i += 8;
+        }
+#endif
+        for (; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
     }
     zgec_br_init(&br, stream, ssize);
