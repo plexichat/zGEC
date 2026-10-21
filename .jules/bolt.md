@@ -918,3 +918,15 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-21 - Context Selection and Sub-Literal Hot Path Optimizations
+
+**Learning:**
+1. In `src/encode.c` (`zgec_ctx_body_bits`), calculating symbol totals (`grp_total`) per context group by incrementing scalar counters inside the per-byte loop was redundant. Removing `grp_total` increments from the byte loop and letting `zgec_enc_entropy_bits_u32` calculate total symbol counts via AVX2 SIMD over the 256 histogram bins (`ZGEC_ENC_TOTAL_UNKNOWN`) eliminates 8 array increments per 8 bytes.
+2. In `zgec_select_contexts` and `zgec_ctx_body_bits`, replacing individual scalar byte reads in 8-unrolled loops with 64-bit unaligned word loads (`zgec_rd64`) reduces memory load instructions.
+3. In `zgec_select_coder`, tracking `rs_built` avoids re-clearing and rebuilding the runstart bitmask from `ll_arr` when evaluating sub-literal context candidates after plain-literal context evaluation already constructed it.
+4. Aligning static TLS thread scratch arrays `work` and `dlt` in `zgec_cluster_greedy` to 64-byte boundaries (`_Alignas(64)`) ensures SIMD vector loads and stores avoid split-cacheline penalties.
+5. In `zgec_enc_entropy_bits_u32`, unrolling the exact 256*log2 integer accumulation loop 8-wide (`a0..a7`) increases ILP across table lookups.
+
+**Action:**
+Eliminate redundant inner-loop array total counters in entropy body estimations when SIMD vector summation is available, avoid duplicate runstart bitmask generation across coder candidates, and align TLS thread scratch arrays to 64 bytes.
