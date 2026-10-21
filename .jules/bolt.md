@@ -839,3 +839,13 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-21 - Context Selection Pass Splitting and Selective cls_hist Zeroing (jules-2)
+
+**Learning:**
+1. In `zgec_select_contexts` (`src/encode.c`), accumulating 4 parallel class histograms (`h0`..`h3`) simultaneously inside the unrolled loop strained L1 cache write store queues and caused store-to-load forwarding stalls. Splitting into two 2-way passes (`h0`+`h1` for LSB6/MSB6, then `h2`+`h3` for TEXT/SIGNED) halves active L1 store streams.
+2. In `zgec_ctx_body_bits` (`src/encode.c`), zeroing all 64 rows of `cls_hist` (64 KiB) per segment was wasteful when `k < 64`. Zeroing only `k * 256` active elements eliminates redundant `memset` calls on hot entropy evaluation paths, and unrolling the interior loop 8-wide further improves throughput.
+3. In `zgec_enc_build_resid` (`src/encode.c`), hoisting the loop-invariant `(size_t)r0 <= p` condition outside the 32-byte AVX2 vector sub-literal residual subtraction loops avoids redundant condition checks per 32-byte block.
+
+**Action:**
+Split multi-way histogram accumulator passes to reduce L1 write stream contention, zero only active context rows in context scoring functions, and hoist loop-invariant bounds checks outside SIMD loops.
