@@ -619,15 +619,37 @@ size_t zgec_fse_write_counts(uint8_t *buf, size_t cap,
     if (nsym == ZGEC_NSYM_LIT && al != ZGEC_LIT_AL) return 0;
     int S = 1 << al;
     long sum = 0;
-    for (int s = 0; s < nsym; s++) {
+    int s = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    __m256i vone = _mm256_set1_epi32(1);
+    __m256i vzero = _mm256_setzero_si256();
+    __m256i vneg1 = _mm256_set1_epi32(-1);
+    for (; s + 8 <= nsym; s += 8) {
+        __m128i raw16 = _mm_loadu_si128((const __m128i *)(const void *)(counts + s));
+        __m256i vc = _mm256_cvtepi16_epi32(raw16);
+        __m256i vinvalid = _mm256_cmpgt_epi32(vneg1, vc);
+        if (!_mm256_testz_si256(vinvalid, vinvalid)) return 0;
+        __m256i vneg = _mm256_cmpgt_epi32(vzero, vc);
+        __m256i veff = _mm256_blendv_epi8(vc, vone, vneg);
+        vsum = _mm256_add_epi32(vsum, veff);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    sum += _mm_cvtsi128_si32(vlow);
+#endif
+    for (; s < nsym; s++) {
         if (counts[s] < -1) return 0;
         sum += counts[s] < 0 ? 1 : counts[s];
     }
     if (sum != S) return 0;
 
     int maxSym = -1;
-    for (int s = nsym - 1; s >= 0; s--) {
-        if (counts[s] != 0) { maxSym = s; break; }
+    for (int k_idx = nsym - 1; k_idx >= 0; k_idx--) {
+        if (counts[k_idx] != 0) { maxSym = k_idx; break; }
     }
     if (maxSym < 0) return 0;
 

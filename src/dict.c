@@ -1,3 +1,6 @@
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 #include "zgec_dict.h"
 
 #include "zgec_bitstream.h"
@@ -189,7 +192,19 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
         if (n > 0) memcpy(dst, src, n);
         return;
     }
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+#if defined(__AVX2__)
+    if (rep0 >= 32u && (size_t)rep0 <= pos) {
+        while (i + 32u <= n) {
+            __m256i vsrc = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + pos + i - (size_t)rep0));
+            __m256i vres = _mm256_add_epi8(vsrc, vpred);
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), vres);
+            i += 32u;
+        }
+    }
+#endif
+    for (; i < n; i++) {
         size_t cur = pos + i;
         uint8_t pred = 0;
         if ((uint64_t)rep0 <= (uint64_t)cur) pred = vb[cur - (size_t)rep0];
