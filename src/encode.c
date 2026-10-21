@@ -586,17 +586,16 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
                 _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vlit);
                 u += 32u;
             }
-        } else {
+        } else if ((size_t)r0 <= p) {
+            /* r0 and p are loop invariants and p + u only grows, so the
+             * per-vector "predictor in range" test the loop used to do can
+             * only fail on its first iteration: hoist it. */
             while (u + 32u <= llen && li + u + 32u <= n_lit) {
-                if ((size_t)r0 <= p + u) {
-                    __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
-                    __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)r0));
-                    __m256i vres = _mm256_sub_epi8(vlit, vpred);
-                    _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
-                    u += 32u;
-                } else {
-                    break;
-                }
+                __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)r0));
+                __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
+                u += 32u;
             }
         }
 #endif
@@ -617,17 +616,13 @@ static void zgec_enc_build_resid(uint8_t *z, const uint8_t *lit,
                 _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vlit);
                 u += 32u;
             }
-        } else {
+        } else if ((size_t)rep0_tail <= p) {
             while (li + u + 32u <= n_lit) {
-                if ((size_t)rep0_tail <= p + u) {
-                    __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
-                    __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)rep0_tail));
-                    __m256i vres = _mm256_sub_epi8(vlit, vpred);
-                    _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
-                    u += 32u;
-                } else {
-                    break;
-                }
+                __m256i vlit = _mm256_loadu_si256((const __m256i *)(const void *)(lit + li + u));
+                __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(vb + p + u - (size_t)rep0_tail));
+                __m256i vres = _mm256_sub_epi8(vlit, vpred);
+                _mm256_storeu_si256((__m256i *)(void *)(z + li + u), vres);
+                u += 32u;
             }
         }
 #endif
@@ -1574,7 +1569,14 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     size_t start[ZGEC_NLANES];
     size_t j;
     int g;
-    memset(cls_hist, 0, (size_t)64 * 256u * sizeof(uint32_t));
+    {
+        /* grp_lut folds every group id to < k and only the first k rows are
+         * read back, so clearing all 64 rows (64 KiB, every call) is waste:
+         * the k == 1 candidate is by far the most common one. */
+        size_t k_clear = (k > 0) ? (size_t)k : 1u;
+        if (k_clear > 64u) k_clear = 64u;
+        memset(cls_hist, 0, k_clear * 256u * sizeof(uint32_t));
+    }
     memset(rs_hist, 0, sizeof(rs_hist));
     memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
@@ -1615,7 +1617,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             } else {
                 /* Fast path: no runstarts and no lane boundary checks in interior */
                 j = l_start + 1;
-                for (; j + 4 <= l_end; j += 4) {
+                for (; j + 8 <= l_end; j += 8) {
                     unsigned ga = (unsigned)grp_lut[z[j - 1]];
                     cls_hist[(size_t)ga * 256u + (uint32_t)z[j]]++;
                     grp_total[ga]++;
@@ -1631,6 +1633,22 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                     unsigned gd = (unsigned)grp_lut[z[j + 2]];
                     cls_hist[(size_t)gd * 256u + (uint32_t)z[j + 3]]++;
                     grp_total[gd]++;
+
+                    unsigned ge = (unsigned)grp_lut[z[j + 3]];
+                    cls_hist[(size_t)ge * 256u + (uint32_t)z[j + 4]]++;
+                    grp_total[ge]++;
+
+                    unsigned gf = (unsigned)grp_lut[z[j + 4]];
+                    cls_hist[(size_t)gf * 256u + (uint32_t)z[j + 5]]++;
+                    grp_total[gf]++;
+
+                    unsigned gg = (unsigned)grp_lut[z[j + 5]];
+                    cls_hist[(size_t)gg * 256u + (uint32_t)z[j + 6]]++;
+                    grp_total[gg]++;
+
+                    unsigned gh = (unsigned)grp_lut[z[j + 6]];
+                    cls_hist[(size_t)gh * 256u + (uint32_t)z[j + 7]]++;
+                    grp_total[gh]++;
                 }
                 for (; j < l_end; j++) {
                     unsigned grp = (unsigned)grp_lut[z[j - 1]];
@@ -1742,10 +1760,17 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                                   zgec_coder_choice *out)
 {
     zgec_coder_choice best;
-    uint32_t *hist = NULL;
+    /* Selection runs once per segment and the buffers are small and
+     * short-lived, so keep them on the stack: the heap churn (one 1 KiB
+     * histogram, one run-start byte per 8 literals, one conditioning
+     * histogram) showed up in the per-segment selection cost. */
+    uint32_t stack_hist[ZGEC_NSYM_LIT];
+    uint32_t *hist = stack_hist;
     uint32_t *cls_hist = NULL;
     int cls_owned = 0;
+    uint8_t stack_rs[8192];
     uint8_t *runstart = NULL;
+    int rs_owned = 0;
     uint8_t *resid = NULL;
     int resid_owned = 0;
     double seq_bits;
@@ -1769,8 +1794,6 @@ static zgec_err zgec_select_coder(const zgec_params *params,
     (void)seq_bits;
 
     if (n_lit_slice > 0) {
-        hist = (uint32_t *)zgec_alloc(256 * sizeof(*hist), 64);
-        if (!hist) return ZGEC_ERR_NOMEM;
         if (h_lit_in) {
             memcpy(hist, h_lit_in, 256 * sizeof(*hist));
         } else {
@@ -1797,19 +1820,20 @@ static zgec_err zgec_select_coder(const zgec_params *params,
         /* Candidate: rANS with block contexts on plain literals,
          * partitioned through the block's real (mode, class map). */
         if (params->use_contexts && block_k > 1 && block_cmap) {
-            runstart = (uint8_t *)zgec_alloc(
-                n_lit_slice ? zgec_rs_bytes(n_lit_slice) : 1, 1);
-            cls_hist = scratch_cls;
-            if (!runstart) {
-                zgec_free(hist);
-                return ZGEC_ERR_NOMEM;
+            size_t rsb = zgec_rs_bytes(n_lit_slice);
+            if (n_lit_slice > 0 && rsb <= sizeof(stack_rs)) {
+                runstart = stack_rs;
+            } else {
+                runstart = (uint8_t *)zgec_alloc(n_lit_slice ? rsb : 1, 1);
+                if (!runstart) return ZGEC_ERR_NOMEM;
+                rs_owned = 1;
             }
+            cls_hist = scratch_cls;
             if (!cls_hist) {
                 cls_hist = (uint32_t *)zgec_alloc(
                     (size_t)64 * 256u * sizeof(uint32_t), 64);
                 if (!cls_hist) {
-                    zgec_free(hist);
-                    zgec_free(runstart);
+                    if (rs_owned) zgec_free(runstart);
                     return ZGEC_ERR_NOMEM;
                 }
                 cls_owned = 1;
@@ -1858,8 +1882,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
             resid = (uint8_t *)zgec_alloc(n_lit_slice ? n_lit_slice : 1,
                                           64);
             if (!resid) {
-                zgec_free(hist);
-                zgec_free(runstart);
+                if (rs_owned) zgec_free(runstart);
                 if (cls_owned) zgec_free(cls_hist);
                 return ZGEC_ERR_NOMEM;
             }
@@ -1891,13 +1914,17 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                 double hdr;
                 double s;
                 if (!runstart) {
-                    runstart = (uint8_t *)zgec_alloc(
-                        zgec_rs_bytes(n_lit_slice), 1);
-                    if (!runstart) {
-                        zgec_free(hist);
-                        if (cls_owned) zgec_free(cls_hist);
-                        if (resid_owned) zgec_free(resid);
-                        return ZGEC_ERR_NOMEM;
+                    size_t rsb = zgec_rs_bytes(n_lit_slice);
+                    if (rsb <= sizeof(stack_rs)) {
+                        runstart = stack_rs;
+                    } else {
+                        runstart = (uint8_t *)zgec_alloc(rsb, 1);
+                        if (!runstart) {
+                            if (cls_owned) zgec_free(cls_hist);
+                            if (resid_owned) zgec_free(resid);
+                            return ZGEC_ERR_NOMEM;
+                        }
+                        rs_owned = 1;
                     }
                 }
                 {
@@ -1915,8 +1942,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                     cls_hist = (uint32_t *)zgec_alloc(
                         (size_t)64 * 256u * sizeof(uint32_t), 64);
                     if (!cls_hist) {
-                        zgec_free(hist);
-                        zgec_free(runstart);
+                        if (rs_owned) zgec_free(runstart);
                         if (resid_owned) zgec_free(resid);
                         return ZGEC_ERR_NOMEM;
                     }
@@ -1962,13 +1988,9 @@ static zgec_err zgec_select_coder(const zgec_params *params,
     if (params->use_conditioning && n > 0 && ll_arr && ml_arr && of_arr &&
         h_ll && h_of) {
 #if ZGEC_ENC_EMIT_SEQ_COND
+        uint32_t stack_cond[3u * ZGEC_NSYM_SEQ];
         uint32_t *cond_hist = scratch_cond;
-        int cond_owned = 0;
-        if (!cond_hist) {
-            cond_hist = (uint32_t *)zgec_alloc(
-                3u * ZGEC_NSYM_SEQ * sizeof(uint32_t), 64);
-            if (cond_hist) cond_owned = 1;
-        }
+        if (!cond_hist) cond_hist = stack_cond;
         if (cond_hist) {
             size_t k;
             /* OF(i) on mlclass(ML(i)). */
@@ -1997,7 +2019,6 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                     best.seq_cond_ll = 1;
                 }
             }
-            if (cond_owned) zgec_free(cond_hist);
         }
 #else
         (void)ll_arr;
@@ -2005,8 +2026,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
 #endif
     }
 
-    zgec_free(hist);
-    zgec_free(runstart);
+    if (rs_owned) zgec_free(runstart);
     if (cls_owned) zgec_free(cls_hist);
     if (resid_owned) zgec_free(resid);
 
