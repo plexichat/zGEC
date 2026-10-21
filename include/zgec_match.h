@@ -85,6 +85,9 @@ void zgec_matcher_insert_match(zgec_matcher *m,
                                            const uint8_t *vb,
                                            size_t start, size_t len);
 
+/* Set the short bucket search cutoff threshold (best.length threshold below which short buckets are searched). */
+void zgec_matcher_set_short_cutoff(zgec_matcher *m, uint32_t short_cutoff);
+
 /* Prefetch the table lines that a find/insert at ip will touch. */
 void zgec_matcher_prefetch(zgec_matcher *m, const uint8_t *vb, size_t ip);
 /* Prefetch the lines that insert_match(start, len) will write. */
