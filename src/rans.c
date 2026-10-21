@@ -888,35 +888,26 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
             if (lane_len > 0) {
                 tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
                 size_t t = 1;
-                for (; t + 4 <= lane_len; t += 4) {
+                while (t < lane_len) {
                     size_t j = lane_start + t;
-                    int table_idx0 = zgec_rs_get(runstart, j) ? (n_tables - 1) : (int)idx_lut[Z[j - 1]];
-                    if (table_idx0 < 0 || table_idx0 >= n_tables) return;
-                    tables_counts[(size_t)table_idx0 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
-
-                    int table_idx1 = zgec_rs_get(runstart, j + 1) ? (n_tables - 1) : (int)idx_lut[Z[j]];
-                    if (table_idx1 < 0 || table_idx1 >= n_tables) return;
-                    tables_counts[(size_t)table_idx1 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j + 1]]++;
-
-                    int table_idx2 = zgec_rs_get(runstart, j + 2) ? (n_tables - 1) : (int)idx_lut[Z[j + 1]];
-                    if (table_idx2 < 0 || table_idx2 >= n_tables) return;
-                    tables_counts[(size_t)table_idx2 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j + 2]]++;
-
-                    int table_idx3 = zgec_rs_get(runstart, j + 3) ? (n_tables - 1) : (int)idx_lut[Z[j + 2]];
-                    if (table_idx3 < 0 || table_idx3 >= n_tables) return;
-                    tables_counts[(size_t)table_idx3 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j + 3]]++;
-                }
-                for (; t < lane_len; t++) {
-                    size_t j = lane_start + t;
-                    int table_idx;
-                    if (zgec_rs_get(runstart, j)) {
-                        table_idx = n_tables - 1;
+                    if ((j & 7u) == 0u && t + 8u <= lane_len && runstart[j >> 3u] == 0u) {
+                        for (size_t u = 0; u < 8u; u++, t++, j++) {
+                            uint8_t pidx = idx_lut[Z[j - 1]];
+                            if (pidx == 0xFFu) return;
+                            tables_counts[(size_t)pidx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+                        }
                     } else {
-                        uint8_t pidx = idx_lut[Z[j - 1]];
-                        if (pidx == 0xFFu) return;
-                        table_idx = (int)pidx;
+                        int table_idx;
+                        if (zgec_rs_get(runstart, j)) {
+                            table_idx = n_tables - 1;
+                        } else {
+                            uint8_t pidx = idx_lut[Z[j - 1]];
+                            if (pidx == 0xFFu) return;
+                            table_idx = (int)pidx;
+                        }
+                        tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+                        t++;
                     }
-                    tables_counts[(size_t)table_idx * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
                 }
             }
         }
