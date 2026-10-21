@@ -839,3 +839,11 @@ cli.c now reports `zgec: thread cycles N` under ZGEC_CPUTIME=1 (Windows
 QueryThreadCycleTime, rdtsc elsewhere). Wall-clock medians on this box swing by
 2-3% while freebuff/GTA5 hold 30-60% of every core, so cycle counts are the
 only usable signal; mins over 9+ interleaved pairs still needed.
+
+## 2026-10-21 - Multi-Context rANS 8-Lane Unrolling and Sentinel Hoisting
+
+**Learning:**
+In `src/rans.c` (`zgec_rans_encode` for `k > 1`), multi-context literal streams previously executed a scalar loop over all 8 lanes per round, performing per-symbol bounds checks, `zgec_rs_get` bitset queries, `idx_lut` sentinel validations (`0xFFu`), and serial `nwords` increments per lane. Pre-scanning `idx_lut` once to verify the absence of `0xFFu` sentinel values (`has_sentinel = 0`) guarantees table index safety and allows unrolling full rounds (`round < len[7]`) using store-free 8-lane evaluation (`ZGEC_RANS_ROUND_CTX`) with pre-resolved context table lookups (`t7..t0`). This removes per-lane branch instructions, avoids `zgec_rs_get` queries when `has_rs == 0`, and eliminates store-forwarding dependencies between lanes, accelerating multi-context rANS encoding throughput by +10-11% at levels 5-6.
+
+**Action:**
+In multi-context entropy encoders, hoist array sentinel and runstart bitset checks outside the round loop, and evaluate 8-lane state transitions in parallel using store-free register evaluation.
