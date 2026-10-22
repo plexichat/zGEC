@@ -918,3 +918,9 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+ACCEPTED jules-1 decode throughput optimizations (src/decode.c, src/rans.c):
+Optimized match copy dispatch in exec_block for moff==3, moff 4..7, and moff>=8 short/medium copies.
+Vectorized clsbuf in seq_decode_cond and ml/of/ll adjustments/summations in decode_segment_streams using AVX2 SIMD.
+Hoisted rANS lane states into scalar registers and consolidated error checks per round in zgec_rans_decode.
+Bitstream output byte-identical. Interleaved A/B benchmarks: +11.84% decode speedup on l4 (1T), +11.48% on l7 (1T), +9.25% on l4 (4T). All 4/4 ctest suites passed.
