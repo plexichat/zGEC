@@ -3603,6 +3603,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     }
 
     if (zgec_add_overflows(raw_size, 1024)) {
+        zgec_free(rb);
         zgec_free(vb_all);
         zgec_free(ll_all);
         zgec_free(lit_bounds);
@@ -3614,6 +3615,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     if (payload_cap < 256) payload_cap = 256;
     payload = (uint8_t *)zgec_alloc(payload_cap, 64);
     if (!payload) {
+        zgec_free(rb);
         zgec_free(vb_all);
         zgec_free(ll_all);
         zgec_free(lit_bounds);
@@ -3633,6 +3635,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         size_t pn = zgec_block_params_emit(payload + payload_off,
                                            payload_cap - payload_off, &bp);
         if (pn == 0) {
+            zgec_free(rb);
             zgec_free(payload);
             zgec_free(vb_all);
             zgec_free(ll_all);
@@ -3645,6 +3648,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     }
     dir_off = payload_off;
     if (n_segments > (SIZE_MAX - dir_off) / 8) {
+        zgec_free(rb);
         zgec_free(payload);
         zgec_free(vb_all);
         zgec_free(ll_all);
@@ -3655,6 +3659,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     }
     err = zgec_payload_grow(&payload, &payload_cap, dir_off, dir_off + n_segments * 8);
     if (err != ZGEC_OK) {
+        zgec_free(rb);
         zgec_free(payload);
         zgec_free(vb_all);
         zgec_free(ll_all);
@@ -3668,6 +3673,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         dir = (zgec_seg_dir_entry *)zgec_alloc(n_segments * sizeof(*dir),
                                               _Alignof(zgec_seg_dir_entry));
         if (!dir) {
+            zgec_free(rb);
             zgec_free(payload);
             zgec_free(vb_all);
             zgec_free(ll_all);
