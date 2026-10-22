@@ -377,7 +377,7 @@ Three changes landed, all bitstream-identical:
 1. `fse.c`: `zgec_fse_build_enc` rents its table from a thread-local free list
    (`zgec_fse_enc_rent` / `zgec_fse_enc_return`) instead of malloc/free. The
    list is threaded through the tables' own `e` field while `al`/`nsym` stay
-   intact, so a slot's size is recovered on reuse. No double-free is possible:
+   intact, so a slot's capacity is recovered on reuse. No double-free is possible:
    every encoder-table pointer is NULL-initialised and cleared after its one
    free, so `seg_fail_tables` only ever frees NULLs after the success path
    already freed them. (commit 7890ba9)
@@ -918,3 +918,15 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-22 - Decompression Path AVX2 SIMD Vectorization across Conditioned Streams and Match Reconstruction
+
+**Learning:**
+1. In `seq_decode_cond` (`src/decode.c`), precomputing `clsbuf` match classes previously ran sequentially (`zgec_mlclass(ml[i])`). Vectorizing with 256-bit AVX2 SIMD (`_mm256_sub_epi32`, `_mm256_cmpgt_epi32`, `_mm_packs_epi32`, `_mm_packus_epi16`) processes 8 elements per iteration and writes packed 8-bit match classes directly into `clsbuf`.
+2. In `decode_segment_streams` (`src/decode.c`), sequence array adjustments (`ml[i] += 3u`, `of[i] += 1u`), length summations (`sum_ml`, `sum_ll`), and V2/V3 validation bounds checks are accelerated 8 elements at a time using 256-bit AVX2 SIMD (`_mm256_add_epi32`, `_mm256_cvtepu32_epi64`, `_mm256_add_epi64`, `_mm256_cmpeq_epi32`).
+3. In `exec_copy_literals` and `exec_match_wide` (`src/decode.c`), replacing 16-byte `memcpy` and 8-byte `memcpy` with 128-bit SIMD (`_mm_storeu_si128`/`_mm_loadu_si128`) and direct 64-bit unaligned word copies (`zgec_wr64`/`zgec_rd64`) accelerates Phase B output generation.
+4. In `exec_literals_sub` (`src/decode.c`) and `zgec_dict_store_literals` (`src/dict.c`), expanding sub-literal prediction additions to 128-bit SIMD (`_mm_add_epi8` for `rep0 >= 16`) and 128-bit SIMD prefix sum (`_mm_slli_si128` + `_mm_add_epi8` for `rep0 == 1`) eliminates scalar byte prediction loops.
+5. In `exec_block` (`src/decode.c`), adding a fast 3-byte pattern broadcast loop for `moff == 3` replicates 24 bytes in 3 64-bit word stores, avoiding byte-by-byte match copy iterations.
+
+**Action:**
+In decompression hot paths, use 256-bit AVX2 SIMD for array adjustments and match class precomputation, 128-bit SIMD prefix sums for `rep0 == 1` sub-literal predictors, and fast 64-bit pattern broadcast stores for small match offsets (`moff == 3`).
