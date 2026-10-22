@@ -3788,6 +3788,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     res->exportable = (!filtered &&
                        zgec_payload_exportable(payload, payload_off,
                                                (uint32_t)n_segments)) ? 1 : 0;
+    zgec_free(rb);
     zgec_parse_free(parse);
     res->payload = payload;
     res->payload_size = payload_off;
