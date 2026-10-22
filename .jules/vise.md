@@ -82,3 +82,10 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Allocator Pool Hardening, Capacity Tracking, and FSE Pool Bounding
+Learning:
+1. In `src/common.c`, `zgec_pool_take` previously omitted returning the block's physical capacity, causing `zgec_alloc` to overwrite the stored header size with a smaller requested total. This artificially shrank the recorded capacity of pooled blocks on subsequent `zgec_free` calls. Returning `cap` from `zgec_pool_take` preserves physical block capacities across take/alloc/free cycles.
+2. In `src/fse.c`, `zgec_fse_enc_pool` was an unbounded singly-linked list. Bounding `zgec_fse_enc_pool_n <= 8` (`ZGEC_FSE_POOL_SLOTS`) caps per-thread table retention at ~4.3 MiB. Checking for existing pointers before returning tables prevents linked list cycles on double return.
+3. Added double-free guards in `zgec_pool_put` and audited all FSE encoder/decoder table cleanup paths across `src/encode.c`, `src/decode.c`, `src/seq.c`, and `src/dict.c`, confirming table pointers are NULL-initialised and cleared after freeing.
+Action: Record true physical capacity in allocator headers, bound thread-local pools with explicit slot limits, and verify table pointers are NULL-cleared after single-free calls.

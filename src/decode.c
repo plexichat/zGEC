@@ -118,11 +118,12 @@ static void seg_tables_free(seg_tables *t)
      * whole NEW loop succeeds, so a mid-loop failure would otherwise
      * leak the tables built so far. RLE slots hold NULL, init is zero. */
     for (i = 0; i < 3; i++) {
-        if (t->ll[i]) zgec_fse_free_dec(t->ll[i]);
-        if (t->of[i]) zgec_fse_free_dec(t->of[i]);
+        if (t->ll[i]) { zgec_fse_free_dec(t->ll[i]); t->ll[i] = NULL; }
+        if (t->of[i]) { zgec_fse_free_dec(t->of[i]); t->of[i] = NULL; }
     }
-    if (t->ml) zgec_fse_free_dec(t->ml);
+    if (t->ml) { zgec_fse_free_dec(t->ml); t->ml = NULL; }
     zgec_free(t->lit);
+    t->lit = NULL;
     seg_tables_init(t);
 }
 
