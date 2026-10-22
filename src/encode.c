@@ -153,49 +153,40 @@ static void zgec_enc_parallel_for(int n_threads, size_t n,
     }
 #if defined(_WIN32)
     {
-        HANDLE *hs = (HANDLE *)zgec_alloc((workers - 1) * sizeof(*hs),
-                                          _Alignof(HANDLE));
-        if (hs != NULL) {
-            for (t = 0; t + 1 < workers; t++) {
-                hs[t] = CreateThread(NULL, 0, zgec_enc_work_proc_win,
-                                     (LPVOID)&w, 0, NULL);
-            }
+        HANDLE stack_hs[ZGEC_MAX_WORKERS];
+        HANDLE *hs = stack_hs;
+        for (t = 0; t + 1 < workers; t++) hs[t] = NULL;
+        for (t = 0; t + 1 < workers; t++) {
+            hs[t] = CreateThread(NULL, 0, zgec_enc_work_proc_win,
+                                 (LPVOID)&w, 0, NULL);
         }
         zgec_enc_work_run(&w); /* the caller works too */
-        if (hs != NULL) {
-            /* Every worker must have stopped before the work list -- a
-             * caller stack frame -- goes out of scope. */
-            for (t = 0; t + 1 < workers; t++) {
-                if (hs[t] != NULL) (void)WaitForSingleObject(hs[t], INFINITE);
-            }
-            for (t = 0; t + 1 < workers; t++) {
-                if (hs[t] != NULL) (void)CloseHandle(hs[t]);
-            }
-            zgec_free(hs);
+        /* Every worker must have stopped before the work list -- a
+         * caller stack frame -- goes out of scope. */
+        for (t = 0; t + 1 < workers; t++) {
+            if (hs[t] != NULL) (void)WaitForSingleObject(hs[t], INFINITE);
+        }
+        for (t = 0; t + 1 < workers; t++) {
+            if (hs[t] != NULL) (void)CloseHandle(hs[t]);
         }
     }
 #else
     {
-        pthread_t *ths = (pthread_t *)zgec_alloc((workers - 1) * sizeof(*ths),
-                                                 _Alignof(pthread_t));
-        unsigned char *started = (unsigned char *)zgec_alloc(workers - 1, 1);
-        if (started != NULL) memset(started, 0, workers - 1);
-        if (ths != NULL && started != NULL) {
-            for (t = 0; t + 1 < workers; t++) {
-                if (pthread_create(&ths[t], NULL, zgec_enc_work_proc_posix,
-                                   (void *)&w) == 0) {
-                    started[t] = 1;
-                }
+        pthread_t stack_ths[ZGEC_MAX_WORKERS];
+        unsigned char stack_started[ZGEC_MAX_WORKERS];
+        pthread_t *ths = stack_ths;
+        unsigned char *started = stack_started;
+        memset(started, 0, workers - 1);
+        for (t = 0; t + 1 < workers; t++) {
+            if (pthread_create(&ths[t], NULL, zgec_enc_work_proc_posix,
+                               (void *)&w) == 0) {
+                started[t] = 1;
             }
         }
         zgec_enc_work_run(&w); /* the caller works too */
-        if (ths != NULL && started != NULL) {
-            for (t = 0; t + 1 < workers; t++) {
-                if (started[t] != 0) (void)pthread_join(ths[t], NULL);
-            }
+        for (t = 0; t + 1 < workers; t++) {
+            if (started[t] != 0) (void)pthread_join(ths[t], NULL);
         }
-        zgec_free(ths);
-        zgec_free(started);
     }
 #endif
     zgec_mu_destroy(&w.mu);
@@ -3374,12 +3365,20 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
      * classes actually emitted (up to the residual difference between
      * the two bound sets). */
     if (parse->n_seq > 0) {
-        uint32_t *seg_dist = (uint32_t *)zgec_alloc(
-            parse->n_seq * sizeof(*seg_dist), _Alignof(uint32_t));
-        if (!seg_dist) {
-            zgec_free(bounds);
-            zgec_parse_free(parse);
-            return ZGEC_ERR_NOMEM;
+        uint32_t stack_seg_dist[2048];
+        uint32_t *seg_dist = NULL;
+        int seg_dist_owned = 0;
+        if (parse->n_seq <= 2048) {
+            seg_dist = stack_seg_dist;
+        } else {
+            seg_dist = (uint32_t *)zgec_alloc(
+                parse->n_seq * sizeof(*seg_dist), _Alignof(uint32_t));
+            if (!seg_dist) {
+                zgec_free(bounds);
+                zgec_parse_free(parse);
+                return ZGEC_ERR_NOMEM;
+            }
+            seg_dist_owned = 1;
         }
         {
             zgec_reps whole;
@@ -3424,15 +3423,22 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                                                seg_dist, &changed2);
             if (changed2) use_grans = 0;
         }
-        zgec_free(seg_dist);
+        if (seg_dist_owned) zgec_free(seg_dist);
     }
 
-    lit_bounds = (size_t *)zgec_alloc((n_segments + 1) * sizeof(size_t),
-                                     _Alignof(size_t));
-    if (!lit_bounds) {
-        zgec_free(bounds);
-        zgec_parse_free(parse);
-        return ZGEC_ERR_NOMEM;
+    size_t stack_lit_bounds[65];
+    int lit_bounds_owned = 0;
+    if (n_segments <= 64) {
+        lit_bounds = stack_lit_bounds;
+    } else {
+        lit_bounds = (size_t *)zgec_alloc((n_segments + 1) * sizeof(size_t),
+                                         _Alignof(size_t));
+        if (!lit_bounds) {
+            zgec_free(bounds);
+            zgec_parse_free(parse);
+            return ZGEC_ERR_NOMEM;
+        }
+        lit_bounds_owned = 1;
     }
     zgec_lit_bounds(parse, bounds, n_segments, lit_bounds);
 
@@ -3447,7 +3453,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             (parse->n_seq ? parse->n_seq : 1) * sizeof(*ll_all),
             _Alignof(uint32_t));
         if (!ll_all) {
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return ZGEC_ERR_NOMEM;
@@ -3462,7 +3468,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                                        parse->n_seq, &mode, &k, cmap);
             if (err != ZGEC_OK) {
                 zgec_free(ll_all);
-                zgec_free(lit_bounds);
+                if (lit_bounds_owned) zgec_free(lit_bounds);
                 zgec_free(bounds);
                 zgec_parse_free(parse);
                 return err;
@@ -3480,7 +3486,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         size_t vb_need = pre;
         if (zgec_add_overflows(vb_need, lr) || zgec_add_overflows(vb_need + lr, raw_size + 64)) {
             zgec_free(ll_all);
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return ZGEC_ERR_INTERNAL;
@@ -3489,7 +3495,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         vb_all = (uint8_t *)zgec_alloc(vb_need, 64);
         if (!vb_all) {
             zgec_free(ll_all);
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return ZGEC_ERR_NOMEM;
@@ -3511,7 +3517,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         if (!rb) {
             zgec_free(vb_all);
             zgec_free(ll_all);
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return ZGEC_ERR_NOMEM;
@@ -3583,7 +3589,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         if (err != ZGEC_OK) {
             zgec_free(vb_all);
             zgec_free(ll_all);
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return err;
@@ -3593,7 +3599,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     if (zgec_add_overflows(raw_size, 1024)) {
         zgec_free(vb_all);
         zgec_free(ll_all);
-        zgec_free(lit_bounds);
+        if (lit_bounds_owned) zgec_free(lit_bounds);
         zgec_free(bounds);
         zgec_parse_free(parse);
         return ZGEC_ERR_INTERNAL;
@@ -3604,7 +3610,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     if (!payload) {
         zgec_free(vb_all);
         zgec_free(ll_all);
-        zgec_free(lit_bounds);
+        if (lit_bounds_owned) zgec_free(lit_bounds);
         zgec_free(bounds);
         zgec_parse_free(parse);
         return ZGEC_ERR_NOMEM;
@@ -3624,7 +3630,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             zgec_free(payload);
             zgec_free(vb_all);
             zgec_free(ll_all);
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return ZGEC_ERR_INTERNAL;
@@ -3636,7 +3642,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         zgec_free(payload);
         zgec_free(vb_all);
         zgec_free(ll_all);
-        zgec_free(lit_bounds);
+        if (lit_bounds_owned) zgec_free(lit_bounds);
         zgec_free(bounds);
         zgec_parse_free(parse);
         return ZGEC_ERR_INTERNAL;
@@ -3646,7 +3652,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         zgec_free(payload);
         zgec_free(vb_all);
         zgec_free(ll_all);
-        zgec_free(lit_bounds);
+        if (lit_bounds_owned) zgec_free(lit_bounds);
         zgec_free(bounds);
         zgec_parse_free(parse);
         return err;
@@ -3659,7 +3665,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             zgec_free(payload);
             zgec_free(vb_all);
             zgec_free(ll_all);
-            zgec_free(lit_bounds);
+            if (lit_bounds_owned) zgec_free(lit_bounds);
             zgec_free(bounds);
             zgec_parse_free(parse);
             return ZGEC_ERR_NOMEM;
@@ -3751,7 +3757,7 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     zgec_free(dir);
     zgec_free(vb_all);
     zgec_free(ll_all);
-    zgec_free(lit_bounds);
+    if (lit_bounds_owned) zgec_free(lit_bounds);
     zgec_free(bounds);
     /* The block's literal buffer, for a later block's LITREF region. */
     if (parse->n_lit > 0) {
@@ -3780,7 +3786,7 @@ fail_seg:
     zgec_free(payload);
     zgec_free(vb_all);
     zgec_free(ll_all);
-    zgec_free(lit_bounds);
+    if (lit_bounds_owned) zgec_free(lit_bounds);
     zgec_free(bounds);
     zgec_parse_free(parse);
     return err;
