@@ -567,8 +567,8 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
         n_ll = h->ctx_ll ? 3 : 1;
         n_of = h->ctx_of ? 3 : 1;
         if (ll_mode == ZGEC_TBL_RLE) {
-            if (dpos + 1 > avail) return ZGEC_ERR_TRUNCATED;
-            if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL; /* V6 */
+            if (dpos + 1 > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
+            if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) { seg_hdr_free_descs(h); return ZGEC_ERR_FSE_SYMBOL; } /* V6 */
             dpos += 1;
         } else if (ll_mode == ZGEC_TBL_NEW) {
             al0 = 0;
@@ -583,8 +583,8 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
             }
         }
         if (ml_mode == ZGEC_TBL_RLE) {
-            if (dpos + 1 > avail) return ZGEC_ERR_TRUNCATED;
-            if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL; /* V6 */
+            if (dpos + 1 > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
+            if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) { seg_hdr_free_descs(h); return ZGEC_ERR_FSE_SYMBOL; } /* V6 */
             dpos += 1;
         } else if (ml_mode == ZGEC_TBL_NEW) {
             e = desc_parse_new(h, buf + pos + dpos, avail - dpos,
@@ -594,8 +594,8 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
             if (dpos > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
         }
         if (of_mode == ZGEC_TBL_RLE) {
-            if (dpos + 1 > avail) return ZGEC_ERR_TRUNCATED;
-            if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) return ZGEC_ERR_FSE_SYMBOL; /* V6 */
+            if (dpos + 1 > avail) { seg_hdr_free_descs(h); return ZGEC_ERR_TRUNCATED; }
+            if (buf[pos + dpos] >= ZGEC_NSYM_SEQ) { seg_hdr_free_descs(h); return ZGEC_ERR_FSE_SYMBOL; } /* V6 */
             dpos += 1;
         } else if (of_mode == ZGEC_TBL_NEW) {
             al0 = 0;
