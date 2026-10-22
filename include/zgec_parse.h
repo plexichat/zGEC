@@ -85,7 +85,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
                                       const uint8_t *dict, size_t dict_size,
                                       const uint8_t *litref, size_t litref_size,
                                       zgec_tier tier, double lambda,
-                                      int fast_dial);
+                                      int fast_dial, int high_dial);
 
 /* Segment a parse into segments (section 11.5).
  * Produces segment boundaries (indices into the

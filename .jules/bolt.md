@@ -918,3 +918,11 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-22 - High-Tier Compression Ladder Tuning (Levels 15-25)
+
+**Learning:**
+Levels 15 through 25 previously set identical parameters apart from `block_log2` (4 MiB, 8 MiB, 16 MiB), leaving levels 19-25 as exact duplicates. Introducing `high_dial` (1..11 mapped from levels 15..25) in `zgec_params` enables progressive scaling of lazy evaluation match lookahead (`parse_lazy_max` from 24 up to 1024 bytes) in `src/parse.c` and long-match position sampling in `src/match.c`. This provides a smooth, progressive compression ratio ladder across top-tier preset levels while maintaining multi-threaded byte-for-byte output determinism and full random-access seekability.
+
+**Action:**
+When configuring high compression levels, scale lazy match lookahead limits (`lazy_max`) and match position sampling thresholds progressively to achieve superior compression ratios without breaking bitstream compatibility or determinism.

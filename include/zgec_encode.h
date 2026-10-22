@@ -52,6 +52,9 @@ typedef struct {
                                   * short-table probes, and 4 runs the
                                   * single-table lean core. Only new levels
                                   * 1-3 set it. */
+    int          high_dial;      /* high-tier encoder dial (0..11). 0 is default;
+                                  * 1..11 enable progressive lazy lookahead and
+                                  * match search scaling for top levels 15..25. */
 } zgec_params;
 
 /* Default parameters. */
