@@ -918,3 +918,11 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-22 - Sub-Literal Residual Buffer Prebuilding and Sharing
+
+**Learning:**
+In zGEC block encoding (`zgec_encode_block_full`), sub-literal residuals were previously calculated during D6 context map training by allocating temporary `tll`, `tml`, and `tr0` buffers per segment, and then freed. During the subsequent segment pass (`zgec_enc_seg_job`), each segment re-allocated `p->resid` and recomputed `zgec_enc_build_resid` from scratch. Allocating `block_rb` once for the entire block and using a single block-level sequence scratch buffer eliminates $4 \times N_{seg}$ dynamic memory allocations per block and avoids redundant residual calculation during segment preparation.
+
+**Action:**
+Pre-build sub-literal residual buffers at the block level when sub-literal mode is enabled and pass slices (`block_rb + l0`) directly to segment preparation jobs.
