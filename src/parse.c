@@ -468,7 +468,7 @@ zgec_err zgec_parse_block(zgec_parse **out,
  * every interior position indexed. Revisit if the fast tier ever gains a
  * price-gated accept, which would pay the cap back in rejected candidates. */
 #ifndef ZGEC_FAST_INS_SPAN
-#define ZGEC_FAST_INS_SPAN 0u
+#define ZGEC_FAST_INS_SPAN 128u
 #endif
 #ifndef ZGEC_FAST_PREFETCH
 #define ZGEC_FAST_PREFETCH 0

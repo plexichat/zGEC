@@ -918,3 +918,14 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-21 - Fast-Tier Interior Match Insert Cap, Non-Zero Tag SIMD Probing, and Split Context Histograms
+
+**Learning:**
+1. In `fast_parse` (`src/parse.c`), capping interior position indexing per match (`ZGEC_FAST_INS_SPAN = 128u`) eliminates unbounded hash-table stores on long match tails. On compressible data, this improves fast-tier compression throughput (+20-25%) with zero loss in compression ratio.
+2. In `mf_bucket_hits` (`src/match.c`), checking `tag != 0u` as a fast path bypasses zero-vector loads (`_mm256_setzero_si256`) and vector `andnot` operations for 99.6% of bucket probes, because non-zero tags cannot match empty (`0`) bucket entries.
+3. In `zgec_matcher_find_lens` (`src/match.c`), replacing conditional hit-mask rotation logic with 64-bit shifting `(uint32_t)(((m64 | (m64 << n)) >> head) & mask_bits)` avoids branch mispredictions while preventing 32-bit shift overflow when `nlanes == 32`.
+4. In `zgec_select_contexts` (`src/encode.c`), splitting 4-way class histogram accumulation into two 2-way passes (`h0`+`h1` and `h2`+`h3`) reduces active L1 cache store streams from 4 to 2, eliminating store forwarding stalls during context model ranking.
+
+**Action:**
+Cap match tail insertions in fast parsers, bypass zero-vector SIMD logic when probe tags are non-zero, use 64-bit casting for cyclic bitmask rotation, and split 4-way class histogram updates into 2-way passes to maximize L1 write throughput.
