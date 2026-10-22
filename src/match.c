@@ -214,6 +214,7 @@
 
 struct zgec_matcher {
     zgec_tier      tier;
+    int            high_dial;
     uint32_t       nbuckets;      /* short buckets */
     uint32_t       nbuckets_mask;
     uint32_t       nlanes;
@@ -709,7 +710,7 @@ static int mf_is_pow2_u32(uint32_t x)
     return x != 0u && (x & (x - 1u)) == 0u;
 }
 
-zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
+zgec_matcher *zgec_matcher_create_dial(zgec_tier tier, size_t vb_capacity, int high_dial)
 {
     zgec_matcher *m;
     size_t short_n;
@@ -726,6 +727,7 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
         return NULL;
     }
     m->tier = tier;
+    m->high_dial = high_dial;
     m->vb_capacity = vb_capacity;
     m->vb = NULL;
     m->vb_size = 0;
@@ -806,6 +808,11 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     m->c_flags[0] = 0u;
     m->c_flags[1] = 0u;
     return m;
+}
+
+zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
+{
+    return zgec_matcher_create_dial(tier, vb_capacity, 0);
 }
 
 void zgec_matcher_destroy(zgec_matcher *m)
@@ -1332,8 +1339,12 @@ void zgec_matcher_prefetch_match(zgec_matcher *m, const uint8_t *vb, size_t star
     if (m->tier == ZGEC_TIER_HIGH) {
         size_t stride = (size_t)1;
         size_t pos;
-        if (len > (size_t)ZGEC_MF_HIGH_SAMPLES) {
-            stride = (len + (size_t)ZGEC_MF_HIGH_SAMPLES - 1u) / (size_t)ZGEC_MF_HIGH_SAMPLES;
+        size_t high_samples = (size_t)ZGEC_MF_HIGH_SAMPLES;
+        if (m->high_dial > 0) {
+            high_samples = (size_t)2048u + (size_t)m->high_dial * 2048u;
+        }
+        if (len > high_samples) {
+            stride = (len + high_samples - 1u) / high_samples;
         }
         for (pos = start; pos < start + len; pos += stride) {
             zgec_matcher_prefetch(m, vb, pos);
@@ -1411,8 +1422,12 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
          * match is very long. */
         size_t stride = (size_t)1;
         size_t pos;
-        if (len > (size_t)ZGEC_MF_HIGH_SAMPLES) {
-            stride = (len + (size_t)ZGEC_MF_HIGH_SAMPLES - 1u) / (size_t)ZGEC_MF_HIGH_SAMPLES;
+        size_t high_samples = (size_t)ZGEC_MF_HIGH_SAMPLES;
+        if (m->high_dial > 0) {
+            high_samples = (size_t)2048u + (size_t)m->high_dial * 2048u;
+        }
+        if (len > high_samples) {
+            stride = (len + high_samples - 1u) / high_samples;
         }
         for (pos = start; pos < start + len; pos += stride) {
             size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN

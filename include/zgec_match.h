@@ -31,6 +31,9 @@ typedef struct zgec_matcher zgec_matcher;
  * reference). */
 zgec_matcher *zgec_matcher_create(zgec_tier tier,
                                                 size_t vb_capacity);
+zgec_matcher *zgec_matcher_create_dial(zgec_tier tier,
+                                                     size_t vb_capacity,
+                                                     int high_dial);
 void zgec_matcher_destroy(zgec_matcher *m);
 
 /* Reset the matcher for a new block, optionally
