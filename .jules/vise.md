@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Elimination of Dictionary and Work Dispatch Heap Allocations via Stack Fallbacks
+Learning: Allocating run-start bitmasks (`rs`) dynamically in `src/dict.c` during dictionary decoding and thread handle arrays (`ths`, `started`, `hs`) in `zgec_enc_parallel_for` produced recurring dynamic allocation overhead and heap fragmentation across multi-threaded encoding/decoding loops. Bounded stack fallbacks (`stack_rs[8192]`, `stack_ths[ZGEC_MAX_WORKERS]`, `stack_seg_dist[2048]`, `stack_lit_bounds[65]`) with explicit ownership flags completely eliminate heap allocations on hot encoding and dictionary decoding paths without exceeding thread stack limits or introducing uninitialized variable risks on early error exit jumps.
+Action: Stack-allocate bounded bitmasks and thread handle arrays in hot encoding/decoding paths, and initialize ownership flags at function/block scope prior to any error jump targets.
