@@ -813,7 +813,7 @@ inlined fast_match_len_tail (always_inline, AVX2 scan) into its position loop,
 and the live values of the accept path cost more registers than the loop has:
 the miss path reloaded `anchor` from the stack, stored it back on every
 position, and reloaded the table base, i.e. three extra memory operations on
-the ~9 of 10 positions that find no candidate. The scan now sits behind a
+the ~9 of 10 positions that find no candidate at all. The scan now sits behind a
 noinline wrapper: the miss path lost all three (verified in the objdump:
 movq 0x98(%rsp) store, movq 0x98(%rsp) reload and movq 0x88(%rsp) reload gone,
 anchor and tl stay in r13/r14), and the scan itself is byte-for-byte the same
@@ -918,3 +918,11 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-23 - Progressive High-Tier Ratio Scaling Ladder (Levels 15-25)
+
+**Learning:**
+Top preset levels 15-25 previously used identical matcher sampling thresholds (`high_samples = 2048`) and fixed lazy evaluation lookahead limits (`PARSE_LAZY_MAX_LEN = 16u`), producing identical compression ratios across all top levels for small-to-medium files. Introducing a dynamic `high_dial` parameter (1..11 for levels 15-25) scales lazy evaluation lookahead threshold (`lazy_max_len`) up to 1024 bytes and matcher position sampling threshold (`high_samples`) up to 4,194,304 positions. This enables progressive compression ratio improvements across top preset levels while preserving bitstream format compatibility and seekable frame footer structures.
+
+**Action:**
+When configuring top-tier compression ladders, scale lazy match lookahead and match finder sampling density dynamically via encoder-side parameters to achieve progressive ratio gains on top preset levels without altering bitstream specifications.

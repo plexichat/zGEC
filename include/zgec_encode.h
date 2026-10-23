@@ -52,6 +52,10 @@ typedef struct {
                                   * short-table probes, and 4 runs the
                                   * single-table lean core. Only new levels
                                   * 1-3 set it. */
+    int          high_dial;      /* high-tier parser speed/ratio dial (0..11).
+                                  * Scales lazy evaluation lookahead (lazy_max)
+                                  * and long match sampling threshold (high_samples)
+                                  * for levels 15-25. */
 } zgec_params;
 
 /* Default parameters. */

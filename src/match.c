@@ -237,6 +237,7 @@ struct zgec_matcher {
     size_t         c_ip[2];     /* hash cache: positions the cached hashes belong to */
     uint32_t       c_hs[2], c_hl[2]; /* cached short / long hashes */
     uint32_t       c_flags[2];  /* bit0: c_hs valid, bit1: c_hl valid */
+    size_t         high_samples;/* match position sampling threshold for high tier */
 };
 
 static inline uint32_t mf_hash5_v(uint64_t v)
@@ -805,7 +806,22 @@ zgec_matcher *zgec_matcher_create(zgec_tier tier, size_t vb_capacity)
     m->c_hl[1] = 0u;
     m->c_flags[0] = 0u;
     m->c_flags[1] = 0u;
+    m->high_samples = (size_t)ZGEC_MF_HIGH_SAMPLES;
     return m;
+}
+
+void zgec_matcher_set_high_dial(zgec_matcher *m, int high_dial)
+{
+    if (!m) return;
+    if (high_dial <= 0) {
+        m->high_samples = (size_t)ZGEC_MF_HIGH_SAMPLES;
+    } else {
+        static const size_t high_samples_table[12] = {
+            2048u, 4096u, 8192u, 16384u, 32768u, 65536u, 131072u, 262144u, 524288u, 1048576u, 2097152u, 4194304u
+        };
+        unsigned hidx = (high_dial > 11) ? 11u : (unsigned)high_dial;
+        m->high_samples = high_samples_table[hidx];
+    }
 }
 
 void zgec_matcher_destroy(zgec_matcher *m)
@@ -1411,8 +1427,9 @@ void zgec_matcher_insert_match(zgec_matcher *m, const uint8_t *vb, size_t start,
          * match is very long. */
         size_t stride = (size_t)1;
         size_t pos;
-        if (len > (size_t)ZGEC_MF_HIGH_SAMPLES) {
-            stride = (len + (size_t)ZGEC_MF_HIGH_SAMPLES - 1u) / (size_t)ZGEC_MF_HIGH_SAMPLES;
+        size_t max_samp = (m->high_samples > 0) ? m->high_samples : (size_t)ZGEC_MF_HIGH_SAMPLES;
+        if (len > max_samp) {
+            stride = (len + max_samp - 1u) / max_samp;
         }
         for (pos = start; pos < start + len; pos += stride) {
             size_t need = m->is_binary ? (size_t)ZGEC_MF_HASH_BYTES_BIN
