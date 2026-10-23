@@ -42,6 +42,9 @@ void zgec_matcher_reset(zgec_matcher *m,
                                     const uint8_t *vb, size_t vb_size,
                                     const uint8_t *dict, size_t dict_size);
 
+/* Configure high-tier preset dial (0..11) for matcher sampling parameters. */
+void zgec_matcher_set_high_dial(zgec_matcher *m, int high_dial);
+
 /* Find the best match at position ip in the virtual
  * buffer vb. rep0/rep1 are the current repeat
  * offsets (checked first). The match must satisfy
