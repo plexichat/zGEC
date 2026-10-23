@@ -1030,6 +1030,53 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         if (!clsbuf) return ZGEC_ERR_NOMEM;
         clsbuf_allocated = 1;
     }
+#if defined(__AVX2__)
+    __m256i sign_flip = _mm256_set1_epi32((int)0x80000000u);
+    __m256i th7 = _mm256_set1_epi32((int)(6u ^ 0x80000000u));
+    __m256i th19 = _mm256_set1_epi32((int)(18u ^ 0x80000000u));
+    if (use_prev) {
+        clsbuf[0] = 0;
+        size_t count = n - 1;
+        size_t idx = 1;
+        while (count >= 8) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(ml + idx - 1));
+            __m256i vs = _mm256_xor_si256(v, sign_flip);
+            __m256i c1 = _mm256_cmpgt_epi32(vs, th7);
+            __m256i c2 = _mm256_cmpgt_epi32(vs, th19);
+            __m256i res32 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(c1, c2));
+            __m128i lo = _mm256_castsi256_si128(res32);
+            __m128i hi = _mm256_extracti128_si256(res32, 1);
+            __m128i p16 = _mm_packs_epi32(lo, hi);
+            __m128i p8 = _mm_packus_epi16(p16, p16);
+            uint64_t val64 = (uint64_t)_mm_cvtsi128_si64(p8);
+            zgec_wr64(clsbuf + idx, val64);
+            idx += 8;
+            count -= 8;
+        }
+        for (i = idx; i < n; i++)
+            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
+    } else {
+        size_t count = n;
+        size_t idx = 0;
+        while (count >= 8) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(ml + idx));
+            __m256i vs = _mm256_xor_si256(v, sign_flip);
+            __m256i c1 = _mm256_cmpgt_epi32(vs, th7);
+            __m256i c2 = _mm256_cmpgt_epi32(vs, th19);
+            __m256i res32 = _mm256_sub_epi32(_mm256_setzero_si256(), _mm256_add_epi32(c1, c2));
+            __m128i lo = _mm256_castsi256_si128(res32);
+            __m128i hi = _mm256_extracti128_si256(res32, 1);
+            __m128i p16 = _mm_packs_epi32(lo, hi);
+            __m128i p8 = _mm_packus_epi16(p16, p16);
+            uint64_t val64 = (uint64_t)_mm_cvtsi128_si64(p8);
+            zgec_wr64(clsbuf + idx, val64);
+            idx += 8;
+            count -= 8;
+        }
+        for (i = idx; i < n; i++)
+            clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
+    }
+#else
     if (use_prev) {
         clsbuf[0] = 0;
         for (i = 1; i < n; i++)
@@ -1038,6 +1085,7 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
         for (i = 0; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
     }
+#endif
     zgec_br_init(&br, stream, ssize);
     if (br.overflow) { if (clsbuf_allocated) zgec_free(clsbuf); return ZGEC_ERR_BITSTREAM_SENTINEL; }
     S = (unsigned)1 << (unsigned)al;
@@ -1265,15 +1313,35 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                                ml_stream, (size_t)h.ml_size);
             if (e != ZGEC_OK) return e;
             {
-                /* ml + 3, folded. The old u64 test could only fire when
-                 * m > 0xFFFFFFFF (m < 3 is impossible for a u64 sum), and
-                 * a 32-bit add makes that wrap land in {0, 1, 2} - so one
-                 * `v < 3` tests exactly the same condition without a
-                 * branch in the loop. The walk also accumulates the V1 ML
-                 * total from the values it stores, which removes the
-                 * second pass over ml[] entirely. */
+                /* ml + 3, folded. Vectorized with AVX2 when n_seq >= 8. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
+                i = 0;
+#if defined(__AVX2__)
+                __m256i v3 = _mm256_set1_epi32(3);
+                __m256i v_two = _mm256_set1_epi32(2);
+                __m256i v_bad = _mm256_setzero_si256();
+                __m256i v_sum_lo = _mm256_setzero_si256();
+                __m256i v_sum_hi = _mm256_setzero_si256();
+                while (i + 8 <= seg->n_seq) {
+                    __m256i v_raw = _mm256_loadu_si256((const __m256i *)(seg->ml + i));
+                    __m256i v_res = _mm256_add_epi32(v_raw, v3);
+                    _mm256_storeu_si256((__m256i *)(seg->ml + i), v_res);
+                    /* v < 3 is equivalent to v <= 2 unsigned, tested via (v - 0x80000000) <= (2 - 0x80000000) */
+                    __m256i cmp = _mm256_cmpeq_epi32(_mm256_min_epu32(v_res, v_two), v_res);
+                    v_bad = _mm256_or_si256(v_bad, cmp);
+                    /* Accumulate 64-bit sum */
+                    __m256i res_lo = _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v_res));
+                    __m256i res_hi = _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v_res, 1));
+                    v_sum_lo = _mm256_add_epi64(v_sum_lo, res_lo);
+                    v_sum_hi = _mm256_add_epi64(v_sum_hi, res_hi);
+                    i += 8;
+                }
+                if (!_mm256_testz_si256(v_bad, v_bad)) bad = 1;
+                uint64_t s_arr[4];
+                _mm256_storeu_si256((__m256i *)s_arr, _mm256_add_epi64(v_sum_lo, v_sum_hi));
+                sum_ml += s_arr[0] + s_arr[1] + s_arr[2] + s_arr[3];
+#endif
+                for (; i < seg->n_seq; i++) {
                     uint32_t v = seg->ml[i] + 3u;
                     seg->ml[i] = v;
                     sum_ml += (uint64_t)v;
@@ -1302,11 +1370,24 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             }
             if (e != ZGEC_OK) return e;
             {
-                /* ob = raw + 1 in 32-bit: the only raw value the old u64
-                 * bound (ob < 1 impossible, ob > 0xFFFFFFFF) could reject
-                 * is 0xFFFFFFFF, and that add wraps it to a stored zero. */
+                /* ob = raw + 1 in 32-bit: Vectorized with AVX2 when n_seq >= 8. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
+                i = 0;
+#if defined(__AVX2__)
+                __m256i v1 = _mm256_set1_epi32(1);
+                __m256i v_zero = _mm256_setzero_si256();
+                __m256i v_bad = _mm256_setzero_si256();
+                while (i + 8 <= seg->n_seq) {
+                    __m256i v_raw = _mm256_loadu_si256((const __m256i *)(seg->of + i));
+                    __m256i v_res = _mm256_add_epi32(v_raw, v1);
+                    _mm256_storeu_si256((__m256i *)(seg->of + i), v_res);
+                    __m256i cmp = _mm256_cmpeq_epi32(v_res, v_zero);
+                    v_bad = _mm256_or_si256(v_bad, cmp);
+                    i += 8;
+                }
+                if (!_mm256_testz_si256(v_bad, v_bad)) bad = 1;
+#endif
+                for (; i < seg->n_seq; i++) {
                     uint32_t ob = seg->of[i] + 1u;
                     seg->of[i] = ob;
                     bad |= (ob == 0u);
