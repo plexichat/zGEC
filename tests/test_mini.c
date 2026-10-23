@@ -147,6 +147,38 @@ int main(void)
     if (zgec_test_rans_round_trip()) passed++; else failed++;
     if (zgec_test_round_trip()) passed++; else failed++;
 
+    printf("multi-context & stack fallbacks... "); fflush(stdout);
+    {
+        uint8_t src[8192];
+        for (int i = 0; i < 8192; i++) src[i] = (uint8_t)((i % 128) < 64 ? (i % 26 + 'a') : (i % 10 + '0'));
+
+        zgec_params p;
+        zgec_params_default(&p);
+        p.use_contexts = 1;
+        p.tier = ZGEC_TIER_MAIN;
+        zgec_encoder *enc = zgec_encoder_create(&p);
+        uint8_t *cmp = NULL;
+        size_t cmp_size = 0;
+        if (enc && zgec_encode_frame(enc, src, sizeof(src), &cmp, &cmp_size) == ZGEC_OK) {
+            uint8_t *dec = NULL;
+            size_t dec_size = 0;
+            if (zgec_decompress(cmp, cmp_size, &dec, &dec_size) == ZGEC_OK &&
+                dec_size == sizeof(src) && memcmp(src, dec, sizeof(src)) == 0) {
+                printf("OK\n");
+                passed++;
+            } else {
+                printf("FAIL decompress\n");
+                failed++;
+            }
+            zgec_free(cmp);
+            zgec_free(dec);
+        } else {
+            printf("FAIL encode\n");
+            failed++;
+        }
+        if (enc) zgec_encoder_destroy(enc);
+    }
+
     printf("PASS %d FAIL %d\n", passed, failed);
     return failed ? 1 : 0;
 }

@@ -1560,7 +1560,7 @@ static double zgec_cond_net_gain(const uint32_t *cls_hist /*[3][66]*/,
 static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                                  const uint8_t *runstart,
                                  int ctx_mode, const uint8_t *cmap, int k,
-                                 uint32_t *cls_hist)
+                                 uint32_t *cls_hist, size_t *desc_bytes_out)
 {
     double body = 0.0;
     uint32_t rs_hist[ZGEC_NSYM_LIT];
@@ -1569,6 +1569,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     size_t start[ZGEC_NLANES];
     size_t j;
     int g;
+    size_t desc_bytes = 0;
     {
         /* grp_lut folds every group id to < k and only the first k rows are
          * read back, so clearing all 64 rows (64 KiB, every call) is waste:
@@ -1661,8 +1662,11 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     for (g = 0; g < k; g++) {
         body += zgec_enc_entropy_bits_u32(cls_hist + (size_t)g * 256u,
                                           ZGEC_NSYM_LIT, grp_total[g]);
+        desc_bytes += zgec_enc_lit_desc_size(cls_hist + (size_t)g * 256u);
     }
     body += zgec_enc_entropy_bits_u32(rs_hist, ZGEC_NSYM_LIT, rs_total);
+    desc_bytes += zgec_enc_lit_desc_size(rs_hist);
+    if (desc_bytes_out) *desc_bytes_out = desc_bytes;
     return body;
 }
 
@@ -1851,13 +1855,12 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                 if (pos < n_lit_slice) zgec_rs_set(runstart, pos);
             }
             {
+                size_t exact_desc_bytes = 0;
                 double body = zgec_ctx_body_bits(seg_lit, n_lit_slice,
                                                  runstart, block_ctx_mode,
                                                  block_cmap, block_k,
-                                                 cls_hist);
-                double hdr = (double)(unsigned)(block_k + 1) *
-                                 (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 +
-                             32.0 * 8.0;
+                                                 cls_hist, &exact_desc_bytes);
+                double hdr = (double)exact_desc_bytes * 8.0 + 32.0 * 8.0;
                 double s = body + hdr +
                            params->lambda * ZGEC_ENC_CYC_RANS_PER_SYM *
                                (double)(uint64_t)n_lit_slice;
@@ -1948,12 +1951,11 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                     }
                     cls_owned = 1;
                 }
+                size_t exact_desc_bytes = 0;
                 body = zgec_ctx_body_bits(resid, n_lit_slice, runstart,
                                           sub_mode, sub_cmap, sub_k,
-                                          cls_hist);
-                hdr = (double)(unsigned)(sub_k + 1) *
-                          (double)ZGEC_ENC_RANS_TABLE_BYTES * 8.0 +
-                      32.0 * 8.0;
+                                          cls_hist, &exact_desc_bytes);
+                hdr = (double)exact_desc_bytes * 8.0 + 32.0 * 8.0;
                 s = body + hdr + params->lambda * cyc *
                                           (double)(uint64_t)n_lit_slice;
                 if (s < best.score) {
@@ -3427,12 +3429,19 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
         zgec_free(seg_dist);
     }
 
-    lit_bounds = (size_t *)zgec_alloc((n_segments + 1) * sizeof(size_t),
-                                     _Alignof(size_t));
-    if (!lit_bounds) {
-        zgec_free(bounds);
-        zgec_parse_free(parse);
-        return ZGEC_ERR_NOMEM;
+    size_t stack_lit_bounds[65];
+    int lit_bounds_owned = 0;
+    if (n_segments <= 64u) {
+        lit_bounds = stack_lit_bounds;
+    } else {
+        lit_bounds = (size_t *)zgec_alloc((n_segments + 1) * sizeof(size_t),
+                                         _Alignof(size_t));
+        if (!lit_bounds) {
+            zgec_free(bounds);
+            zgec_parse_free(parse);
+            return ZGEC_ERR_NOMEM;
+        }
+        lit_bounds_owned = 1;
     }
     zgec_lit_bounds(parse, bounds, n_segments, lit_bounds);
 
@@ -3671,16 +3680,34 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
      * directly after the reserved directory (P6). Selection and
      * emission share one prep per segment (P1/P2). */
     if (n_segments > 0) {
-        size_t *out_bases = (size_t *)zgec_alloc(n_segments * sizeof(*out_bases), _Alignof(size_t));
-        uint8_t **seg_bufs = (uint8_t **)zgec_alloc(n_segments * sizeof(*seg_bufs), _Alignof(uint8_t *));
-        size_t *seg_sizes = (size_t *)zgec_alloc(n_segments * sizeof(*seg_sizes), _Alignof(size_t));
-        zgec_err *seg_errs = (zgec_err *)zgec_alloc(n_segments * sizeof(*seg_errs), _Alignof(zgec_err));
-        if (!out_bases || !seg_bufs || !seg_sizes || !seg_errs) {
-            zgec_free(out_bases);
-            zgec_free(seg_bufs);
-            zgec_free(seg_sizes);
-            zgec_free(seg_errs);
-            goto fail_seg;
+        size_t stack_out_bases[64];
+        uint8_t *stack_seg_bufs[64];
+        size_t stack_seg_sizes[64];
+        zgec_err stack_seg_errs[64];
+        size_t *out_bases = NULL;
+        uint8_t **seg_bufs = NULL;
+        size_t *seg_sizes = NULL;
+        zgec_err *seg_errs = NULL;
+        int seg_arrays_owned = 0;
+
+        if (n_segments <= 64u) {
+            out_bases = stack_out_bases;
+            seg_bufs = stack_seg_bufs;
+            seg_sizes = stack_seg_sizes;
+            seg_errs = stack_seg_errs;
+        } else {
+            out_bases = (size_t *)zgec_alloc(n_segments * sizeof(*out_bases), _Alignof(size_t));
+            seg_bufs = (uint8_t **)zgec_alloc(n_segments * sizeof(*seg_bufs), _Alignof(uint8_t *));
+            seg_sizes = (size_t *)zgec_alloc(n_segments * sizeof(*seg_sizes), _Alignof(size_t));
+            seg_errs = (zgec_err *)zgec_alloc(n_segments * sizeof(*seg_errs), _Alignof(zgec_err));
+            if (!out_bases || !seg_bufs || !seg_sizes || !seg_errs) {
+                zgec_free(out_bases);
+                zgec_free(seg_bufs);
+                zgec_free(seg_sizes);
+                zgec_free(seg_errs);
+                goto fail_seg;
+            }
+            seg_arrays_owned = 1;
         }
         memset(seg_bufs, 0, n_segments * sizeof(*seg_bufs));
         memset(seg_sizes, 0, n_segments * sizeof(*seg_sizes));
@@ -3720,10 +3747,12 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             if (seg_errs[s] != ZGEC_OK) {
                 err = seg_errs[s];
                 for (size_t k = 0; k < n_segments; k++) zgec_free(seg_bufs[k]);
-                zgec_free(out_bases);
-                zgec_free(seg_bufs);
-                zgec_free(seg_sizes);
-                zgec_free(seg_errs);
+                if (seg_arrays_owned) {
+                    zgec_free(out_bases);
+                    zgec_free(seg_bufs);
+                    zgec_free(seg_sizes);
+                    zgec_free(seg_errs);
+                }
                 goto fail_seg;
             }
         }
@@ -3731,10 +3760,12 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             err = zgec_payload_grow(&payload, &payload_cap, payload_off, payload_off + seg_sizes[s]);
             if (err != ZGEC_OK) {
                 for (size_t k = 0; k < n_segments; k++) zgec_free(seg_bufs[k]);
-                zgec_free(out_bases);
-                zgec_free(seg_bufs);
-                zgec_free(seg_sizes);
-                zgec_free(seg_errs);
+                if (seg_arrays_owned) {
+                    zgec_free(out_bases);
+                    zgec_free(seg_bufs);
+                    zgec_free(seg_sizes);
+                    zgec_free(seg_errs);
+                }
                 goto fail_seg;
             }
             memcpy(payload + payload_off, seg_bufs[s], seg_sizes[s]);
@@ -3742,16 +3773,18 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             zgec_free(seg_bufs[s]);
             seg_bufs[s] = NULL;
         }
-        zgec_free(out_bases);
-        zgec_free(seg_bufs);
-        zgec_free(seg_sizes);
-        zgec_free(seg_errs);
+        if (seg_arrays_owned) {
+            zgec_free(out_bases);
+            zgec_free(seg_bufs);
+            zgec_free(seg_sizes);
+            zgec_free(seg_errs);
+        }
     }
     zgec_seg_dir_emit(payload + dir_off, dir, (uint32_t)n_segments);
     zgec_free(dir);
     zgec_free(vb_all);
     zgec_free(ll_all);
-    zgec_free(lit_bounds);
+    if (lit_bounds_owned) zgec_free(lit_bounds);
     zgec_free(bounds);
     /* The block's literal buffer, for a later block's LITREF region. */
     if (parse->n_lit > 0) {
@@ -3780,7 +3813,7 @@ fail_seg:
     zgec_free(payload);
     zgec_free(vb_all);
     zgec_free(ll_all);
-    zgec_free(lit_bounds);
+    if (lit_bounds_owned) zgec_free(lit_bounds);
     zgec_free(bounds);
     zgec_parse_free(parse);
     return err;
