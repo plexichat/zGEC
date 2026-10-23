@@ -77,10 +77,17 @@ void zgec_fb_init(zgec_fwd_bits *f, const uint8_t *p, size_t size)
      * the true length of the object p points at: a larger value forms the
      * same out-of-range pointer, one branch later. The sibling reader
      * zgec_lsbr carries a remaining count instead, which is what this would
-     * become if the signature allowed it (review finding 5). */
+     * become if the signature allowed it (review finding 5).
+     *
+     * Pointer wraparound (p + size < p) is checked to prevent out-of-bounds
+     * reads if an invalid size is passed. */
     if (!f) return;
     f->p = p;
-    f->end = (p == NULL) ? NULL : p + size;
+    if (p == NULL || (uintptr_t)(p + size) < (uintptr_t)p) {
+        f->end = NULL;
+    } else {
+        f->end = p + size;
+    }
     f->acc = 0;
     f->nacc = 0;
 }

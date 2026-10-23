@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-23 - Exact Multi-Context Header Cost Calculation and Bounded Stack Fallbacks
+Learning: Overestimating multi-context rANS table header costs using a fixed 300-byte-per-table assumption during segment coder selection (`zgec_select_coder`) caused the encoder to falsely reject multi-context rANS literal models when sparse FSE descriptor tables in fact required only 40–100 bytes each. Computing exact descriptor lengths (`zgec_enc_lit_desc_size`) across `cls_hist` and `rs_hist` enables accurate cost modeling, selecting multi-context rANS whenever bitstream density improves. Furthermore, stack fallbacks for segment preparation arrays (`stack_lit_bounds[65]`, `stack_out_bases[64]`, `stack_seg_bufs[64]`, `stack_seg_sizes[64]`, `stack_seg_errs[64]`) and frame block offsets (`stack_off[64]`, `stack_sz[64]`) eliminate heap allocation churn on parallel block encoding and frame decoding hot paths.
+Action: Compute exact FSE descriptor sizes for multi-context entropy coder selection and use bounded stack fallback buffers for per-block and per-frame segment metadata.

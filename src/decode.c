@@ -3495,11 +3495,22 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     *took = 0;
     memset(&xc, 0, sizeof(xc));
     if ((uint64_t)nblk * (uint64_t)sizeof(*off) > (uint64_t)SIZE_MAX) { err = ZGEC_ERR_NOMEM; goto done; }
-    off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
-    sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
-    if (off == NULL || sz == NULL) {
-        err = ZGEC_ERR_NOMEM;
-        goto done;
+    size_t stack_off[64];
+    size_t stack_sz[64];
+    int off_sz_owned = 0;
+    if (nblk <= 64u) {
+        off = stack_off;
+        sz = stack_sz;
+    } else {
+        off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
+        sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
+        if (off == NULL || sz == NULL) {
+            zgec_free(off);
+            zgec_free(sz);
+            err = ZGEC_ERR_NOMEM;
+            goto done;
+        }
+        off_sz_owned = 1;
     }
 
     /* Pass 1: walk the records exactly as the sequential scan does, but
@@ -3713,8 +3724,10 @@ done:
     }
     zgec_free(ws);
     zgec_free(jobs);
-    zgec_free(off);
-    zgec_free(sz);
+    if (off_sz_owned) {
+        zgec_free(off);
+        zgec_free(sz);
+    }
     zgec_free(out);
     return err;
 }
