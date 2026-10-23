@@ -2866,8 +2866,12 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
         for (ci = 0; ci < 3; ci++) {
             zgec_fse_free_enc(enc_of3[ci]);
             zgec_fse_free_dec(dec_of3[ci]);
+            enc_of3[ci] = NULL;
+            dec_of3[ci] = NULL;
             zgec_fse_free_enc(enc_ll3[ci]);
             zgec_fse_free_dec(dec_ll3[ci]);
+            enc_ll3[ci] = NULL;
+            dec_ll3[ci] = NULL;
         }
         zgec_fse_free_enc(enc_ll);
         zgec_fse_free_dec(dec_ll);
@@ -2875,6 +2879,8 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
         zgec_fse_free_dec(dec_ml);
         zgec_fse_free_enc(enc_of);
         zgec_fse_free_dec(dec_of);
+        enc_ll = enc_ml = enc_of = NULL;
+        dec_ll = dec_ml = dec_of = NULL;
         return err;
     }
 

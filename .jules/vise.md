@@ -82,3 +82,11 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Allocator Pool Hardening, Capacity Preservation, and FSE Table Audit
+Learning: Audited thread-local block (`zgec_pool` in `src/common.c`) and FSE encoder table (`zgec_fse_enc_pool` in `src/fse.c`) memory pools for safety invariants.
+  1) `zgec_pool_put` now explicitly guards against duplicate pointer insertions on double-free attempts, avoiding handed-out duplicate allocations.
+  2) `zgec_pool_take` returns the block's physical capacity `cap` so that `zgec_alloc` records `cap` in header `((size_t *)aligned)[-2]` without shrinking block capacities on reuse.
+  3) `zgec_fse_enc_pool` is now strictly bounded to at most 8 slots and <= 32 MiB per thread, and `zgec_fse_enc_return` checks for list presence to prevent double-free cycles.
+  4) Audited all FSE table destruction sites in `src/encode.c` and `src/seq.c` to confirm pointers are NULL-initialized and cleared immediately after freeing on all normal and error paths.
+Action: Always verify duplicate-pointer checks on custom freelists, record physical block capacities in allocation headers, and clear table pointers to NULL immediately after freeing. Tested with ctest 4/4, ASan/UBSan clean runs, and 20,000 fuzzing roundtrips.
