@@ -918,3 +918,12 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+ACCEPTED decode throughput optimizations (task 6 / jules-1).
+Decompression throughput optimizations without altering bitstream output:
+- Match copy dispatch in exec_block: added fast pattern expansion for moff == 3 (unrolled 24-byte pattern stores), moff >= 4 (4-byte chunk copies), and moff >= 8 (16/32-byte SIMD overlap loads/stores).
+- Vectorized clsbuf match class computation in seq_decode_cond using 256-bit AVX2 SIMD with unsigned threshold comparisons.
+- Vectorized sequence length adjustments and summations (ml, of, ll) in decode_segment_streams using AVX2 SIMD.
+- Hoisted rANS lane states into scalar registers and consolidated error checks per round across 8 lanes in zgec_rans_decode for both k=1 and k>1.
+
+Byte-identical output across all levels. Decompression throughput increased by +11.8% in interleaved benchmarks. All ctests pass (4/4).
