@@ -846,8 +846,39 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
 
     int rs_empty = zgec_rs_is_empty(runstart, n_lit);
+    int has_sentinel = 0;
+    for (unsigned b = 0; b < 256u; b++) {
+        if (idx_lut[b] == 0xFFu) { has_sentinel = 1; break; }
+    }
 
-    if (rs_empty) {
+    if (rs_empty && !has_sentinel) {
+        /* Fast path: no runstarts and no sentinels in idx_lut */
+        for (unsigned lane = 0; lane < 8; lane++) {
+            size_t lane_len = len[lane];
+            size_t lane_start = start[lane];
+            if (lane_len > 0) {
+                tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
+                size_t t = 1;
+                for (; t + 4 <= lane_len; t += 4) {
+                    size_t j = lane_start + t;
+                    unsigned p0 = idx_lut[Z[j - 1]];
+                    unsigned p1 = idx_lut[Z[j]];
+                    unsigned p2 = idx_lut[Z[j + 1]];
+                    unsigned p3 = idx_lut[Z[j + 2]];
+
+                    tables_counts[(size_t)p0 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+                    tables_counts[(size_t)p1 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j + 1]]++;
+                    tables_counts[(size_t)p2 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j + 2]]++;
+                    tables_counts[(size_t)p3 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j + 3]]++;
+                }
+                for (; t < lane_len; t++) {
+                    size_t j = lane_start + t;
+                    unsigned p0 = idx_lut[Z[j - 1]];
+                    tables_counts[(size_t)p0 * (size_t)ZGEC_NSYM_LIT + (size_t)Z[j]]++;
+                }
+            }
+        }
+    } else if (rs_empty) {
         /* When runstart has no bits set, skip testing zgec_rs_get() per literal. */
         for (unsigned lane = 0; lane < 8; lane++) {
             size_t lane_len = len[lane];
@@ -1044,7 +1075,26 @@ zgec_err zgec_rans_normalise(int16_t *counts, const uint32_t *hist)
     }
 
     int final_sum = 0;
-    for (int s = 0; s < ZGEC_NSYM_LIT; s++) final_sum += counts[s] < 0 ? 1 : counts[s];
+    int s_f = 0;
+#if defined(__AVX2__)
+    __m256i vsum_f = _mm256_setzero_si256();
+    __m256i vone_f = _mm256_set1_epi32(1);
+    __m256i vzero_f = _mm256_setzero_si256();
+    for (; s_f + 8 <= ZGEC_NSYM_LIT; s_f += 8) {
+        __m128i raw16 = _mm_loadu_si128((const __m128i *)(const void *)(counts + s_f));
+        __m256i vc = _mm256_cvtepi16_epi32(raw16);
+        __m256i vneg = _mm256_cmpgt_epi32(vzero_f, vc);
+        __m256i veff = _mm256_blendv_epi8(vc, vone_f, vneg);
+        vsum_f = _mm256_add_epi32(vsum_f, veff);
+    }
+    __m128i vlow_f = _mm256_castsi256_si128(vsum_f);
+    __m128i vhigh_f = _mm256_extracti128_si256(vsum_f, 1);
+    vlow_f = _mm_add_epi32(vlow_f, vhigh_f);
+    vlow_f = _mm_hadd_epi32(vlow_f, vlow_f);
+    vlow_f = _mm_hadd_epi32(vlow_f, vlow_f);
+    final_sum += _mm_cvtsi128_si32(vlow_f);
+#endif
+    for (; s_f < ZGEC_NSYM_LIT; s_f++) final_sum += counts[s_f] < 0 ? 1 : counts[s_f];
     if (final_sum != ZGEC_RANS_M) return ZGEC_ERR_RANS_STATE;
     return ZGEC_OK;
 }

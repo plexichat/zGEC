@@ -918,3 +918,15 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+2026-10-22 - SIMD Acceleration across Encoder Context Evaluation, Clustering, Sub-Literals, and Entropy Normalization
+
+Learning:
+1. In `src/encode.c` (`zgec_ctx_body_bits`), for order-0 single context streams (`k <= 1` without runstarts), unrolling histogram generation across 8 parallel accumulators (`c0..c7`) with 256-bit AVX2 vector additions (`_mm256_add_epi32`) and passing `ZGEC_ENC_TOTAL_UNKNOWN` to `zgec_enc_entropy_bits_u32` eliminates per-byte group lookup and store-forwarding stalls.
+2. In `src/encode.c` (`zgec_cluster_greedy`), short-circuiting delta calculations when either candidate class total is zero (`ctot == 0`) sets `cand_delta = 0.0` directly, bypassing 256-element SIMD additions and entropy evaluations on empty classes.
+3. In `src/fse.c` (`zgec_fse_write_counts`) and `src/rans.c` (`zgec_rans_normalise`), symbol count array summation and final state validation are accelerated with 128-bit SIMD loads (`_mm_loadu_si128`), sign extension (`_mm256_cvtepi16_epi32`), AVX2 comparison/blend, and horizontal vector reduction.
+4. In `src/lit.c` (`zgec_lit_sub_reconstruct`) and `src/dict.c` (`zgec_dict_store_literals`), vectorizing sub-literal residual additions (`_mm256_add_epi8`) when `rep0 >= 32` and `rep0 <= pos` accelerates reconstruction while ensuring no stale predictor reads occur.
+5. In `include/zgec_lit.h` (`zgec_rs_is_empty`), 256-bit AVX2 SIMD zero-testing (`_mm256_testz_si256`) checks 32 bytes per instruction.
+
+Action:
+Always short-circuit context clustering for empty symbol classes, use 8 parallel accumulator banks for single-context literal histogram generation, and vectorize sub-literal prediction additions using AVX2 SIMD when `rep0 >= 32` and `rep0 <= pos`.
