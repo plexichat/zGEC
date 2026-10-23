@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-22 - Bounded Stack Fallbacks for Hot Decompression Path Allocations
+Learning: Remaining heap allocations on the frame decompression hot path in `src/decode.c` and `src/dict.c` (single-table rANS decoders, segment descriptors `new_desc_t`, worker thread arrays, block jobs and offsets, export cache slots, litref gathering, and RLE temporary buffers) caused heap allocation churn during decoding. Adding bounded stack fallbacks (`_Alignas(64) stack_lit[1]`, `stack_descs[4]`, `stack_hs`/`stack_ths`/`stack_started`, `stack_slot[64]`, `stack_litref[8192]`, `stack_tmp[8192]`, `stack_off[64]`/`stack_sz[64]`, `stack_ws`/`stack_jobs`) reduces decompression allocations (e.g. from 68 down to 53 allocations on a 10MB frame decode) while maintaining stack frame footprints <= 32 KiB and full memory safety under ASan/UBSan.
+Action: Use bounded stack fallbacks for per-block and per-segment metadata arrays and temporary buffers when sizing bounds are known at compile time, falling back to dynamic allocation only when counts exceed stack bounds.
