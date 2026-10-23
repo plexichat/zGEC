@@ -918,3 +918,12 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-23 - Selective Export Cache Mutex Initialization and Unrolled Scalar rANS Decode
+
+**Learning:**
+1. In `zgec_export_cache_init` (`src/decode.c`), calculating block reference counts (`refs`) prior to mutex initialization allows calling `zgec_mu_init` only on slots with `refs > 0`, eliminating hundreds of redundant `pthread_mutex_init` and `pthread_mutex_destroy` calls per frame. Guarding `zgec_free(c->slot[i].lit)` with `c->slot[i].lit != NULL` in `zgec_export_cache_free` avoids redundant function call overhead during cache destruction.
+2. In `zgec_rans_decode` (`src/rans.c`), hoisting lane states (`st0..st7`) and lane start positions (`s0..s7`) into CPU scalar registers for full 8-lane rounds (`round < full`) in `k == 1` and `k > 1` (no-runstart) modes eliminates stack reloads and enables full instruction-level parallelism (ILP) across independent rANS state transitions. Consolidating per-lane validity checks into a single combined boolean check (`!f0 || !f1 || ...`) removes 7 conditional branches per round.
+
+**Action:**
+Calculate slot reference counts before initializing mutexes in shared caches, and hoist multi-lane rANS decoder states into local scalar registers for full rounds.
