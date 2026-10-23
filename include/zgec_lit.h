@@ -1,6 +1,10 @@
 #ifndef ZGEC_LIT_H
 #define ZGEC_LIT_H
 
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 #include "zgec_common.h"
 #include "zgec_rans.h"
 
@@ -93,6 +97,15 @@ static inline int zgec_rs_is_empty(const uint8_t *map, size_t n_lit)
     if (map == NULL || n_lit == 0) return 1;
     size_t bytes = zgec_rs_bytes(n_lit);
     size_t i = 0;
+#if defined(__AVX2__)
+    if (bytes >= 32) {
+        while (i + 32 <= bytes) {
+            __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(map + i));
+            if (!_mm256_testz_si256(v, v)) return 0;
+            i += 32;
+        }
+    }
+#endif
     while (i + 8 <= bytes) {
         if (zgec_rd64(map + i) != 0) return 0;
         i += 8;
