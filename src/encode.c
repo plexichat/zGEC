@@ -1267,6 +1267,7 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         size_t j;
         memset(hist4, 0, 4u * hist_bytes);
         if (zgec_rs_is_empty(runstart, n_lit)) {
+            /* Pass 1: LSB6 (h0) and MSB6 (h1) */
             j = 1;
             for (; j + 8 <= n_lit; j += 8) {
                 uint8_t p0 = lit[j - 1], n0 = lit[j];
