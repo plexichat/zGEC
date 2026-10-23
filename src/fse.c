@@ -1374,74 +1374,116 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
     }
 
     if (base != NULL && nbits != NULL) {
-        for (size_t i = n - 1; i > 0; i--) {
-            uint8_t s = syms[i - 1];
+        struct zgec_fse_sym_info {
             const zgec_fse_enc_entry *row;
-            zgec_fse_enc_entry entry;
-            uint32_t bits;
-            uint32_t val = values[i - 1];
-            unsigned nb = (unsigned)nbits[s];
-            uint64_t comb;
-            unsigned cn;
             uint32_t lo;
-            uint32_t extra;
+            uint8_t nb;
+        } sinfo[256];
 
-            if ((int)s >= t_nsym) return ZGEC_ERR_FSE_SYMBOL;
-            row = ents + ((size_t)s << t_al);
-            if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
-            entry = row[(size_t)state];
-            bits = (state >= (uint32_t)entry.baseline)
-                        ? (uint32_t)(state - (uint32_t)entry.baseline)
-                        : 0u;
+        int valid = (bw_end >= bw_ptr && (size_t)(bw_end - bw_ptr) >= n * 8u + 16u && t_nsym <= 256);
+        if (valid) {
+            for (int s = 0; s < t_nsym; s++) {
+                const zgec_fse_enc_entry *row = ents + ((size_t)s << t_al);
+                if (row[0].pad == 0) { valid = 0; break; }
+                sinfo[s].row = row;
+                sinfo[s].lo = base[s];
+                sinfo[s].nb = nbits[s];
+            }
+        }
+        if (valid) {
+            for (size_t k = 0; k < n; k++) {
+                uint8_t s = syms[k];
+                if ((int)s >= t_nsym) { valid = 0; break; }
+                uint32_t val = values[k];
+                uint32_t lo = sinfo[s].lo;
+                unsigned nb = sinfo[s].nb;
+                if (val < lo || (nb < 32u && (val - lo) >= (1u << nb))) {
+                    valid = 0; break;
+                }
+            }
+        }
 
-            /* The transition field and the value's extra bits are
-             * adjacent in the bitstream, so one accumulate-and-flush of
-             * the concatenation is bit-identical to writing them
-             * separately: the byte order is fixed by the accumulation
-             * order, not by where the flushes land. Halving the number of
-             * write sites is the point -- this loop is throughput-bound.
-             *
-             * The nb == 0 case is folded in rather than branched: a symbol
-             * with no extra bits stands for exactly base[s] and the code
-             * above derives s from val, so extra is 0 and the mask is 0,
-             * contributing nothing while still paying one branch per
-             * symbol (bit widths vary enough that the branch mispredicts).
-             * The two range checks below are unchanged for nb > 0; for
-             * nb == 0 they only reject a value that is not base[s], which
-             * the symbol derivation already rules out. */
-            comb = (uint64_t)bits;
-            cn = (unsigned)entry.nb_bits;
-            lo = base[s];
-            if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
-            extra = val - lo;
-            if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-            /* extra is now known to fit in nb bits (and for nb >= 32 it is
-             * a full 32-bit value), so masking it again is a no-op. The
-             * transition field bits is < 2^entry.nb_bits <= 2^cn, so the
-             * two fields cannot overlap; + and | therefore agree. */
-            comb += (uint64_t)extra << cn;
-            cn += nb;
-            bw_acc |= comb << bw_nacc;
-            bw_nacc += cn;
-            {
+        if (__builtin_expect(valid, 1)) {
+            for (size_t i = n - 1; i > 0; i--) {
+                uint8_t s = syms[i - 1];
+                const struct zgec_fse_sym_info *info = &sinfo[s];
+                zgec_fse_enc_entry entry = info->row[(size_t)state];
+                uint32_t bits = (state >= (uint32_t)entry.baseline)
+                            ? (uint32_t)(state - (uint32_t)entry.baseline)
+                            : 0u;
+                uint32_t extra = values[i - 1] - info->lo;
+                unsigned cn = (unsigned)entry.nb_bits;
+                uint64_t comb = (uint64_t)bits | ((uint64_t)extra << cn);
+                cn += (unsigned)info->nb;
+
+                bw_acc |= comb << bw_nacc;
+                bw_nacc += cn;
+
                 unsigned flush = (bw_nacc >= 32u) ? 1u : 0u;
                 zgec_wr32(bw_ptr, (uint32_t)bw_acc);
                 bw_ptr += (size_t)flush * 4u;
                 bw_acc = flush ? (bw_acc >> 32u) : bw_acc;
                 bw_nacc -= flush * 32u;
-            }
-            if (bw_nacc >= 32u) {
-                if (bw_ptr + 4 > bw_end) {
-                    overflow = 1;
-                } else {
+
+                if (__builtin_expect(bw_nacc >= 32u, 0)) {
                     zgec_wr32(bw_ptr, (uint32_t)bw_acc);
-                    bw_ptr += 4;
+                    bw_ptr += 4u;
                     bw_acc >>= 32u;
                     bw_nacc -= 32u;
                 }
+                state = entry.new_state;
             }
-            if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
-            state = entry.new_state;
+        } else {
+            for (size_t i = n - 1; i > 0; i--) {
+                uint8_t s = syms[i - 1];
+                const zgec_fse_enc_entry *row;
+                zgec_fse_enc_entry entry;
+                uint32_t bits;
+                uint32_t val = values[i - 1];
+                unsigned nb = (unsigned)nbits[s];
+                uint64_t comb;
+                unsigned cn;
+                uint32_t lo;
+                uint32_t extra;
+
+                if ((int)s >= t_nsym) return ZGEC_ERR_FSE_SYMBOL;
+                row = ents + ((size_t)s << t_al);
+                if (row[0].pad == 0) return ZGEC_ERR_FSE_SYMBOL;
+                entry = row[(size_t)state];
+                bits = (state >= (uint32_t)entry.baseline)
+                            ? (uint32_t)(state - (uint32_t)entry.baseline)
+                            : 0u;
+
+                comb = (uint64_t)bits;
+                cn = (unsigned)entry.nb_bits;
+                lo = base[s];
+                if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
+                extra = val - lo;
+                if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
+                comb += (uint64_t)extra << cn;
+                cn += nb;
+                bw_acc |= comb << bw_nacc;
+                bw_nacc += cn;
+                {
+                    unsigned flush = (bw_nacc >= 32u) ? 1u : 0u;
+                    zgec_wr32(bw_ptr, (uint32_t)bw_acc);
+                    bw_ptr += (size_t)flush * 4u;
+                    bw_acc = flush ? (bw_acc >> 32u) : bw_acc;
+                    bw_nacc -= flush * 32u;
+                }
+                if (bw_nacc >= 32u) {
+                    if (bw_ptr + 4 > bw_end) {
+                        overflow = 1;
+                    } else {
+                        zgec_wr32(bw_ptr, (uint32_t)bw_acc);
+                        bw_ptr += 4;
+                        bw_acc >>= 32u;
+                        bw_nacc -= 32u;
+                    }
+                }
+                if (overflow) { bw->overflow = 1; return ZGEC_ERR_BITSTREAM_OVERFLOW; }
+                state = entry.new_state;
+            }
         }
     } else {
         for (size_t i = n - 1; i > 0; i--) {
