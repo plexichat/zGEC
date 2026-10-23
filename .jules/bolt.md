@@ -918,3 +918,6 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+ACCEPTED jules-2: context and sub-literal encode optimization for levels 7-10.
+Vectorized zgec_cluster_greedy initial copy/sum loop using 4-wide AVX2 unrolling, added zero-total short-circuiting in cluster delta seeding/evaluations, precomputed group offsets and deferred group totals to AVX2 sum in zgec_ctx_body_bits, and split zgec_select_contexts histogram updates into two 2-way passes to reduce L1 cache write contention. Byte-identical across all benchmark levels and tests pass.
