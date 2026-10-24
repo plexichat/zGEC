@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdio.h> /* Linux physical-core probe reads sysfs */
 #include <stdlib.h>
 #include <string.h>
@@ -194,6 +195,11 @@ static void *zgec_pool_take(size_t total)
 static int zgec_pool_put(void *raw, size_t total)
 {
     if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
+#ifndef NDEBUG
+    for (unsigned i = 0; i < zgec_pool_n; i++) {
+        assert(zgec_pool[i].raw != raw && "Duplicate pointer in zgec_pool_put");
+    }
+#endif
     zgec_pool[zgec_pool_n].raw = raw;
     zgec_pool[zgec_pool_n].total = total;
     zgec_pool_n++;
@@ -262,6 +268,10 @@ void *zgec_alloc(size_t n, size_t align)
         return NULL;
     }
     aligned = sum & ~(uintptr_t)(align - 1);
+#ifndef NDEBUG
+    assert((uintptr_t)aligned >= (uintptr_t)raw + 2u * sizeof(void *));
+    assert((uintptr_t)aligned + n <= (uintptr_t)raw + total);
+#endif
     ((void **)aligned)[-1] = raw;
     ((size_t *)aligned)[-2] = total;
     return (void *)aligned;
@@ -280,6 +290,11 @@ void zgec_free(void *p)
     if (!p) return;
     void *raw = ((void **)p)[-1];
     size_t total = ((size_t *)p)[-2];
+#ifndef NDEBUG
+    assert(raw != NULL && "Double free detected in zgec_free");
+    ((void **)p)[-1] = NULL;
+    ((size_t *)p)[-2] = 0;
+#endif
     if (total >= ZGEC_POOL_MIN && total <= ZGEC_POOL_MAX_BLOCK &&
         zgec_pool_put(raw, total)) {
         return;

@@ -649,6 +649,8 @@ zgec_err zgec_seq_build_tables_counts(zgec_fse_dec_table **dec,
                                                int16_t *counts_out)
 {
     if (!dec || !enc || !hist) return ZGEC_ERR_INVAL;
+    *dec = NULL;
+    *enc = NULL;
     if (al < ZGEC_MIN_AL || al > ZGEC_MAX_AL) return ZGEC_ERR_FSE_AL;
     int16_t counts[ZGEC_NSYM_SEQ];
     int16_t *counts_use = counts_out ? counts_out : counts;
@@ -666,7 +668,7 @@ zgec_err zgec_seq_build_tables_counts(zgec_fse_dec_table **dec,
     zgec_err err = zgec_fse_build_dec(dec, counts_use, ZGEC_NSYM_SEQ, al);
     if (err != ZGEC_OK) return err;
     err = zgec_fse_build_enc(enc, *dec);
-    if (err != ZGEC_OK) { zgec_fse_free_dec(*dec); *dec = NULL; return err; }
+    if (err != ZGEC_OK) { zgec_fse_free_dec(*dec); *dec = NULL; *enc = NULL; return err; }
     return ZGEC_OK;
 }
 
