@@ -1032,10 +1032,52 @@ static zgec_err seq_decode_cond(uint32_t *out, size_t n,
     }
     if (use_prev) {
         clsbuf[0] = 0;
-        for (i = 1; i < n; i++)
+        i = 1;
+#if defined(__AVX2__)
+        {
+            __m256i v3 = _mm256_set1_epi32(3);
+            __m256i vth3 = _mm256_set1_epi32(3);
+            __m256i vth15 = _mm256_set1_epi32(15);
+            for (; i + 8 <= n; i += 8) {
+                __m256i v_ml = _mm256_loadu_si256((const __m256i *)&ml[i - 1]);
+                __m256i m = _mm256_sub_epi32(v_ml, v3);
+                __m256i ge4 = _mm256_cmpgt_epi32(m, vth3);
+                __m256i ge16 = _mm256_cmpgt_epi32(m, vth15);
+                __m256i sum_neg = _mm256_add_epi32(ge4, ge16);
+                __m256i res32 = _mm256_sub_epi32(_mm256_setzero_si256(), sum_neg);
+                __m128i lo = _mm256_castsi256_si128(res32);
+                __m128i hi = _mm256_extracti128_si256(res32, 1);
+                __m128i pack16 = _mm_packs_epi32(lo, hi);
+                __m128i pack8 = _mm_packus_epi16(pack16, pack16);
+                memcpy(clsbuf + i, &pack8, 8);
+            }
+        }
+#endif
+        for (; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i - 1]);
     } else {
-        for (i = 0; i < n; i++)
+        i = 0;
+#if defined(__AVX2__)
+        {
+            __m256i v3 = _mm256_set1_epi32(3);
+            __m256i vth3 = _mm256_set1_epi32(3);
+            __m256i vth15 = _mm256_set1_epi32(15);
+            for (; i + 8 <= n; i += 8) {
+                __m256i v_ml = _mm256_loadu_si256((const __m256i *)&ml[i]);
+                __m256i m = _mm256_sub_epi32(v_ml, v3);
+                __m256i ge4 = _mm256_cmpgt_epi32(m, vth3);
+                __m256i ge16 = _mm256_cmpgt_epi32(m, vth15);
+                __m256i sum_neg = _mm256_add_epi32(ge4, ge16);
+                __m256i res32 = _mm256_sub_epi32(_mm256_setzero_si256(), sum_neg);
+                __m128i lo = _mm256_castsi256_si128(res32);
+                __m128i hi = _mm256_extracti128_si256(res32, 1);
+                __m128i pack16 = _mm_packs_epi32(lo, hi);
+                __m128i pack8 = _mm_packus_epi16(pack16, pack16);
+                memcpy(clsbuf + i, &pack8, 8);
+            }
+        }
+#endif
+        for (; i < n; i++)
             clsbuf[i] = (uint8_t)zgec_mlclass(ml[i]);
     }
     zgec_br_init(&br, stream, ssize);
@@ -1273,7 +1315,29 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                  * total from the values it stores, which removes the
                  * second pass over ml[] entirely. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
+                i = 0;
+#if defined(__AVX2__)
+                if (seg->n_seq >= 8) {
+                    __m256i vadd3 = _mm256_set1_epi32(3);
+                    __m256i vthree = _mm256_set1_epi32(3);
+                    __m256i acc0 = _mm256_setzero_si256();
+                    __m256i acc1 = _mm256_setzero_si256();
+                    for (; i + 8 <= seg->n_seq; i += 8) {
+                        __m256i v = _mm256_loadu_si256((const __m256i *)&seg->ml[i]);
+                        __m256i v3 = _mm256_add_epi32(v, vadd3);
+                        _mm256_storeu_si256((__m256i *)&seg->ml[i], v3);
+                        __m256i cmp_bad = _mm256_cmpgt_epi32(vthree, v3); /* 3 > v3, i.e., v3 <= 2 */
+                        bad |= (uint32_t)_mm256_movemask_epi8(cmp_bad);
+                        acc0 = _mm256_add_epi64(acc0, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v3)));
+                        acc1 = _mm256_add_epi64(acc1, _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v3, 1)));
+                    }
+                    __m256i acc_sum = _mm256_add_epi64(acc0, acc1);
+                    uint64_t tmp64[4];
+                    _mm256_storeu_si256((__m256i *)tmp64, acc_sum);
+                    sum_ml += tmp64[0] + tmp64[1] + tmp64[2] + tmp64[3];
+                }
+#endif
+                for (; i < seg->n_seq; i++) {
                     uint32_t v = seg->ml[i] + 3u;
                     seg->ml[i] = v;
                     sum_ml += (uint64_t)v;
@@ -1306,7 +1370,21 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
                  * bound (ob < 1 impossible, ob > 0xFFFFFFFF) could reject
                  * is 0xFFFFFFFF, and that add wraps it to a stored zero. */
                 uint32_t bad = 0;
-                for (i = 0; i < seg->n_seq; i++) {
+                i = 0;
+#if defined(__AVX2__)
+                if (seg->n_seq >= 8) {
+                    __m256i vadd1 = _mm256_set1_epi32(1);
+                    __m256i vzero = _mm256_setzero_si256();
+                    for (; i + 8 <= seg->n_seq; i += 8) {
+                        __m256i v = _mm256_loadu_si256((const __m256i *)&seg->of[i]);
+                        __m256i ob = _mm256_add_epi32(v, vadd1);
+                        _mm256_storeu_si256((__m256i *)&seg->of[i], ob);
+                        __m256i cmp_bad = _mm256_cmpeq_epi32(ob, vzero);
+                        bad |= (uint32_t)_mm256_movemask_epi8(cmp_bad);
+                    }
+                }
+#endif
+                for (; i < seg->n_seq; i++) {
                     uint32_t ob = seg->of[i] + 1u;
                     seg->of[i] = ob;
                     bad |= (ob == 0u);
@@ -1375,7 +1453,23 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
      * mix of ll[i] used to mispredict here on every other symbol. */
     {
         uint64_t total = 0;
-        for (i = 0; i < seg->n_seq; i++) {
+        i = 0;
+#if defined(__AVX2__)
+        if (seg->n_seq >= 8) {
+            __m256i acc0 = _mm256_setzero_si256();
+            __m256i acc1 = _mm256_setzero_si256();
+            for (; i + 8 <= seg->n_seq; i += 8) {
+                __m256i v = _mm256_loadu_si256((const __m256i *)&seg->ll[i]);
+                acc0 = _mm256_add_epi64(acc0, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v)));
+                acc1 = _mm256_add_epi64(acc1, _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v, 1)));
+            }
+            __m256i acc_sum = _mm256_add_epi64(acc0, acc1);
+            uint64_t tmp64[4];
+            _mm256_storeu_si256((__m256i *)tmp64, acc_sum);
+            total += tmp64[0] + tmp64[1] + tmp64[2] + tmp64[3];
+        }
+#endif
+        for (; i < seg->n_seq; i++) {
             total += (uint64_t)seg->ll[i];
         }
         sum_ll = total;
@@ -1483,7 +1577,29 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         {
             /* Same fold as the conditioned path above. */
             uint32_t bad = 0;
-            for (i = 0; i < seg->n_seq; i++) {
+            i = 0;
+#if defined(__AVX2__)
+            if (seg->n_seq >= 8) {
+                __m256i vadd3 = _mm256_set1_epi32(3);
+                __m256i vthree = _mm256_set1_epi32(3);
+                __m256i acc0 = _mm256_setzero_si256();
+                __m256i acc1 = _mm256_setzero_si256();
+                for (; i + 8 <= seg->n_seq; i += 8) {
+                    __m256i v = _mm256_loadu_si256((const __m256i *)&seg->ml[i]);
+                    __m256i v3 = _mm256_add_epi32(v, vadd3);
+                    _mm256_storeu_si256((__m256i *)&seg->ml[i], v3);
+                    __m256i cmp_bad = _mm256_cmpgt_epi32(vthree, v3);
+                    bad |= (uint32_t)_mm256_movemask_epi8(cmp_bad);
+                    acc0 = _mm256_add_epi64(acc0, _mm256_cvtepu32_epi64(_mm256_castsi256_si128(v3)));
+                    acc1 = _mm256_add_epi64(acc1, _mm256_cvtepu32_epi64(_mm256_extracti128_si256(v3, 1)));
+                }
+                __m256i acc_sum = _mm256_add_epi64(acc0, acc1);
+                uint64_t tmp64[4];
+                _mm256_storeu_si256((__m256i *)tmp64, acc_sum);
+                sum_ml += tmp64[0] + tmp64[1] + tmp64[2] + tmp64[3];
+            }
+#endif
+            for (; i < seg->n_seq; i++) {
                 uint32_t v = seg->ml[i] + 3u;
                 seg->ml[i] = v;
                 sum_ml += (uint64_t)v;
@@ -1501,7 +1617,21 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         {
             /* Same fold as the conditioned path above. */
             uint32_t bad = 0;
-            for (i = 0; i < seg->n_seq; i++) {
+            i = 0;
+#if defined(__AVX2__)
+            if (seg->n_seq >= 8) {
+                __m256i vadd1 = _mm256_set1_epi32(1);
+                __m256i vzero = _mm256_setzero_si256();
+                for (; i + 8 <= seg->n_seq; i += 8) {
+                    __m256i v = _mm256_loadu_si256((const __m256i *)&seg->of[i]);
+                    __m256i ob = _mm256_add_epi32(v, vadd1);
+                    _mm256_storeu_si256((__m256i *)&seg->of[i], ob);
+                    __m256i cmp_bad = _mm256_cmpeq_epi32(ob, vzero);
+                    bad |= (uint32_t)_mm256_movemask_epi8(cmp_bad);
+                }
+            }
+#endif
+            for (; i < seg->n_seq; i++) {
                 uint32_t ob = seg->of[i] + 1u;
                 seg->of[i] = ob;
                 bad |= (ob == 0u);
@@ -1555,6 +1685,25 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
             size_t chunk = seg->n_seq - done;
             size_t k2;
             if (chunk > 1024) chunk = 1024;
+#if defined(__AVX2__)
+            if (chunk >= 8) {
+                __m256i vtwo = _mm256_set1_epi32(2);
+                __m256i vzero = _mm256_setzero_si256();
+                for (k2 = 0; k2 + 8 <= chunk; k2 += 8) {
+                    size_t j = done + k2;
+                    __m256i vml = _mm256_loadu_si256((const __m256i *)&seg->ml[j]);
+                    __m256i vof = _mm256_loadu_si256((const __m256i *)&seg->of[j]);
+                    __m256i bad_ml = _mm256_cmpgt_epi32(vtwo, vml); /* 2 > ml, i.e., ml <= 2 */
+                    __m256i bad_of = _mm256_cmpeq_epi32(vof, vzero); /* of == 0 */
+                    if (_mm256_movemask_epi8(_mm256_or_si256(bad_ml, bad_of))) {
+                        for (size_t check = 0; check < 8; check++) {
+                            if (seg->ml[j + check] < 3) return ZGEC_ERR_MATCH_LENGTH;
+                            if (seg->of[j + check] < 1) return ZGEC_ERR_OFFSET;
+                        }
+                    }
+                }
+            }
+#endif
             for (k2 = 0; k2 < chunk; k2++) {
                 size_t j = done + k2;
                 uint64_t mpos;
@@ -1676,18 +1825,29 @@ static zgec_err exec_literals_plain(uint8_t *dst, const uint8_t *lit, size_t n,
     if (n > raw_size || pos > raw_size - n) return ZGEC_ERR_RAW_LEN;
     if (raw_size > 64 && pos + n > raw_size - 64) {
         size_t done = 0;
+#if defined(__AVX2__)
+        while (done + 32 <= n) {
+            _mm256_storeu_si256((__m256i *)(dst + pos + done), _mm256_loadu_si256((const __m256i *)(lit + done)));
+            done += 32;
+        }
+#else
         if (n >= 32) {
             while (done + 32 <= n) {
                 memcpy(dst + pos + done, lit + done, 32);
                 done += 32;
             }
         }
+#endif
         if (n - done >= 16) {
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+            _mm_storeu_si128((__m128i *)(dst + pos + done), _mm_loadu_si128((const __m128i *)(lit + done)));
+#else
             memcpy(dst + pos + done, lit + done, 16);
+#endif
             done += 16;
         }
         if (n - done >= 8) {
-            memcpy(dst + pos + done, lit + done, 8);
+            zgec_wr64(dst + pos + done, zgec_rd64(lit + done));
             done += 8;
         }
         for (i = done; i < n; i++) dst[pos + i] = lit[i]; /* safe scalar tail */
@@ -1703,15 +1863,40 @@ static void exec_literals_sub(uint8_t *vb, uint8_t *dst, const uint8_t *res,
 {
     size_t t = 0;
     if (n == 0 || vb == NULL || dst == NULL || res == NULL) return;
-#if defined(__AVX2__)
-    if ((uint64_t)rep0 <= (uint64_t)(LdLl + pos) && rep0 >= 32) {
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+    if (rep0 == 1 && (uint64_t)rep0 <= (uint64_t)(LdLl + pos) && n >= 16) {
+        size_t back0 = (LdLl + pos) - 1;
+        uint8_t last_pred = vb[back0];
+        while (t + 16 <= n) {
+            __m128i v = _mm_loadu_si128((const __m128i *)(res + t));
+            v = _mm_add_epi8(v, _mm_slli_si128(v, 1));
+            v = _mm_add_epi8(v, _mm_slli_si128(v, 2));
+            v = _mm_add_epi8(v, _mm_slli_si128(v, 4));
+            v = _mm_add_epi8(v, _mm_slli_si128(v, 8));
+            v = _mm_add_epi8(v, _mm_set1_epi8((char)last_pred));
+            _mm_storeu_si128((__m128i *)(dst + pos + t), v);
+            last_pred = dst[pos + t + 15];
+            t += 16;
+        }
+    } else if ((uint64_t)rep0 <= (uint64_t)(LdLl + pos) && rep0 >= 16) {
         size_t back_base = (LdLl + pos) - (size_t)rep0;
-        while (t + 32 <= n) {
-            __m256i v_res = _mm256_loadu_si256((const __m256i *)(res + t));
-            __m256i v_pred = _mm256_loadu_si256((const __m256i *)(vb + back_base + t));
-            __m256i v_sum = _mm256_add_epi8(v_res, v_pred);
-            _mm256_storeu_si256((__m256i *)(dst + pos + t), v_sum);
-            t += 32;
+#if defined(__AVX2__)
+        if (rep0 >= 32) {
+            while (t + 32 <= n) {
+                __m256i v_res = _mm256_loadu_si256((const __m256i *)(res + t));
+                __m256i v_pred = _mm256_loadu_si256((const __m256i *)(vb + back_base + t));
+                __m256i v_sum = _mm256_add_epi8(v_res, v_pred);
+                _mm256_storeu_si256((__m256i *)(dst + pos + t), v_sum);
+                t += 32;
+            }
+        }
+#endif
+        while (t + 16 <= n) {
+            __m128i v_res = _mm_loadu_si128((const __m128i *)(res + t));
+            __m128i v_pred = _mm_loadu_si128((const __m128i *)(vb + back_base + t));
+            __m128i v_sum = _mm_add_epi8(v_res, v_pred);
+            _mm_storeu_si128((__m128i *)(dst + pos + t), v_sum);
+            t += 16;
         }
     }
 #endif
@@ -1756,6 +1941,16 @@ static void exec_match_wide(uint8_t *d, const uint8_t *src, size_t len,
             i += 32;
         }
         _mm256_storeu_si256((__m256i *)(d + len - 32), _mm256_loadu_si256((const __m256i *)(src + len - 32)));
+        return;
+    }
+#endif
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+    if (quantum >= 16 && len >= 16) {
+        while (i + 16 <= len) {
+            _mm_storeu_si128((__m128i *)(d + i), _mm_loadu_si128((const __m128i *)(src + i)));
+            i += 16;
+        }
+        _mm_storeu_si128((__m128i *)(d + len - 16), _mm_loadu_si128((const __m128i *)(src + len - 16)));
         return;
     }
 #endif
@@ -1894,6 +2089,25 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                 /* The periodic-offset replicators below are reachable
                  * only for moff < 8 now (2/4); moff 8/16 fall through
                  * to the wide copies above with identical output. */
+                } else if (moff == 3 && mlen >= 8) {
+                    uint8_t b0 = msrc[0], b1 = msrc[1], b2 = msrc[2];
+                    size_t i = 0;
+                    while (i + 24 <= mlen) {
+                        d[i + 0] = b0; d[i + 1] = b1; d[i + 2] = b2;
+                        d[i + 3] = b0; d[i + 4] = b1; d[i + 5] = b2;
+                        d[i + 6] = b0; d[i + 7] = b1; d[i + 8] = b2;
+                        d[i + 9] = b0; d[i + 10] = b1; d[i + 11] = b2;
+                        d[i + 12] = b0; d[i + 13] = b1; d[i + 14] = b2;
+                        d[i + 15] = b0; d[i + 16] = b1; d[i + 17] = b2;
+                        d[i + 18] = b0; d[i + 19] = b1; d[i + 20] = b2;
+                        d[i + 21] = b0; d[i + 22] = b1; d[i + 23] = b2;
+                        i += 24;
+                    }
+                    while (i + 3 <= mlen) {
+                        d[i + 0] = b0; d[i + 1] = b1; d[i + 2] = b2;
+                        i += 3;
+                    }
+                    for (; i < mlen; i++) d[i] = msrc[i % 3];
 #if defined(__AVX2__)
                 } else if (moff == 2 && mlen >= 8) {
                     uint16_t p16 = zgec_rd16(msrc);
@@ -1921,6 +2135,34 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                         i += 8;
                     }
                     for (; i < mlen; i++) d[i] = msrc[i % 4];
+                } else if (moff == 8 && mlen >= 32) {
+                    uint64_t v64 = zgec_rd64(msrc);
+                    __m128i v128 = _mm_loadu_si64(&v64);
+                    v128 = _mm_unpacklo_epi64(v128, v128);
+                    __m256i v256 = _mm256_broadcastsi128_si256(v128);
+                    size_t i = 0;
+                    while (i + 32 <= mlen) {
+                        _mm256_storeu_si256((__m256i *)(d + i), v256);
+                        i += 32;
+                    }
+                    while (i + 8 <= mlen) {
+                        zgec_wr64(d + i, v64);
+                        i += 8;
+                    }
+                    for (; i < mlen; i++) d[i] = msrc[i % 8];
+                } else if (moff == 16 && mlen >= 32) {
+                    __m128i v128 = _mm_loadu_si128((const __m128i *)msrc);
+                    __m256i v256 = _mm256_broadcastsi128_si256(v128);
+                    size_t i = 0;
+                    while (i + 32 <= mlen) {
+                        _mm256_storeu_si256((__m256i *)(d + i), v256);
+                        i += 32;
+                    }
+                    while (i + 16 <= mlen) {
+                        _mm_storeu_si128((__m128i *)(d + i), v128);
+                        i += 16;
+                    }
+                    for (; i < mlen; i++) d[i] = msrc[i % 16];
 #endif
                 } else if (moff >= 4 && mlen >= 4 && mlen <= 8) {
                     memcpy(d, msrc, 4);

@@ -918,3 +918,15 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-22 - Decompression Path Comprehensive AVX2 SIMD Vectorization
+
+**Learning:**
+In zGEC decompression (`src/decode.c`), several sequence processing and Phase B execution loops previously ran in scalar mode:
+1. `seq_decode_cond`: Match class precomputation (`clsbuf`) was scalar. Vectorizing 8 elements per iteration using 256-bit AVX2 SIMD (`_mm256_sub_epi32` and `_mm256_cmpgt_epi32` against thresholds 3 and 15) with 128-bit SIMD packing (`_mm_packs_epi32`, `_mm_packus_epi16`) removes branchy scalar iterations.
+2. `decode_segment_streams`: Sequence length/offset adjustments (`ml[i] += 3`, `of[i] += 1`), overflow checks (`v3 <= 2`), and length summations (`sum_ml`, `sum_ll`) are accelerated 8 elements at a time using 256-bit AVX2 SIMD (`_mm256_add_epi32`, `_mm256_cvtepu32_epi64`, `_mm256_add_epi64`).
+3. `exec_literals_sub`: For `rep0 == 1`, sub-literal reconstruction runs a 16-byte SIMD parallel prefix sum using byte shifts (`_mm_slli_si128`) and byte additions (`_mm_add_epi8`), while `rep0 >= 16` and `rep0 >= 32` use 128-bit and 256-bit SIMD additions.
+4. `exec_literals_plain` and `exec_match_wide`: 32-byte and 16-byte chunk copying uses AVX2/SSE SIMD stores/loads. Pattern broadcast for `moff == 3` uses unrolled 24-byte stores and `moff == 8, 16` uses AVX2 broadcast (`_mm256_broadcastsi128_si256`).
+
+**Action:**
+Vectorize sequence array adjustments, classification precomputations, sub-literal prefix sums, and pattern broadcasts in decompression hot paths using 256-bit AVX2 SIMD with scalar fallbacks.
