@@ -82,3 +82,11 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Allocator Header Bound Proof and Thread-Local Pool Hardening
+Learning: Audited thread-local block (`zgec_pool`) and FSE encoder table (`zgec_fse_enc_pool`) pools for memory safety, double-frees, and unbounded retention:
+  1. Header Size Proof: In `zgec_alloc(n, align)`, `total = n + 2*sizeof(void*) + align - 1`. The usable buffer `aligned` satisfies `aligned >= raw + 2*sizeof(void*)` and `aligned + n <= raw + total`. When a block of size `total` is cached in `zgec_pool`, storing `total` as the slot capacity is a strict lower bound on its physical allocation size. Future `zgec_pool_take(need)` calls check `cached_total >= need`, mathematically guaranteeing that any reused block has at least `need` bytes of physical memory capacity.
+  2. Bounded Retention: `zgec_pool` is capped at 8 slots (max 4 MiB per block = 32 MiB max per thread). `zgec_fse_enc_pool` was previously an unbounded linked list; adding `ZGEC_FSE_POOL_SLOTS` = 8u and tracking `zgec_fse_enc_pool_n` strictly bounds cached tables to <= 8 slots (~4.3 MiB per thread) and frees excess tables via `zgec_free(t)`.
+  3. Double-Free & UAF Protection: Adding debug assertions (`#ifndef NDEBUG`) in `zgec_free` clears `((void **)p)[-1] = NULL`, detecting double frees immediately. Debug assertions in `zgec_pool_put` and `zgec_fse_enc_return` walk the pool structures to verify no duplicate or cyclic entries can be inserted.
+  4. Pointer Zeroing: Confirmed and hardened pointer zeroing across `src/encode.c` and `src/seq.c` so every encoder/decoder table pointer is NULL-initialized on declaration and explicitly zeroed immediately after `zgec_fse_free_enc` / `zgec_fse_free_dec` on both success and error paths (`seg_fail_tables`).
+Action: Always enforce strict slot limits on thread-local allocation pools and zero table handles immediately upon freeing.
