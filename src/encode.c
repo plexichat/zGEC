@@ -668,10 +668,22 @@ static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
 {
     int s = 0;
 #if defined(__AVX2__)
-    for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-        __m256i vd = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s));
-        __m256i vs = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s));
-        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s), _mm256_add_epi32(vd, vs));
+    for (; s + 32 <= ZGEC_NSYM_LIT; s += 32) {
+        __m256i vd0 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s));
+        __m256i vs0 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s), _mm256_add_epi32(vd0, vs0));
+
+        __m256i vd1 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s + 8));
+        __m256i vs1 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s + 8));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s + 8), _mm256_add_epi32(vd1, vs1));
+
+        __m256i vd2 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s + 16));
+        __m256i vs2 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s + 16));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s + 16), _mm256_add_epi32(vd2, vs2));
+
+        __m256i vd3 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s + 24));
+        __m256i vs3 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s + 24));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s + 24), _mm256_add_epi32(vd3, vs3));
     }
 #endif
     for (; s < ZGEC_NSYM_LIT; s++) dst->lit[(size_t)s] += src->lit[(size_t)s];
@@ -1016,16 +1028,29 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         {
             /* Copy the class row and total it in one pass. The total is an
              * exact 32-bit sum: it is at most n_lit, so no lane can reach
-             * 2^32 and the horizontal add cannot wrap. */
-            __m256i vsum = _mm256_setzero_si256();
+             * 2^32 and the horizontal add cannot wrap. Unrolled 4-wide. */
+            __m256i vsum0 = _mm256_setzero_si256();
+            __m256i vsum1 = _mm256_setzero_si256();
+            __m256i vsum2 = _mm256_setzero_si256();
+            __m256i vsum3 = _mm256_setzero_si256();
             const uint32_t *src = cls_hist + (size_t)c * 256u;
             uint32_t *dst = work[(size_t)c];
-            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-                __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(src + s));
-                _mm256_storeu_si256((__m256i *)(void *)(dst + s), v);
-                vsum = _mm256_add_epi32(vsum, v);
+            for (; s + 32 <= ZGEC_NSYM_LIT; s += 32) {
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(src + s));
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(src + s + 8));
+                __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(src + s + 16));
+                __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(src + s + 24));
+                _mm256_storeu_si256((__m256i *)(void *)(dst + s), v0);
+                _mm256_storeu_si256((__m256i *)(void *)(dst + s + 8), v1);
+                _mm256_storeu_si256((__m256i *)(void *)(dst + s + 16), v2);
+                _mm256_storeu_si256((__m256i *)(void *)(dst + s + 24), v3);
+                vsum0 = _mm256_add_epi32(vsum0, v0);
+                vsum1 = _mm256_add_epi32(vsum1, v1);
+                vsum2 = _mm256_add_epi32(vsum2, v2);
+                vsum3 = _mm256_add_epi32(vsum3, v3);
             }
             {
+                __m256i vsum = _mm256_add_epi32(_mm256_add_epi32(vsum0, vsum1), _mm256_add_epi32(vsum2, vsum3));
                 __m128i lo = _mm256_castsi256_si128(vsum);
                 __m128i hi = _mm256_extracti128_si256(vsum, 1);
                 lo = _mm_add_epi32(lo, hi);
@@ -1059,14 +1084,22 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             uint64_t mt = ctot[(size_t)c] + ctot[(size_t)bb];
             s = 0;
 #if defined(__AVX2__)
-            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-                __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)c] + s));
-                __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)bb] + s));
-                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va, vb256));
-            }
-            for (; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)c][(size_t)s] + work[(size_t)bb][(size_t)s];
+            for (; s + 32 <= ZGEC_NSYM_LIT; s += 32) {
+                __m256i va0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)c] + s));
+                __m256i vb0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)bb] + s));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va0, vb0));
+
+                __m256i va1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)c] + s + 8));
+                __m256i vb1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)bb] + s + 8));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s + 8), _mm256_add_epi32(va1, vb1));
+
+                __m256i va2 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)c] + s + 16));
+                __m256i vb2 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)bb] + s + 16));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s + 16), _mm256_add_epi32(va2, vb2));
+
+                __m256i va3 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)c] + s + 24));
+                __m256i vb3 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)bb] + s + 24));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s + 24), _mm256_add_epi32(va3, vb3));
             }
 #else
             for (; s < ZGEC_NSYM_LIT; s++) {
@@ -1117,15 +1150,22 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             double ver_delta = 0.0;
             s = 0;
 #if defined(__AVX2__)
-            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-                __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
-                __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
-                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va, vb256));
-            }
-            for (; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)cand_a][(size_t)s] +
-                    work[(size_t)cand_b][(size_t)s];
+            for (; s + 32 <= ZGEC_NSYM_LIT; s += 32) {
+                __m256i va0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
+                __m256i vb0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va0, vb0));
+
+                __m256i va1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s + 8));
+                __m256i vb1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s + 8));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s + 8), _mm256_add_epi32(va1, vb1));
+
+                __m256i va2 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s + 16));
+                __m256i vb2 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s + 16));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s + 16), _mm256_add_epi32(va2, vb2));
+
+                __m256i va3 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s + 24));
+                __m256i vb3 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s + 24));
+                _mm256_storeu_si256((__m256i *)(void *)(merged + s + 24), _mm256_add_epi32(va3, vb3));
             }
 #else
             for (; s < ZGEC_NSYM_LIT; s++) {
@@ -1167,13 +1207,22 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
         /* Merge best_b into best_a. */
         s = 0;
 #if defined(__AVX2__)
-        for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-            __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_a] + s));
-            __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_b] + s));
-            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)best_a] + s), _mm256_add_epi32(va, vb256));
-        }
-        for (; s < ZGEC_NSYM_LIT; s++) {
-            work[(size_t)best_a][(size_t)s] += work[(size_t)best_b][(size_t)s];
+        for (; s + 32 <= ZGEC_NSYM_LIT; s += 32) {
+            __m256i va0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_a] + s));
+            __m256i vb0 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_b] + s));
+            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)best_a] + s), _mm256_add_epi32(va0, vb0));
+
+            __m256i va1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_a] + s + 8));
+            __m256i vb1 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_b] + s + 8));
+            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)best_a] + s + 8), _mm256_add_epi32(va1, vb1));
+
+            __m256i va2 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_a] + s + 16));
+            __m256i vb2 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_b] + s + 16));
+            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)best_a] + s + 16), _mm256_add_epi32(va2, vb2));
+
+            __m256i va3 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_a] + s + 24));
+            __m256i vb3 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)best_b] + s + 24));
+            _mm256_storeu_si256((__m256i *)(void *)(work[(size_t)best_a] + s + 24), _mm256_add_epi32(va3, vb3));
         }
 #else
         for (; s < ZGEC_NSYM_LIT; s++) {

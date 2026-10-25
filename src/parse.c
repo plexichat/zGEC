@@ -196,10 +196,10 @@ void zgec_lit_bounds(const zgec_parse *p,
         size_t i = start_seq;
 #if defined(__AVX2__)
         __m256i vsum = _mm256_setzero_si256();
+        const __m256i v_offsets = _mm256_set_epi32(84, 72, 60, 48, 36, 24, 12, 0);
         while (i + 8 <= end_seq) {
             const zgec_sequence *q = &p->seq[i];
-            __m256i v_ll = _mm256_set_epi32((int)q[7].ll, (int)q[6].ll, (int)q[5].ll, (int)q[4].ll,
-                                            (int)q[3].ll, (int)q[2].ll, (int)q[1].ll, (int)q[0].ll);
+            __m256i v_ll = _mm256_i32gather_epi32((const int *)(const void *)&q->ll, v_offsets, 1);
             vsum = _mm256_add_epi32(vsum, v_ll);
             i += 8;
         }
