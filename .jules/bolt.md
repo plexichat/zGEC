@@ -918,3 +918,22 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-25 - Decompression Throughput Optimization across Match Copying, Sequence Field Adjustments, and rANS Lane Unrolling
+
+**Learning:**
+1. In LZ77 match copy execution (`exec_block` in `src/decode.c`), branchy 8-byte chunk loop conditions (`if (mlen > 8)...`) introduce data-dependent mispredictions on short match lengths. For non-overlapping short matches (`moff >= 8` and `mlen <= 8`), issuing a single 64-bit load/store (`zgec_wr64(d, zgec_rd64(msrc))`) branchlessly completes the copy.
+2. For 3-byte match offsets (`moff == 3`), broadcasting 3-byte patterns across 24-byte words (`w0, w1, w2`) and copying 24-byte chunks branchlessly replaces scalar single-byte iteration loops with 64-bit unaligned stores.
+3. For small match offsets (`moff >= 4` and `moff < 8`), copying in 4-byte chunks (`zgec_wr32`) is provably safe and non-overlapping, eliminating scalar byte loops for offsets 4, 5, 6, and 7. For 2-byte offsets (`moff == 2`), in-phase 64-bit stores (`d + i` for even `i`) prevent phase-shift alignment errors.
+4. In Phase A sequence stream decoding (`decode_segment_streams` and `seq_decode_cond` in `src/decode.c`), sequence length adjustments (`ml[i] += 3`, `of[i] += 1`), sequence field summations (`sum_ml`, `sum_ll`), and match class precomputation (`clsbuf`) are vectorized 8 elements at a time using 256-bit AVX2 SIMD (`_mm256_add_epi32`, `_mm256_cmpgt_epi32`, `_mm_packs_epi32`, `_mm_packus_epi16`).
+5. In 8-lane rANS decoding (`zgec_rans_decode` in `src/rans.c`), unrolling default single-context (`k = 1`) full rounds into 8 scalar register variables (`x0..x7`) with a single consolidated validity check (`if (__builtin_expect(!f0 || !f1 || ... , 0))`) maximizes instruction-level parallelism (ILP) across superscalar execution pipelines.
+
+**Measurement (reference corpus Silesia 211,938,580 B, interleaved A/B N=11):**
+- Level 4 (-T 1): Min speedup **+6.32%**, Med speedup **+2.02%**
+- Level 7 (-T 1): Min speedup **+1.56%**, Med speedup **+2.45%**
+- Level 4 (-T 4): Min speedup **+3.58%**, Med speedup **+2.70%**
+- Level 7 (-T 4): Min speedup **+3.39%**, Med speedup **+2.45%**
+Pins (l4, l6, l7, l8, l9, l10) and l7 SHA-256 byte-identical. All ctest fixtures pass (4/4).
+
+**Action:**
+In LZ77 decoders, handle 3-byte offsets via 24-byte pattern words and 4..7-byte offsets via 4-byte chunk stores; use 256-bit AVX2 SIMD for sequence array transformations; and unroll single-context rANS 8-lane decoding into register variables with a single consolidated validity check.
