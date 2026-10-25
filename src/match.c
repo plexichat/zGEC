@@ -637,10 +637,14 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
     __m256i tagv = _mm256_set1_epi32((int)(tag << ZGEC_MF_TAG_SHIFT));
     __m256i tagmask = _mm256_set1_epi32((int)(ZGEC_MF_TAG_MASK << ZGEC_MF_TAG_SHIFT));
     __m256i zero = _mm256_setzero_si256();
+    int tag_nonzero = (__builtin_expect(tag != 0u, 1) != 0);
     /* The common widths (8 and 16 lanes) skip the loop and the lane shift. */
     if (nlanes == 8u) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)b);
         __m256i eq = _mm256_cmpeq_epi32(_mm256_and_si256(v, tagmask), tagv);
+        if (tag_nonzero) {
+            return (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(eq));
+        }
         __m256i nz = _mm256_cmpeq_epi32(v, zero);
         __m256i hit = _mm256_andnot_si256(nz, eq);
         return (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(hit));
@@ -649,9 +653,14 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
         __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)b);
         __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(b + 8));
         __m256i eq0 = _mm256_cmpeq_epi32(_mm256_and_si256(v0, tagmask), tagv);
+        __m256i eq1 = _mm256_cmpeq_epi32(_mm256_and_si256(v1, tagmask), tagv);
+        if (tag_nonzero) {
+            uint32_t m0 = (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(eq0));
+            uint32_t m1 = (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(eq1));
+            return m0 | (m1 << 8);
+        }
         __m256i nz0 = _mm256_cmpeq_epi32(v0, zero);
         __m256i hit0 = _mm256_andnot_si256(nz0, eq0);
-        __m256i eq1 = _mm256_cmpeq_epi32(_mm256_and_si256(v1, tagmask), tagv);
         __m256i nz1 = _mm256_cmpeq_epi32(v1, zero);
         __m256i hit1 = _mm256_andnot_si256(nz1, eq1);
         uint32_t m0 = (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(hit0));
@@ -661,9 +670,13 @@ static uint32_t mf_bucket_hits(const uint32_t *b, uint32_t tag, uint32_t nlanes,
     for (; lane + 8u <= nlanes; lane += 8u) {
         __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(b + lane));
         __m256i eq = _mm256_cmpeq_epi32(_mm256_and_si256(v, tagmask), tagv);
-        __m256i nz = _mm256_cmpeq_epi32(v, zero);
-        __m256i hit = _mm256_andnot_si256(nz, eq);
-        mask |= (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(hit)) << lane;
+        if (tag_nonzero) {
+            mask |= (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(eq)) << lane;
+        } else {
+            __m256i nz = _mm256_cmpeq_epi32(v, zero);
+            __m256i hit = _mm256_andnot_si256(nz, eq);
+            mask |= (uint32_t)_mm256_movemask_ps(_mm256_castsi256_ps(hit)) << lane;
+        }
     }
 #endif
     for (; lane < nlanes; lane++) {
