@@ -239,6 +239,8 @@ typedef struct {
     int lit_form;
     int lit_k;
     int has_lit;
+    int lit_owned;
+    _Alignas(64) zgec_rans_dec_table stack_lit[1];
     zgec_fse_dec_table *ll[3];
     int ll_rle[3];
     int n_ll;
@@ -267,16 +269,22 @@ static void zgec_dict_prev_init(zgec_dict_prev *p)
     p->ml_rle = -1;
 }
 
-static void zgec_dict_prev_free(zgec_dict_prev *p)
+static void zgec_dict_prev_clear_old(zgec_dict_prev *p)
 {
     size_t i;
     if (!p) return;
     for (i = 0; i < 3; i++) {
-        if ((int)i < p->n_ll && p->ll[i]) zgec_fse_free_dec(p->ll[i]);
-        if ((int)i < p->n_of && p->of[i]) zgec_fse_free_dec(p->of[i]);
+        if ((int)i < p->n_ll && p->ll[i]) { zgec_fse_free_dec(p->ll[i]); p->ll[i] = NULL; }
+        if ((int)i < p->n_of && p->of[i]) { zgec_fse_free_dec(p->of[i]); p->of[i] = NULL; }
     }
-    if (p->ml) zgec_fse_free_dec(p->ml);
-    zgec_free(p->lit);
+    if (p->ml) { zgec_fse_free_dec(p->ml); p->ml = NULL; }
+    if (p->lit_owned && p->lit) { zgec_free(p->lit); p->lit = NULL; p->lit_owned = 0; }
+}
+
+static void zgec_dict_prev_free(zgec_dict_prev *p)
+{
+    if (!p) return;
+    zgec_dict_prev_clear_old(p);
     zgec_dict_prev_init(p);
 }
 
@@ -555,9 +563,13 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         }
         /* rANS tail-only segment: build tables, run-start, decode. */
         if (n_lit_tbl <= 0) { zgec_dict_seg_release(seg); return ZGEC_ERR_TABLE_MODE; }
-        lt = (zgec_rans_dec_table *)zgec_alloc(
-            (size_t)n_lit_tbl * sizeof(*lt), 64);
-        if (!lt) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+        if (n_lit_tbl == 1) {
+            lt = prev->stack_lit;
+        } else {
+            lt = (zgec_rans_dec_table *)zgec_alloc(
+                (size_t)n_lit_tbl * sizeof(*lt), 64);
+            if (!lt) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+        }
         {
             size_t fp = 2;
             uint32_t tmp = 0;
@@ -565,10 +577,10 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
             const uint8_t *dp;
             size_t rem;
             nn = zgec_varint_decode(seg_buf + fp, seg_size - fp, &tmp);
-            if (nn == 0) { zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_VARINT; }
+            if (nn == 0) { if (lt != prev->stack_lit) zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_VARINT; }
             fp += nn;
             nn = zgec_varint_decode(seg_buf + fp, seg_size - fp, &tmp);
-            if (nn == 0) { zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_VARINT; }
+            if (nn == 0) { if (lt != prev->stack_lit) zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_VARINT; }
             fp += nn;
             dp = seg_buf + fp;
             rem = hdr_size > fp ? hdr_size - fp : 0;
@@ -577,19 +589,20 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
             if (lit_mode == ZGEC_TBL_REPEAT) {
                 if (is_first || !prev->has_lit || prev->lit_form != lit_form ||
                     prev->lit_k != k || prev->n_lit_tbl != n_lit_tbl) {
-                    zgec_free(lt);
+                    if (lt != prev->stack_lit) zgec_free(lt);
                     zgec_dict_seg_release(seg);
                     return ZGEC_ERR_TABLE_INHERIT;
                 }
-                memcpy(lt, prev->lit,
-                       (size_t)n_lit_tbl * sizeof(*lt));
+                if (prev->lit != prev->stack_lit) {
+                    memcpy(lt, prev->lit, (size_t)n_lit_tbl * sizeof(*lt));
+                }
                 rem = 0;
             } else {
                 for (int ti = 0; ti < n_lit_tbl; ti++) {
                     size_t before = rem;
                     e0 = zgec_dict_build_rans(&lt[ti], &dp, &rem);
                     if (e0 != ZGEC_OK || rem == before) {
-                        zgec_free(lt);
+                        if (lt != prev->stack_lit) zgec_free(lt);
                         zgec_dict_seg_release(seg);
                         return e0 != ZGEC_OK ? e0 : ZGEC_ERR_FSE_COUNTS;
                     }
@@ -603,7 +616,7 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
                         size_t nn2 = zgec_varint_decode(
                             dp + used, rem - used, &vs[(unsigned)vi]);
                         if (nn2 == 0) {
-                            zgec_free(lt);
+                            if (lt != prev->stack_lit) zgec_free(lt);
                             zgec_dict_seg_release(seg);
                             return ZGEC_ERR_VARINT;
                         }
@@ -612,7 +625,7 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
                     if (used != rem || vs[0] != sh.lit_size ||
                         vs[1] != sh.ll_size || vs[2] != sh.ml_size ||
                         vs[3] != sh.of_size) {
-                        zgec_free(lt);
+                        if (lt != prev->stack_lit) zgec_free(lt);
                         zgec_dict_seg_release(seg);
                         return ZGEC_ERR_SEGMENT_SIZE;
                     }
@@ -620,11 +633,21 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
             }
         }
         if (seg->n_lit > 0) {
-            uint8_t *rs = (uint8_t *)zgec_alloc(zgec_rs_bytes(seg->n_lit), 1);
+            uint8_t stack_rs[8192];
+            uint8_t *rs = NULL;
+            int rs_owned = 0;
+            size_t rsb = zgec_rs_bytes(seg->n_lit);
+            if (rsb <= sizeof(stack_rs)) {
+                rs = stack_rs;
+                rs_owned = 0;
+            } else {
+                rs = (uint8_t *)zgec_alloc(rsb, 1);
+                if (!rs) { if (lt != prev->stack_lit) zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+                rs_owned = 1;
+            }
             const uint8_t *lit_stream = seg_buf + hdr_size;
-            if (!rs) { zgec_free(lt); zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
             e0 = zgec_lit_runstart(rs, seg->n_lit, NULL, 0);
-            if (e0 != ZGEC_OK) { zgec_free(rs); zgec_free(lt); zgec_dict_seg_release(seg); return e0; }
+            if (e0 != ZGEC_OK) { if (rs_owned) zgec_free(rs); if (lt != prev->stack_lit) zgec_free(lt); zgec_dict_seg_release(seg); return e0; }
             if (k <= 1)
                 e0 = zgec_rans_decode(seg->lit, seg->n_lit, lit_stream,
                                       (size_t)sh.lit_size, lt, 1,
@@ -633,12 +656,13 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
                 e0 = zgec_rans_decode(seg->lit, seg->n_lit, lit_stream,
                                       (size_t)sh.lit_size, lt, k,
                                       ctx_mode, class_map, rs);
-            zgec_free(rs);
-            if (e0 != ZGEC_OK) { zgec_free(lt); zgec_dict_seg_release(seg); return e0; }
+            if (rs_owned) zgec_free(rs);
+            if (e0 != ZGEC_OK) { if (lt != prev->stack_lit) zgec_free(lt); zgec_dict_seg_release(seg); return e0; }
         }
         /* Carry literal tables for REPEAT. */
-        zgec_dict_prev_free(prev);
+        zgec_dict_prev_clear_old(prev);
         prev->lit = lt;
+        prev->lit_owned = (lt != prev->stack_lit);
         prev->n_lit_tbl = n_lit_tbl;
         prev->lit_form = lit_form;
         prev->lit_k = k;
@@ -687,17 +711,26 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
 
         /* Literal tables (omitted when lit_coder == 0). */
         if (lit_coder != 0) {
-            lt = (zgec_rans_dec_table *)zgec_alloc(
-                (size_t)n_lit_tbl * sizeof(*lt), 64);
-            if (!lt) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+            if (n_lit_tbl == 1) {
+                lt = prev->stack_lit;
+            } else {
+                lt = (zgec_rans_dec_table *)zgec_alloc(
+                    (size_t)n_lit_tbl * sizeof(*lt), 64);
+                if (!lt) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+            }
             if (lit_mode == ZGEC_TBL_REPEAT) {
                 if (is_first || !prev->has_lit || prev->lit_form != lit_form ||
                     prev->lit_k != k || prev->n_lit_tbl != n_lit_tbl) {
-                    zgec_free(lt);
+                    if (lt != prev->stack_lit) zgec_free(lt);
                     zgec_dict_seg_release(seg);
                     return ZGEC_ERR_TABLE_INHERIT;
                 }
-                memcpy(lt, prev->lit, (size_t)n_lit_tbl * sizeof(*lt));
+                if (prev->lit == prev->stack_lit) {
+                    lt = prev->stack_lit;
+                    memcpy(lt, prev->stack_lit, sizeof(*lt));
+                } else {
+                    memcpy(lt, prev->lit, (size_t)n_lit_tbl * sizeof(*lt));
+                }
             } else {
                 for (ti = 0; ti < n_lit_tbl; ti++) {
                     derr = zgec_dict_build_rans(&lt[ti], &dp, &rem);
@@ -898,9 +931,18 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         }
 
         /* Run-start bitmap (section 9.3, incl. tail start). */
+        uint8_t stack_rs[8192];
+        int rs_owned = 0;
         if (seg->n_lit > 0) {
-            rs = (uint8_t *)zgec_alloc(zgec_rs_bytes(seg->n_lit), 1);
-            if (!rs) { derr = ZGEC_ERR_NOMEM; goto lit_seq_fail; }
+            size_t rsb = zgec_rs_bytes(seg->n_lit);
+            if (rsb <= sizeof(stack_rs)) {
+                rs = stack_rs;
+                rs_owned = 0;
+            } else {
+                rs = (uint8_t *)zgec_alloc(rsb, 1);
+                if (!rs) { derr = ZGEC_ERR_NOMEM; goto lit_seq_fail; }
+                rs_owned = 1;
+            }
             derr = zgec_lit_runstart(rs, seg->n_lit, seg->ll, seg->n_seq);
             if (derr != ZGEC_OK) goto lit_seq_fail;
         }
@@ -925,7 +967,7 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
                 if (derr != ZGEC_OK) goto lit_seq_fail;
             }
         }
-        zgec_free(rs);
+        if (rs_owned) zgec_free(rs);
         rs = NULL;
 
         /* Repeat offsets from (1,4,8); record rep0_before + tail (8.2). */
@@ -962,9 +1004,10 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
 
         /* Carry tables for REPEAT (section 7.4). Raw segments carry
          * only sequence tables; rANS segments carry both. */
-        zgec_dict_prev_free(prev);
+        zgec_dict_prev_clear_old(prev);
         if (lit_coder != 0) {
             prev->lit = lt;
+            prev->lit_owned = (lt != prev->stack_lit);
             lt = NULL;
             prev->n_lit_tbl = n_lit_tbl;
             prev->lit_form = lit_form;
@@ -1010,8 +1053,8 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         return ZGEC_OK;
 
 lit_seq_fail:
-        zgec_free(rs);
-        zgec_free(lt);
+        if (rs_owned) zgec_free(rs);
+        if (lt != prev->stack_lit) zgec_free(lt);
         for (ti = 0; ti < 3; ti++) {
             if (ti < n_ll && llt[ti]) zgec_fse_free_dec(llt[ti]);
             if (ti < n_of && oft[ti]) zgec_fse_free_dec(oft[ti]);
