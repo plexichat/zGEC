@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdio.h> /* Linux physical-core probe reads sysfs */
 #include <stdlib.h>
 #include <string.h>
@@ -170,8 +171,8 @@ static ZGEC_ALLOC_TLS struct zgec_pool_slot zgec_pool[ZGEC_POOL_SLOTS];
 static ZGEC_ALLOC_TLS unsigned zgec_pool_n;
 
 /* Smallest cached block that can hold `total`, removed from the cache, or
-   NULL if none fits. */
-static void *zgec_pool_take(size_t total)
+   NULL if none fits. Returns physical capacity in *out_cap if non-NULL. */
+static void *zgec_pool_take(size_t total, size_t *out_cap)
 {
     unsigned i;
     unsigned best = ZGEC_POOL_SLOTS;
@@ -185,6 +186,7 @@ static void *zgec_pool_take(size_t total)
     if (best == ZGEC_POOL_SLOTS) return NULL;
     {
         void *raw = zgec_pool[best].raw;
+        if (out_cap) *out_cap = zgec_pool[best].total;
         zgec_pool[best] = zgec_pool[--zgec_pool_n];
         return raw;
     }
@@ -193,6 +195,17 @@ static void *zgec_pool_take(size_t total)
 /* Offer a block to the cache; returns 0 if it was not taken (caller frees). */
 static int zgec_pool_put(void *raw, size_t total)
 {
+    unsigned i;
+    if (!raw) return 0;
+    /* Guard against duplicate pointer / double free in thread-local pool */
+    for (i = 0; i < zgec_pool_n; i++) {
+        if (zgec_pool[i].raw == raw) {
+#ifndef NDEBUG
+            assert(0 && "zgec_pool: duplicate pointer in zgec_pool_put");
+#endif
+            return 0;
+        }
+    }
     if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
     zgec_pool[zgec_pool_n].raw = raw;
     zgec_pool[zgec_pool_n].total = total;
@@ -238,6 +251,7 @@ void *zgec_alloc(size_t n, size_t align)
 {
     size_t prefix;
     size_t total;
+    size_t header_total;
     void *raw;
     uintptr_t base;
     uintptr_t aligned;
@@ -251,10 +265,11 @@ void *zgec_alloc(size_t n, size_t align)
     prefix = 2u * sizeof(void *) + align - 1;
     if (zgec_add_overflows(n, prefix)) return NULL;
     total = n + prefix;
-    raw = zgec_pool_take(total);
+    raw = zgec_pool_take(total, &header_total);
     if (!raw) {
         raw = malloc(total);
         if (!raw) return NULL;
+        header_total = total;
     }
     base = (uintptr_t)raw;
     if (__builtin_add_overflow(base, prefix, &sum)) {
@@ -263,7 +278,10 @@ void *zgec_alloc(size_t n, size_t align)
     }
     aligned = sum & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
-    ((size_t *)aligned)[-2] = total;
+    ((size_t *)aligned)[-2] = header_total;
+#ifndef NDEBUG
+    assert(((size_t *)aligned)[-2] >= n + prefix);
+#endif
     return (void *)aligned;
 }
 

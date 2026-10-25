@@ -82,3 +82,10 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-25 - Pool Hardening, Capacity Preservation, and Table Pointer Audit
+Learning:
+1. In `src/common.c`, `zgec_alloc` previously overwrote `((size_t *)aligned)[-2]` with the smaller requested size `n + prefix` when reusing cached blocks from `zgec_pool_take`. On subsequent calls to `zgec_free`, this caused recorded block total sizes to shrink artificially towards `ZGEC_POOL_MIN`, preventing reuse of larger blocks up to their true physical capacity. Preserving `header_total` (the physical capacity) across reuse cycles maintains accurate block capacity tracking. Furthermore, linear duplicate-pointer scans in `zgec_pool_put` guard against double-frees and ensure blocks cannot be handed to multiple owners.
+2. In `src/fse.c`, `zgec_fse_enc_pool` was previously an unbounded singly-linked list. Bounding the slot count to `ZGEC_FSE_POOL_SLOTS` (8 slots, <= 32 MiB) prevents unbounded thread-local memory retention. Using `((size_t *)t)[-2]` from `zgec_alloc`'s header in `zgec_fse_enc_rent` safely recovers physical capacity without depending on `t->al` or `t->nsym`, and linear checks in `zgec_fse_enc_return` prevent double-free cycles.
+3. In `src/encode.c`, setting freed FSE table pointers (`enc_ll`, `dec_ll`, `enc_ml`, `dec_ml`, `enc_of`, `dec_of`, `enc_ll3[ci]`, `dec_ll3[ci]`, `enc_of3[ci]`, `dec_of3[ci]`) to `NULL` immediately after `zgec_fse_free_enc`/`zgec_fse_free_dec` in `seg_fail_tables` ensures error paths cannot re-free live tables.
+Action: Preserve physical block capacities in `zgec_alloc`, bound thread-local pools with duplicate checks, and NULL table pointers immediately after freeing in error handlers.
