@@ -918,3 +918,13 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-25 - Literal Context Body Bits AVX2 Parallel Accumulation and Pre-Shifted Group Offsets
+
+**Learning:**
+1. In `zgec_ctx_body_bits` (`src/encode.c`), evaluating order-0 single context literal streams (`k <= 1` without runstarts) previously ran through a scalar context lookup loop (`grp_lut[z[j-1]]`). Adding an 8-bank parallel uint32_t frequency accumulator (`c0`..`c7`) combined with 256-bit AVX2 SIMD additions (`_mm256_add_epi32`) accelerates single-context histogram generation.
+2. In multi-context streams (`k > 1`), precomputing pre-shifted group offsets (`grp_offset[b] = (uint32_t)grp * 256u`) eliminates 256-stride multiplication math per byte in the inner loop.
+3. Deferring group symbol totals (`grp_total`) to `zgec_enc_entropy_bits_u32` (via `ZGEC_ENC_TOTAL_UNKNOWN`) eliminates loop-carried scalar additions and store-forwarding stalls inside the 8-unrolled inner loop, improving multi-threaded encoding throughput from 386.9 MB/s to 459.5 MB/s (+18.8%).
+
+**Action:**
+In literal context entropy estimators, separate the `k <= 1` order-0 fast path using 8-bank parallel accumulators, pre-shift context group offsets, and defer symbol total summations to AVX2 vector reduction routines.
