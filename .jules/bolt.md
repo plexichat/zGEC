@@ -918,3 +918,13 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-22 - Phase B Match Copy Acceleration, AVX2 Sequence Vectorization, and 8-Lane rANS Decode Optimization
+
+**Learning:**
+1. In LZ77 decompression Phase B (`exec_block` in `src/decode.c`), adding fast match copy handling for 3-byte offsets (`moff == 3 && mlen >= 8`) with unrolled 24-byte pattern expansion via 64-bit unaligned stores (`v0`, `v1`, `v2`) bypasses slow modulo byte copies. Adding 16-byte chunk copies for `moff >= 8 && mlen <= 16` (`zgec_wr64(d, ...)` and `zgec_wr64(d + mlen - 8, ...)`) and delegating `moff >= 4 && mlen > 8` to `exec_match_wide` accelerates match copying across all sequence streams.
+2. Vectorizing sequence length adjustments (`seg->of[i] += 1`, `seg->ml[i] += 3`), sequence field summations (`sum_ll`, `sum_ml`), and match class table generation (`clsbuf`) in `seq_decode_cond` using 256-bit AVX2 SIMD instructions (`_mm256_add_epi32`, `_mm256_cvtepu32_epi64`, `_mm256_add_epi64`, `_mm256_cmpgt_epi32`) accelerates segment stream decoding.
+3. In `zgec_rans_decode` (`src/rans.c`), hoisting 8-lane rANS state transitions into scalar registers (`st0..st7`, `s0..s7`) and consolidating zero-symbol validity checks per round (`if (!f0 || !f1 || ...)`) eliminates array indexing overhead and improves ILP across 8 parallel rANS decoding lanes.
+
+**Action:**
+In Phase B LZ77 match copy dispatches, use 24-byte pattern expansions for `moff == 3` and 16-byte chunk copies for short non-overlapping matches (`moff >= 8`). Vectorize sequence length adjustments and summations with AVX2 SIMD, and hoist multi-lane rANS state variables into scalar registers during decoding.
