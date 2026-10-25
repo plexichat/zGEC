@@ -918,3 +918,13 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-25 - Sub-Literal Residual Buffer Reuse and Sequence Buffer Allocation Elimination
+
+**Learning:**
+1. In `zgec_encode_block_full` (`src/encode.c`), when sub-literal prediction is enabled (levels 6+), the block-level sub-literal residual buffer `rb` was previously computed for context training and then freed. Later, during parallel segment encoding, `zgec_seg_prep_build` allocated heap memory and re-computed sub-literal residuals (`zgec_enc_build_resid`) for every segment.
+2. Retaining `block_rb` until segment preparation completes and passing it via `sp.block_rb` allows `zgec_seg_prep_build` to borrow slices (`block_rb + l0`, with `p->resid_owned = 0`) directly, eliminating per-segment memory allocations (`zgec_alloc`) and redundant `zgec_enc_build_resid` calculations.
+3. Using stack fallback buffers (`stack_ll`, `stack_ml`, `stack_tr0`) for sequence counts `nn <= 2048` during block context training eliminates per-segment allocation churn.
+
+**Action:**
+When block-level buffers are already computed during training or context selection, retain the buffer across segment preparation jobs to allow segment tasks to reference slices directly instead of re-allocating and re-computing them.
