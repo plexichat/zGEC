@@ -694,7 +694,9 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         const uint8_t *ll_stream;
         const uint8_t *ml_stream;
         const uint8_t *of_stream;
+        uint8_t stack_rs[8192];
         uint8_t *rs = NULL;
+        int rs_owned = 0;
         uint64_t ll_sum = 0;
         uint64_t ml_sum = 0;
         zgec_err derr = ZGEC_OK;
@@ -931,8 +933,6 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         }
 
         /* Run-start bitmap (section 9.3, incl. tail start). */
-        uint8_t stack_rs[8192];
-        int rs_owned = 0;
         if (seg->n_lit > 0) {
             size_t rsb = zgec_rs_bytes(seg->n_lit);
             if (rsb <= sizeof(stack_rs)) {
