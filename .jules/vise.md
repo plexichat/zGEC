@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Decoder Hot-Path Stack Fallbacks for Single-Context rANS Tables, Descriptors, and Block Arrays
+Learning: Dynamic heap allocation churn on the decompression hot path was driven by several recurring per-segment and per-block allocations: 8 KiB rANS single-context decoding tables (`n_lit_tbl == 1`), table descriptor array headers (`new_descs`), frame export cache slots (`c->slot`), frame block worker arrays (`off`, `sz`, `ws`, `jobs`), and literal reference gathering buffers (`litref`). Embedding bounded 64-byte aligned stack fallback buffers (`_Alignas(64) stack_lit[1]` in `seg_tables`/`zgec_dict_prev`, `stack_descs[4]` in `seg_hdr_t`, `stack_slot[64]` in `zgec_export_cache`, `stack_litref[8192]`, `stack_off[64]`, `stack_sz[64]`, `stack_ws[64]`, and `stack_jobs[64]`) with explicit ownership flags completely eliminates dynamic memory allocation overhead during frame and segment decoding without exceeding thread stack limits or compromising memory safety.
+Action: Use embedded 64-byte SIMD-aligned stack fallback buffers for single-context entropy decoding tables, descriptor headers, and bounded per-frame block worker metadata during decompression.
