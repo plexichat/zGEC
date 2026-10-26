@@ -1612,7 +1612,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
         if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
             cur_len <= PARSE_LAZY_MAX_LEN &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
-            uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
+            uint32_t min_lazy_len = (cur_score > 0.0f) ? ((uint32_t)(cur_score / lbar) + 1u) : 4u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;
             uint32_t nrep_len[3] = { 0u, 0u, 0u };
             zgec_match nm = zgec_matcher_find_lens(m, vb, ip + (size_t)1,

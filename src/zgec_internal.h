@@ -32,6 +32,10 @@ typedef struct { pthread_mutex_t mu; int ok; } zgec_mu;
 
 #if defined(__APPLE__)
 #include <sys/types.h>
+typedef unsigned int u_int;
+typedef unsigned char u_char;
+typedef unsigned short u_short;
+typedef unsigned long u_long;
 #include <sys/sysctl.h> /* sysctlbyname, for zgec_cpu_count */
 #endif
 
