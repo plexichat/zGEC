@@ -1868,23 +1868,43 @@ static zgec_err exec_block(zgec_block_arrays *ba)
                      * before the match, so the byte-at-a-time order is
                      * one memset. msrc == d - 1 is in bounds. */
                     memset(d, msrc[0], mlen);
+                } else if (moff == 3 && raw_size > 64) {
+                    uint8_t s0 = msrc[0], s1 = msrc[1], s2 = msrc[2];
+                    uint64_t w0 = (uint64_t)s0 | ((uint64_t)s1 << 8) | ((uint64_t)s2 << 16) | ((uint64_t)s0 << 24) |
+                                  ((uint64_t)s1 << 32) | ((uint64_t)s2 << 40) | ((uint64_t)s0 << 48) | ((uint64_t)s1 << 56);
+                    uint64_t w1 = (uint64_t)s2 | ((uint64_t)s0 << 8) | ((uint64_t)s1 << 16) | ((uint64_t)s2 << 24) |
+                                  ((uint64_t)s0 << 32) | ((uint64_t)s1 << 40) | ((uint64_t)s2 << 48) | ((uint64_t)s0 << 56);
+                    uint64_t w2 = (uint64_t)s1 | ((uint64_t)s2 << 8) | ((uint64_t)s0 << 16) | ((uint64_t)s1 << 24) |
+                                  ((uint64_t)s2 << 32) | ((uint64_t)s0 << 40) | ((uint64_t)s1 << 48) | ((uint64_t)s2 << 56);
+                    size_t i = 0;
+                    while (i + 24 <= mlen) {
+                        zgec_wr64(d + i, w0);
+                        zgec_wr64(d + i + 8, w1);
+                        zgec_wr64(d + i + 16, w2);
+                        i += 24;
+                    }
+                    if (i < mlen) {
+                        zgec_wr64(d + i, w0);
+                        if (i + 8 < mlen) {
+                            zgec_wr64(d + i + 8, w1);
+                            if (i + 16 < mlen) {
+                                zgec_wr64(d + i + 16, w2);
+                            }
+                        }
+                    }
                 } else if (moff >= 8 && mlen <= 32 && raw_size > 64) {
-                    /* 1..32 bytes with off >= 8: four 8-byte chunks,
-                     * branch-free. Chunk k reads [d-off+8k, d-off+8k+8)
-                     * and writes [d+8k, d+8k+8): off >= 8 puts the source
-                     * before the destination of the same chunk, and the
-                     * bytes above d come from the earlier chunks, so the
-                     * result matches the byte-at-a-time order. Bytes past
-                     * the match end are written but never read: outside
-                     * the last-64 window every position below raw_size is
-                     * claimed and rewritten by a later sequence before
-                     * the buffer is read (the near-end guard above keeps
-                     * the last 64 exact, and raw_size > 64 is checked
-                     * here because that guard is what proves the slack). */
-                    zgec_wr64(d, zgec_rd64(msrc));
-                    zgec_wr64(d + 8, zgec_rd64(msrc + 8));
-                    zgec_wr64(d + 16, zgec_rd64(msrc + 16));
-                    zgec_wr64(d + 24, zgec_rd64(msrc + 24));
+                    /* 1..32 bytes with off >= 8: direct 64-bit word stores */
+                    if (mlen <= 8) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                    } else if (mlen <= 16) {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                        zgec_wr64(d + 8, zgec_rd64(msrc + 8));
+                    } else {
+                        zgec_wr64(d, zgec_rd64(msrc));
+                        zgec_wr64(d + 8, zgec_rd64(msrc + 8));
+                        zgec_wr64(d + 16, zgec_rd64(msrc + 16));
+                        zgec_wr64(d + 24, zgec_rd64(msrc + 24));
+                    }
                 } else if (moff >= 32 && mlen >= 32) {
                     exec_match_wide(d, msrc, mlen, 32);
                 } else if (moff >= 16 && mlen >= 16) {
