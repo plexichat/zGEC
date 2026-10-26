@@ -196,10 +196,10 @@ void zgec_lit_bounds(const zgec_parse *p,
         size_t i = start_seq;
 #if defined(__AVX2__)
         __m256i vsum = _mm256_setzero_si256();
+        const __m256i v_offsets = _mm256_set_epi32(84, 72, 60, 48, 36, 24, 12, 0);
         while (i + 8 <= end_seq) {
             const zgec_sequence *q = &p->seq[i];
-            __m256i v_ll = _mm256_set_epi32((int)q[7].ll, (int)q[6].ll, (int)q[5].ll, (int)q[4].ll,
-                                            (int)q[3].ll, (int)q[2].ll, (int)q[1].ll, (int)q[0].ll);
+            __m256i v_ll = _mm256_i32gather_epi32((const int *)(const void *)&q->ll, v_offsets, 1);
             vsum = _mm256_add_epi32(vsum, v_ll);
             i += 8;
         }
@@ -344,8 +344,13 @@ static float parse_lbar(const uint32_t *lit_hist, size_t total)
     float log2_t = log2f(t);
 #if defined(__AVX2__)
     __m256 vprior = _mm256_set1_ps(PARSE_LBAR_PRIOR);
+    float zero_block_bits = 8.0f * PARSE_LBAR_PRIOR * (log2_t - log2f(PARSE_LBAR_PRIOR));
     for (; s + 8 <= 256; s += 8) {
         __m256i vhist = _mm256_loadu_si256((const __m256i *)(const void *)(lit_hist + s));
+        if (_mm256_testz_si256(vhist, vhist)) {
+            bits += zero_block_bits;
+            continue;
+        }
         __m256 vc = _mm256_add_ps(_mm256_cvtepi32_ps(vhist), vprior);
         float c_arr[8];
         _mm256_storeu_ps(c_arr, vc);
