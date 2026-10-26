@@ -28,6 +28,10 @@ Makefile
 
 # Test / debug run artifacts
 *.zgec
+*.txt
+*.tmp
+*.dat
+callgrind.out*
 gmon.out
 silesia/
 silesia.zip
