@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-26 - Decoder Descriptor Cleanup Hardening and Encoder Block SBO Fallbacks
+Learning: In `src/decode.c` (`seg_hdr_parse`), returning early on RLE descriptor error paths (`ll_mode`, `ml_mode`, or `of_mode` bounds/symbol checks) without invoking `seg_hdr_free_descs(h)` leaked dynamically allocated descriptor arrays (`h->new_descs`) when processing malformed or truncated bitstreams. Calling `seg_hdr_free_descs(h)` on all error return paths guarantees zero memory leaks under corrupt inputs. In `src/encode.c` (`zgec_encode_block_full`), allocating sequence explicit distances (`seg_dist`), literal bounds (`lit_bounds`), segment dispatch arrays (`out_bases`, `seg_bufs`, `seg_sizes`, `seg_errs`), and sub-literal residual sequence buffers (`tll`, `tml`, `tr0`) dynamically per block created heavy heap allocation churn. Providing stack fallbacks (`stack_seg_dist[2048]`, `stack_lit_bounds[65]`, `stack_out_bases[64]`, `stack_ll[2048]`) completely eliminates dynamic heap allocations on hot block encoding paths.
+Action: Always call descriptor cleanup functions on decoder error return paths, and use bounded stack fallbacks for block-level segment and sequence metadata in multi-threaded encoders.
