@@ -918,3 +918,13 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-24 - Context Clustering, Candidate Flag Scan and 2-Pass Class Histogram Optimizations
+
+**Learning:**
+1. In `zgec_cluster_greedy`, copying class rows into scratch arrays and accumulating horizontal symbol counts can be vectorized 4-wide over 256 symbols using 256-bit AVX2 SIMD (`_mm256_loadu_si256`, `_mm256_storeu_si256`, `_mm256_add_epi32`). Short-circuiting candidate delta calculation and SIMD merges when class counts (`ctot`) are zero avoids unnecessary entropy calculations and 256-element vector additions for empty classes.
+2. In `zgec_select_contexts`, splitting the 4-way class histogram accumulation loop into two 2-way passes (`h0`+`h1` and `h2`+`h3`) reduces L1 write stream thrashing and store-to-load forwarding stalls.
+3. In `zgec_select_coder`, checking `rep0_before[t] < 32u` for `slow_sublit` flag evaluation with an immediate early break avoids scanning remaining sequences in a segment.
+
+**Action:**
+When evaluating multi-context or sub-literal entropy models in zGEC block encoding, split 4-way class histogram writes into two 2-way passes and short-circuit zero-total class merges.
