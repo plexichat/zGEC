@@ -876,12 +876,6 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
             unsigned nb;
             uint64_t w;
 
-            /* refill to 56..63 bits, branchless: the top-up width is
-             * zero when nacc is already >= 56, so the OR is masked off
-             * and nacc/ptr/left stay put. The load runs unconditionally,
-             * which the loop's left > 16u guard keeps in bounds; the bit
-             * pattern of nacc < 56 is data dependent, so trading the
-             * branch for a mask is cheaper than the mispredicts. */
             w = zgec_rd64(ptr - 7);
             nb = (63u - nacc) >> 3;
             {
@@ -927,12 +921,10 @@ zgec_err zgec_fse_decode(const zgec_fse_dec_table *t, zgec_br *br,
 
             if (nbits != NULL) xb = (unsigned)e->pad;
 
-            /* refill to 56..63 bits, branchless (mask as above) */
-            w = zgec_rd64(ptr - 7);
-            nb = (63u - nacc) >> 3;
-            {
-                uint64_t m = (uint64_t)0 - (uint64_t)(nacc < 56u);
-                acc |= (w >> nacc) & m;
+            if (nacc < 56u) {
+                nb = (63u - nacc) >> 3;
+                w = zgec_rd64(ptr - 7);
+                acc |= w >> nacc;
                 nacc += 8u * nb;
                 ptr -= nb;
                 left -= nb;

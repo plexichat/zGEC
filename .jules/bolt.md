@@ -918,3 +918,14 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-26 - Decoder SIMD Vectorization, Match/Literal Copy Dispatch, and rANS ILP Unrolling
+
+**Learning:**
+1. In `src/decode.c` (`exec_block`), short literal runs (`ll <= 32`) and non-overlapping matches were incurring function call overhead or scalar loops. Direct 8/16/32-byte SIMD writes outside the last-64 output window for short literals (`ll <= 32`), 24-byte 64-bit pattern expansion stores for `moff == 3`, 4-byte chunk stores for `moff == 4..7`, and 1x/2x/4x 64-bit stores for `moff >= 8` short match lengths significantly accelerate Phase B execution.
+2. In `src/decode.c` (`seq_decode_cond`), precomputing match class buffers (`clsbuf`) was running in a scalar loop. Vectorizing `zgec_mlclass` evaluations 8 elements at a time using 256-bit AVX2 SIMD (`_mm256_cmpgt_epi32` against thresholds 6 and 18, `_mm_packs_epi32`, and `_mm_packus_epi16`) removes loop overhead.
+3. In `src/decode.c` (`decode_segment_streams`), sequence length adjustments (`ml[i] += 3`, `of[i] += 1`) and sequence field summations (`sum_ml`, `sum_ll`) are vectorized 8 elements at a time using 256-bit AVX2 SIMD with `0x80000000u` XOR bias mapping for unsigned comparisons.
+4. In `src/rans.c` (`zgec_rans_decode`), 8-lane state transitions during full rounds (`round < full`) for single-context (`k = 1`) and multi-context (`k > 1`, `!has_rs`) literal streams were unrolled into scalar register variables (`x0..x7`) with consolidated validity checks (`!f0 || !f1 || ...`), maximizing instruction-level parallelism.
+
+**Action:**
+Use 256-bit AVX2 SIMD for sequence array adjustments and class buffer precomputation, unroll independent multi-lane rANS state transitions into scalar register variables, and implement specialized chunked copy dispatches in Phase B decompression.
