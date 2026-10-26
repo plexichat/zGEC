@@ -394,6 +394,12 @@ static void cli_apply_level(zgec_params *p, int level)
      * uses, through the two-table fast parser's shed-feature rungs. See
      * zgec_parse_block_dial. */
     p->fast_dial = (level >= 1 && level <= 3) ? (5 - level) : 0;
+    if (level >= 15) {
+        int lm = 16 << (level - 15);
+        p->lazy_max = (lm > 1024) ? 1024 : lm;
+    } else {
+        p->lazy_max = 0;
+    }
 }
 
 static int cli_tier(const char *s, zgec_tier *out)
