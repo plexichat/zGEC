@@ -335,8 +335,22 @@ void zgec_lit_sub_reconstruct(uint8_t *Z,
     for (size_t i = 0; i < n_seq; i++) {
         uint32_t rep0 = rep0_before[i];
         size_t runlen = (size_t)ll[i];
+        size_t t = 0;
 
-        for (size_t t = 0; t < runlen && pos < n_lit; t++, pos++) {
+#if defined(__AVX2__)
+        if (rep0 >= 32u) {
+            while (t + 32u <= runlen && pos + 32u <= n_lit && (size_t)rep0 <= vbpos + pos) {
+                __m256i vz = _mm256_loadu_si256((const __m256i *)(const void *)(Z + pos));
+                __m256i vp = _mm256_loadu_si256((const __m256i *)(const void *)(Z + (ptrdiff_t)pos - (ptrdiff_t)rep0));
+                __m256i vres = _mm256_add_epi8(vz, vp);
+                _mm256_storeu_si256((__m256i *)(void *)(Z + pos), vres);
+                t += 32u;
+                pos += 32u;
+            }
+        }
+#endif
+
+        for (; t < runlen && pos < n_lit; t++, pos++) {
             size_t cur = vbpos + pos;
             uint8_t pred;
             if (rep0 == 0u || (size_t)rep0 > cur) {
@@ -354,8 +368,22 @@ void zgec_lit_sub_reconstruct(uint8_t *Z,
         if (n_seq > 0) {
             rep0 = rep0_before[n_seq];
         }
+        size_t t = 0;
 
-        for (size_t t = 0; t < tail && pos < n_lit; t++, pos++) {
+#if defined(__AVX2__)
+        if (rep0 >= 32u) {
+            while (t + 32u <= tail && pos + 32u <= n_lit && (size_t)rep0 <= vbpos + pos) {
+                __m256i vz = _mm256_loadu_si256((const __m256i *)(const void *)(Z + pos));
+                __m256i vp = _mm256_loadu_si256((const __m256i *)(const void *)(Z + (ptrdiff_t)pos - (ptrdiff_t)rep0));
+                __m256i vres = _mm256_add_epi8(vz, vp);
+                _mm256_storeu_si256((__m256i *)(void *)(Z + pos), vres);
+                t += 32u;
+                pos += 32u;
+            }
+        }
+#endif
+
+        for (; t < tail && pos < n_lit; t++, pos++) {
             size_t cur = vbpos + pos;
             uint8_t pred;
             if (rep0 == 0u || (size_t)rep0 > cur) {
