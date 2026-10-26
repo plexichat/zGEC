@@ -1314,7 +1314,8 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
                           const uint8_t *dict, size_t dict_size,
                           const uint8_t *litref, size_t litref_size,
-                          zgec_tier tier, double lambda, int fast_dial)
+                          zgec_tier tier, double lambda, int fast_dial,
+                          int lazy_max)
 {
     if (!out) return ZGEC_ERR_INVAL;
     /* Never leave a stale pointer behind on the failure paths below. */
@@ -1609,8 +1610,9 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
         /* Lazy evaluation at ip + 1, driven by the
          * same price score and selected with a
          * conditional move on the score. */
-        if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
-            cur_len <= PARSE_LAZY_MAX_LEN &&
+        uint32_t lazy_max_len = (lazy_max > 0) ? (uint32_t)lazy_max : PARSE_LAZY_MAX_LEN;
+        if (lazy_max_len > 0u && cur_len > 0u &&
+            cur_len <= lazy_max_len &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;
@@ -1805,5 +1807,5 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                           zgec_tier tier, double lambda)
 {
     return zgec_parse_block_dial(out, src, raw_size, dict, dict_size,
-                                 litref, litref_size, tier, lambda, 0);
+                                 litref, litref_size, tier, lambda, 0, 0);
 }
