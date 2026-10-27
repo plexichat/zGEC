@@ -918,3 +918,111 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-27 — triage of the 83 new remote branches
+
+One accepted change; everything else rejected with a reason. The box was quiet
+for all measurements (pinned -T1 on CPU 9, on-CPU cycles, interleaved pairs).
+
+ACCEPTED (426fc44): reuse the block sub-literal residual across segment prep
+(bolt-sublit-residual-reuse-opt-3186615715539687738). The block residual D6
+already builds for context training is kept alive and each segment borrows
+block_rb + literal offset instead of rebuilding it into a fresh allocation;
+zgec_seg_prep gets a resid_owned flag so the borrowed slice is not freed.
+Byte-identical at all pinned levels, l7 SHA unchanged, ctest 4/4.
+Pinned A/B 7 pairs, cycles: l6 -3.51% min / -3.45% median (7/7), l7 -0.48% /
+-1.45% (6/7), l5 +0.05% / -0.61% (3/7). Best per-level wall-clock swing at the
+end of the ladder: l10 +9.2%, l7 +3.9%, l6 +3.6%.
+
+REJECTED ON MEASUREMENT (byte-identical, no clean win):
+- bolt-rans-encode-ilp-opt-4837357691360075786: compute the eight CORE results
+  before writing any word (kills the serial off += nd chain). 11 pairs:
+  l5 min +2.48% (1/11), l6 min +0.12% / median +0.69% (6/11). Revert.
+- perf-avx2-lit-sub-and-rs-check-9149768304684681786: skip zgec_rs_get when the
+  runstart byte is zero (plus idx_lut histogram). 7 pairs: l5 +0.65% min (2/7),
+  l6 +0.29% min / +3.95% median (3/7). Revert.
+- jules-766560588384388724-73c2d766: zero-total class short-circuit in
+  zgec_cluster_greedy. 9 pairs: l5 -1.18% min (5/9), l6 +0.27% min (3/9).
+  Inconsistent, under the bar. Revert.
+- bolt-encode-simd-seq-10388098753882553791: vpgatherdd + packus for the eight
+  literal stream symbols. 9 pairs: l6 min +2.19% (3/9). Gather on Zen 3 is
+  slower than eight LUT loads, as expected. Revert.
+- jules-10255497313521071875-f33c3d31: 8x rd64 unroll of the parser literal
+  histogram. 9 pairs: l4 min +3.67% (1/9). A single shared table with eight
+  increments still serialises on store-to-load forwarding. Revert.
+- bolt-match-bucket-tag-check-opt-7810206319205787732 and the match tag +
+  rotation hunk in perf/fast-parse-and-simd-probe-opt: byte-identical but
+  -0.33% median at l7 (6/9) for a doubled mf_bucket_hits body. Revert.
+- The "split the fused 4-table select_contexts histogram into 2-way passes"
+  family (bolt/avx2-ctx-body-bits-opt-12245133083373002612,
+  bolt-context-histogram-avx2-opt, bolt-encode-simd-seq's encode.c hunk,
+  avx2-order0-context-eval-opt, avx2-encode-* etc.): same mechanism as the
+  four-pass split already measured at l5 +4.53% / l6 +7.30%; the shift instead
+  of multiply addressing is a no-op. Reject without a fresh run.
+
+REJECTED: CHANGES THE OUTPUT (pinned sizes move):
+- perf/fast-parse-and-simd-probe-opt-15873013203331910245 and
+  bolt-encode-throughput-opt-5086947002786071052: capping interior insertion
+  span (ZGEC_FAST_INS_SPAN 128/256) changes which matches the fast tier finds:
+  l1 unchanged but l4 65,065,617 (pin 65,059,955) and l6 63,204,503
+  (pin 63,199,065), i.e. -0.009% ratio for a claimed +20-25% speed. The speed
+  number is real and large; the ratio change is the deal-breaker. A future
+  version would need a price-gated accept so the capped inserts cannot lose.
+- Level-ladder / lazy-max / high-tier candidate branches
+  (bolt/high-tier-preset-ladder-*, bolt/opt-high-levels-lazy-max-*,
+  jules-6581123340553178971-*, perf/high-tier-level-scaling-*): change preset
+  definitions, i.e. output by design.
+
+REJECTED: SUPERSEDED OR EMPTY:
+- avx2-encode-path-simd-opt-16308059259113919190,
+  bolt-opt-seg-prep-histogram-accumulation-10614563276623186825,
+  bolt/encode-avx2-audit-verify-17512270635402491956: zero diff vs main.
+- bolt-opt-reuse-block-sublit-resid-buffer-*,
+  bolt-sublit-resid-buffer-reuse-*, bolt-sublit-residual-reuse-opt-17919738974042651688,
+  bolt/block-sublit-residual-reuse-*: the same residual-reuse idea in older or
+  larger form; the accepted variant is the smallest complete one.
+- vise-exact-context-cost-and-stack-fallbacks-*: the exact multi-context header
+  cost is already a365f84.
+- bolt-opt-dec-cache-rans-unroll-*, bolt-opt-rans-decode-unroll-*, and every
+  other 8-lane rANS decode unroll: decode-side, and a365f84/f276867 already
+  cover the encode side.
+
+REJECTED: NOT SPEED (allocator hardening, stack fallbacks, leak audits, CI):
+vise-pool-hardening-* (3), vise-1-decode-stack-alloc-* (3),
+vise-2-pool-hardening-audit-*, vise-decode-stack-fallbacks-*,
+vise-decoder-stack-fallbacks-*, vise-stack-fallback-buffers-*,
+vise-decoder-leak-fix-and-encoder-sbo-*, jules-13906346593682127824-*,
+jules-16465769277812124083-*, jules-16667722021506175466-*,
+jules-13222170761254327584-* (UBSan/LeakSanitizer/macOS CI). Correctness and
+hygiene work, not throughput; main already carries the stack-buffer wins.
+
+REJECTED: DECODE-ONLY (out of scope for the encode throughput goal):
+bolt-avx2-decode-*, bolt-decode-*, bolt/avx2-decode-*, bolt-opt-rans-decode-*,
+jules-10207686664027492687-*, jules-7368521922566503819-*,
+jules-989631382241814899-*, jules-decode-opt-task6-*,
+jules-decode-throughput-opt-*, jules-export-cache-opt-*,
+opt-decode-match-copy-fse-build-*, optimize-decoder-rans-unroll-*,
+perf/avx2-decode-optimization-*, perf-avx2-lit-sub-and-rs-check's lit.c hunk.
+The encode-side hunk of the last one was measured above and lost.
+
+Encode-side families that were checked and are just AVX2 variants of already
+measured shapes: bolt/avx2-encode-path-simd-opt, bolt/avx2-encode-throughput-opt,
+bolt-avx2-simd-encoder-opt, bolt-opt-avx2-encode-unrolling, bolt-simd-encode-opt,
+avx2-encode-hotpath-opt, avx2-encode-optimization-*, avx2-encode-throughput-opt,
+bolt-encode-fse-ctx-opt (adds a prescan pass over the whole FSE row -- the
+"per-row pad prescan" already rejected), bolt/fse-ctx-encode-opt, and
+perf/encode-avx2-fse-opt (same branch content).
+
+Throughput after the triage (211.9 MB silesia, single-thread, pinned, MB/s
+decimal, best of 3, before = 1b2a7eb):
+  l1 241.8 -> 239.7   l2 179.0 -> 180.9   l3 140.8 -> 141.3
+  l4 110.0 -> 111.7   l5  88.2 ->  89.3   l6  68.8 ->  71.2
+  l7  28.1 ->  29.2   l9  19.4 ->  20.1   l10  9.7 ->  10.6
+
+zstd 1.5.7 single-thread pinned on the same file: -1 352.3 MB/s @ 73,307,280,
+-3 227.6 @ 66,209,100, -6 98.6 @ 61,352,157, -9 62.0 @ 59,184,357,
+-19 2.5 @ 52,855,117. Interpolating our curve at zstd's ratios: zstd is 2.2x
+faster at ratio 2.89 (our 162 vs 352 MB/s), 1.8x at 3.20 (124 vs 228), 4.6x at
+3.45 (21 vs 99), >5.8x at 3.58. zstd also wins ratio at equal level number.
+The ladder's l7-l10 half is where the gap now lives: 29 MB/s at ratio 3.42
+against zstd -6's 99 MB/s at 3.45.
