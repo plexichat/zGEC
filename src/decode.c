@@ -1516,8 +1516,10 @@ static zgec_err decode_segment_streams(zgec_segment_arrays *seg,
         uint32_t dd;
         seg->rep0_before[i] = rep0;
         if (ob == 1) {
-            dd = rep0;
-        } else if (ob == 2) {
+            seg->of[i] = rep0;
+            continue;
+        }
+        if (ob == 2) {
             dd = rep1;
             rep1 = rep0;
             rep0 = dd;

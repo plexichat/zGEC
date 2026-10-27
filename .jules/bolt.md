@@ -918,3 +918,12 @@ already measured negative), the l6 D6 residual build (the same residuals are
 built again in zgec_seg_prep_build; sharing the block-level buffer needs a
 per-segment "built" flag because D6 skips segments with no sequences), and
 emit seq FSE at ~16.6 ticks/symbol, already at the serial state chain floor.
+
+## 2026-10-21 - Unrolled 8-Lane rANS Decode Registers and Repeat Offset Fast Path
+
+**Learning:**
+1. In `zgec_rans_decode` (`src/rans.c`), unrolling 8-lane full-round iterations into explicit scalar register variables (`x0..x7`, `s0..s7`) and consolidating symbol validity checks (`!f0 || !f1 || ...`) eliminates per-lane array indexing, register spilling, and conditional branch overhead in both single-context (`k = 1`) and multi-context (`k > 1`, `!has_rs`) literal streams.
+2. In `decode_segment_streams` (`src/decode.c`), adding a fast-path for `ob == 1` (`seg->of[i] = rep0; continue;`) during sequence offset resolution bypasses branch evaluation and offset rotation logic for repeat offset 0 matches.
+
+**Action:**
+In multi-lane entropy decoders, hold state variables in local scalar registers across full rounds, and short-circuit repeat offset 0 resolution during LZ77 sequence decoding.
