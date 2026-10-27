@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-27 - Elimination of Block Dispatch and Worker Array Heap Allocations via Stack Fallbacks
+Learning: Allocating transient metadata arrays—such as block offsets/sizes (`off`/`sz`), worker handle tracking (`ths`/`started`/`hs`), sequence explicit distances (`seg_dist`), segment literal bounds (`lit_bounds`), and segment output dispatch arrays (`out_bases`/`seg_bufs`/`seg_sizes`/`seg_errs`)—on the heap via `zgec_alloc` during multi-block frame decoding and block encoding caused repeated memory allocation churn and RSS fragmentation under concurrent thread workloads. Providing stack fallback buffers (`stack_off[64]`, `stack_sz[64]`, `stack_seg_dist[2048]`, `stack_lit_bounds[65]`, `stack_out_bases[64]`, `stack_seg_bufs[64]`, `stack_seg_sizes[64]`, `stack_seg_errs[64]`) when bounds are within limits (e.g. `nblk <= 64`, `n_segments <= 64`, `parse->n_seq <= 2048`) completely eliminates dynamic heap allocations on block dispatch paths without exceeding stack boundaries or risking stack overflow.
+Action: Always provide bounded stack fallback buffers for per-block or per-segment metadata arrays in block encoding and multi-block frame decoding dispatch routines.

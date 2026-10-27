@@ -3374,12 +3374,20 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
      * classes actually emitted (up to the residual difference between
      * the two bound sets). */
     if (parse->n_seq > 0) {
-        uint32_t *seg_dist = (uint32_t *)zgec_alloc(
-            parse->n_seq * sizeof(*seg_dist), _Alignof(uint32_t));
-        if (!seg_dist) {
-            zgec_free(bounds);
-            zgec_parse_free(parse);
-            return ZGEC_ERR_NOMEM;
+        uint32_t stack_seg_dist[2048];
+        uint32_t *seg_dist = NULL;
+        int seg_dist_owned = 0;
+        if (parse->n_seq <= 2048u) {
+            seg_dist = stack_seg_dist;
+        } else {
+            seg_dist = (uint32_t *)zgec_alloc(
+                parse->n_seq * sizeof(*seg_dist), _Alignof(uint32_t));
+            if (!seg_dist) {
+                zgec_free(bounds);
+                zgec_parse_free(parse);
+                return ZGEC_ERR_NOMEM;
+            }
+            seg_dist_owned = 1;
         }
         {
             zgec_reps whole;
@@ -3424,15 +3432,22 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
                                                seg_dist, &changed2);
             if (changed2) use_grans = 0;
         }
-        zgec_free(seg_dist);
+        if (seg_dist_owned) zgec_free(seg_dist);
     }
 
-    lit_bounds = (size_t *)zgec_alloc((n_segments + 1) * sizeof(size_t),
-                                     _Alignof(size_t));
-    if (!lit_bounds) {
-        zgec_free(bounds);
-        zgec_parse_free(parse);
-        return ZGEC_ERR_NOMEM;
+    size_t stack_lit_bounds[65];
+    int lit_bounds_owned = 0;
+    if (n_segments <= 64u) {
+        lit_bounds = stack_lit_bounds;
+    } else {
+        lit_bounds = (size_t *)zgec_alloc((n_segments + 1) * sizeof(size_t),
+                                         _Alignof(size_t));
+        if (!lit_bounds) {
+            zgec_free(bounds);
+            zgec_parse_free(parse);
+            return ZGEC_ERR_NOMEM;
+        }
+        lit_bounds_owned = 1;
     }
     zgec_lit_bounds(parse, bounds, n_segments, lit_bounds);
 
@@ -3670,17 +3685,35 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     /* Per-segment coder selection (11.7) then emission, appended
      * directly after the reserved directory (P6). Selection and
      * emission share one prep per segment (P1/P2). */
+    size_t stack_out_bases[64];
+    uint8_t *stack_seg_bufs[64];
+    size_t stack_seg_sizes[64];
+    zgec_err stack_seg_errs[64];
+    size_t *out_bases = NULL;
+    uint8_t **seg_bufs = NULL;
+    size_t *seg_sizes = NULL;
+    zgec_err *seg_errs = NULL;
+    int seg_arrays_owned = 0;
+
     if (n_segments > 0) {
-        size_t *out_bases = (size_t *)zgec_alloc(n_segments * sizeof(*out_bases), _Alignof(size_t));
-        uint8_t **seg_bufs = (uint8_t **)zgec_alloc(n_segments * sizeof(*seg_bufs), _Alignof(uint8_t *));
-        size_t *seg_sizes = (size_t *)zgec_alloc(n_segments * sizeof(*seg_sizes), _Alignof(size_t));
-        zgec_err *seg_errs = (zgec_err *)zgec_alloc(n_segments * sizeof(*seg_errs), _Alignof(zgec_err));
-        if (!out_bases || !seg_bufs || !seg_sizes || !seg_errs) {
-            zgec_free(out_bases);
-            zgec_free(seg_bufs);
-            zgec_free(seg_sizes);
-            zgec_free(seg_errs);
-            goto fail_seg;
+        if (n_segments <= 64u) {
+            out_bases = stack_out_bases;
+            seg_bufs = stack_seg_bufs;
+            seg_sizes = stack_seg_sizes;
+            seg_errs = stack_seg_errs;
+        } else {
+            out_bases = (size_t *)zgec_alloc(n_segments * sizeof(*out_bases), _Alignof(size_t));
+            seg_bufs = (uint8_t **)zgec_alloc(n_segments * sizeof(*seg_bufs), _Alignof(uint8_t *));
+            seg_sizes = (size_t *)zgec_alloc(n_segments * sizeof(*seg_sizes), _Alignof(size_t));
+            seg_errs = (zgec_err *)zgec_alloc(n_segments * sizeof(*seg_errs), _Alignof(zgec_err));
+            if (!out_bases || !seg_bufs || !seg_sizes || !seg_errs) {
+                zgec_free(out_bases);
+                zgec_free(seg_bufs);
+                zgec_free(seg_sizes);
+                zgec_free(seg_errs);
+                goto fail_seg;
+            }
+            seg_arrays_owned = 1;
         }
         memset(seg_bufs, 0, n_segments * sizeof(*seg_bufs));
         memset(seg_sizes, 0, n_segments * sizeof(*seg_sizes));
@@ -3742,16 +3775,18 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
             zgec_free(seg_bufs[s]);
             seg_bufs[s] = NULL;
         }
-        zgec_free(out_bases);
-        zgec_free(seg_bufs);
-        zgec_free(seg_sizes);
-        zgec_free(seg_errs);
+        if (seg_arrays_owned) {
+            zgec_free(out_bases);
+            zgec_free(seg_bufs);
+            zgec_free(seg_sizes);
+            zgec_free(seg_errs);
+        }
     }
     zgec_seg_dir_emit(payload + dir_off, dir, (uint32_t)n_segments);
     zgec_free(dir);
     zgec_free(vb_all);
     zgec_free(ll_all);
-    zgec_free(lit_bounds);
+    if (lit_bounds_owned) zgec_free(lit_bounds);
     zgec_free(bounds);
     /* The block's literal buffer, for a later block's LITREF region. */
     if (parse->n_lit > 0) {
@@ -3776,11 +3811,17 @@ static zgec_err zgec_encode_block_full(zgec_encoder *e,
     return ZGEC_OK;
 
 fail_seg:
+    if (seg_arrays_owned) {
+        zgec_free(out_bases);
+        zgec_free(seg_bufs);
+        zgec_free(seg_sizes);
+        zgec_free(seg_errs);
+    }
     zgec_free(dir);
     zgec_free(payload);
     zgec_free(vb_all);
     zgec_free(ll_all);
-    zgec_free(lit_bounds);
+    if (lit_bounds_owned) zgec_free(lit_bounds);
     zgec_free(bounds);
     zgec_parse_free(parse);
     return err;

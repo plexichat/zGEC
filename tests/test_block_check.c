@@ -350,6 +350,50 @@ static void test_corrupted_bitstreams(void)
     printf("corrupted bitstreams ok\n");
 }
 
+static void test_stack_fallback_paths(void)
+{
+    /* Test compression/decompression through stack fallback paths (<= 64 segments/blocks) */
+    uint8_t src[32768];
+    for (size_t i = 0; i < sizeof(src); i++) {
+        src[i] = (uint8_t)(i * 31 + 7);
+    }
+
+    zgec_params p;
+    zgec_params_default(&p);
+    p.block_log2 = 16; /* 64 KiB blocks */
+    p.n_threads = 4;
+    p.use_contexts = 1;
+    p.use_sublit = 1;
+
+    zgec_encoder *e = zgec_encoder_create(&p);
+    CHECK(e != NULL, "encoder create for stack fallback test");
+
+    uint8_t *cmp = NULL;
+    size_t cmp_size = 0;
+    zgec_err err = zgec_encode_frame(e, src, sizeof(src), &cmp, &cmp_size);
+    CHECK(err == ZGEC_OK, "encode frame stack fallback path");
+    zgec_encoder_destroy(e);
+
+    zgec_limits lim;
+    memset(&lim, 0, sizeof(lim));
+    lim.n_threads = 4;
+    zgec_decoder *d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, &lim);
+    CHECK(d != NULL, "decoder create for stack fallback test");
+
+    uint8_t *out = NULL;
+    size_t out_size = 0;
+    err = zgec_decode_frame(d, cmp, cmp_size, &out, &out_size);
+    CHECK(err == ZGEC_OK, "decode frame stack fallback path");
+    CHECK(out_size == sizeof(src), "decoded size matches");
+    CHECK(memcmp(out, src, sizeof(src)) == 0, "decoded data matches");
+
+    zgec_decoder_destroy(d);
+    zgec_free(cmp);
+    zgec_free(out);
+
+    printf("stack fallback paths ok\n");
+}
+
 int main(void)
 {
     test_block_params();
@@ -360,6 +404,7 @@ int main(void)
     test_bitstream();
     test_rans_context_bounds();
     test_corrupted_bitstreams();
+    test_stack_fallback_paths();
     if (fails == 0) printf("ALL BLOCK/BITSTREAM CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);
     return fails ? 1 : 0;

@@ -2014,13 +2014,20 @@ static void *zgec_phaseA_proc_posix(void *arg)
 static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
 {
 #if defined(_WIN32)
+    HANDLE stack_hs[ZGEC_MAX_WORKERS];
     HANDLE *hs = NULL;
+    int hs_owned = 0;
     size_t t;
     if (ranges == NULL || w == 0u) return;
-    hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
-    if (hs == NULL) {
-        for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
-        return;
+    if (w <= ZGEC_MAX_WORKERS) {
+        hs = stack_hs;
+    } else {
+        hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
+        if (hs == NULL) {
+            for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
+            return;
+        }
+        hs_owned = 1;
     }
     for (t = 0; t < w; t++) hs[t] = NULL;
     for (t = 0; t < w; t++) {
@@ -2039,19 +2046,29 @@ static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
         if (nv > 0u) (void)WaitForMultipleObjects(nv, hs, TRUE, INFINITE);
         for (t = 0; t < (size_t)nv; t++) (void)CloseHandle(hs[t]);
     }
-    zgec_free(hs);
+    if (hs_owned) zgec_free(hs);
 #else
+    pthread_t stack_ths[ZGEC_MAX_WORKERS];
+    unsigned char stack_started[ZGEC_MAX_WORKERS];
     pthread_t *ths = NULL;
     unsigned char *started = NULL;
+    int ths_owned = 0, started_owned = 0;
     size_t t;
     if (ranges == NULL || w == 0u) return;
-    ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
-    started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
-    if (ths == NULL || started == NULL) {
-        for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
-        zgec_free(ths);
-        zgec_free(started);
-        return;
+    if (w <= ZGEC_MAX_WORKERS) {
+        ths = stack_ths;
+        started = stack_started;
+    } else {
+        ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
+        started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
+        if (ths) ths_owned = 1;
+        if (started) started_owned = 1;
+        if (ths == NULL || started == NULL) {
+            for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
+            if (ths_owned) zgec_free(ths);
+            if (started_owned) zgec_free(started);
+            return;
+        }
     }
     memset(started, 0, w * sizeof(*started));
     for (t = 0; t < w; t++) {
@@ -2065,8 +2082,8 @@ static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
     for (t = 0; t < w; t++) {
         if (started[t] != 0) (void)pthread_join(ths[t], NULL);
     }
-    zgec_free(ths);
-    zgec_free(started);
+    if (ths_owned) zgec_free(ths);
+    if (started_owned) zgec_free(started);
 #endif
 }
 
@@ -3473,8 +3490,11 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
                                       uint8_t **dst, size_t *dst_size)
 {
     uint32_t nblk = f->block_count;
+    size_t stack_off[64];
+    size_t stack_sz[64];
     size_t *off = NULL;
     size_t *sz = NULL;
+    int off_owned = 0, sz_owned = 0;
     uint8_t *out = NULL;
     zgec_decoder **ws = NULL;
     zgec_dec_block_job *jobs = NULL;
@@ -3494,12 +3514,19 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
 
     *took = 0;
     memset(&xc, 0, sizeof(xc));
-    if ((uint64_t)nblk * (uint64_t)sizeof(*off) > (uint64_t)SIZE_MAX) { err = ZGEC_ERR_NOMEM; goto done; }
-    off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
-    sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
-    if (off == NULL || sz == NULL) {
-        err = ZGEC_ERR_NOMEM;
-        goto done;
+    if ((uint64_t)nblk * (uint64_t)sizeof(size_t) > (uint64_t)SIZE_MAX) { err = ZGEC_ERR_NOMEM; goto done; }
+    if (nblk <= 64u) {
+        off = stack_off;
+        sz = stack_sz;
+    } else {
+        off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
+        sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
+        if (off) off_owned = 1;
+        if (sz) sz_owned = 1;
+        if (off == NULL || sz == NULL) {
+            err = ZGEC_ERR_NOMEM;
+            goto done;
+        }
     }
 
     /* Pass 1: walk the records exactly as the sequential scan does, but
@@ -3713,8 +3740,8 @@ done:
     }
     zgec_free(ws);
     zgec_free(jobs);
-    zgec_free(off);
-    zgec_free(sz);
+    if (off_owned) zgec_free(off);
+    if (sz_owned) zgec_free(sz);
     zgec_free(out);
     return err;
 }
