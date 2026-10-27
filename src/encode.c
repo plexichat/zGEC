@@ -1055,7 +1055,17 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
     /* Seed the delta cache once (all pairs of singletons). */
     for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
         int bb;
+        if (ctot[(size_t)c] == 0) {
+            for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+                dlt[(size_t)c][(size_t)bb] = 0.0;
+            }
+            continue;
+        }
         for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+            if (ctot[(size_t)bb] == 0) {
+                dlt[(size_t)c][(size_t)bb] = 0.0;
+                continue;
+            }
             uint64_t mt = ctot[(size_t)c] + ctot[(size_t)bb];
             s = 0;
 #if defined(__AVX2__)
@@ -1115,29 +1125,33 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             int ver_a = -1;
             int ver_b = -1;
             double ver_delta = 0.0;
-            s = 0;
+            if (ctot[(size_t)cand_a] == 0 || ctot[(size_t)cand_b] == 0) {
+                cand_delta = 0.0;
+            } else {
+                s = 0;
 #if defined(__AVX2__)
-            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-                __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
-                __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
-                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va, vb256));
-            }
-            for (; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)cand_a][(size_t)s] +
-                    work[(size_t)cand_b][(size_t)s];
-            }
+                for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+                    __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
+                    __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
+                    _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va, vb256));
+                }
+                for (; s < ZGEC_NSYM_LIT; s++) {
+                    merged[(size_t)s] =
+                        work[(size_t)cand_a][(size_t)s] +
+                        work[(size_t)cand_b][(size_t)s];
+                }
 #else
-            for (; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)cand_a][(size_t)s] +
-                    work[(size_t)cand_b][(size_t)s];
-            }
+                for (; s < ZGEC_NSYM_LIT; s++) {
+                    merged[(size_t)s] =
+                        work[(size_t)cand_a][(size_t)s] +
+                        work[(size_t)cand_b][(size_t)s];
+                }
 #endif
-            cand_delta =
-                zgec_class_entropy(merged, ctot[(size_t)cand_a] +
-                                           ctot[(size_t)cand_b]) -
-                cent[(size_t)cand_a] - cent[(size_t)cand_b];
+                cand_delta =
+                    zgec_class_entropy(merged, ctot[(size_t)cand_a] +
+                                               ctot[(size_t)cand_b]) -
+                    cent[(size_t)cand_a] - cent[(size_t)cand_b];
+            }
             dlt[(size_t)cand_a][(size_t)cand_b] = cand_delta;
             for (a = 0; a < ZGEC_ENC_NCLASS; a++) {
                 int bb;
@@ -1269,14 +1283,16 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         if (zgec_rs_is_empty(runstart, n_lit)) {
             j = 1;
             for (; j + 8 <= n_lit; j += 8) {
-                uint8_t p0 = lit[j - 1], n0 = lit[j];
-                uint8_t p1 = lit[j], n1 = lit[j + 1];
-                uint8_t p2 = lit[j + 1], n2 = lit[j + 2];
-                uint8_t p3 = lit[j + 2], n3 = lit[j + 3];
-                uint8_t p4 = lit[j + 3], n4 = lit[j + 4];
-                uint8_t p5 = lit[j + 4], n5 = lit[j + 5];
-                uint8_t p6 = lit[j + 5], n6 = lit[j + 6];
-                uint8_t p7 = lit[j + 6], n7 = lit[j + 7];
+                uint64_t vp = zgec_rd64(lit + j - 1);
+                uint64_t vn = zgec_rd64(lit + j);
+                uint8_t p0 = (uint8_t)vp, n0 = (uint8_t)vn;
+                uint8_t p1 = (uint8_t)(vp >> 8), n1 = (uint8_t)(vn >> 8);
+                uint8_t p2 = (uint8_t)(vp >> 16), n2 = (uint8_t)(vn >> 16);
+                uint8_t p3 = (uint8_t)(vp >> 24), n3 = (uint8_t)(vn >> 24);
+                uint8_t p4 = (uint8_t)(vp >> 32), n4 = (uint8_t)(vn >> 32);
+                uint8_t p5 = (uint8_t)(vp >> 40), n5 = (uint8_t)(vn >> 40);
+                uint8_t p6 = (uint8_t)(vp >> 48), n6 = (uint8_t)(vn >> 48);
+                uint8_t p7 = (uint8_t)(vp >> 56), n7 = (uint8_t)(vn >> 56);
 
                 h0[(size_t)(p0 & 63u) * 256u + n0]++;
                 h1[(size_t)(p0 >> 2u) * 256u + n0]++;
@@ -1581,79 +1597,122 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
     {
-        /* Byte -> context group, resolved once (estimate-only: out-of-range
-         * classes/groups fold to 0, as the per-byte clamps below did). */
-        uint8_t grp_lut[256];
-        unsigned b;
-        for (b = 0; b < 256u; b++) {
-            unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
-            unsigned grp;
-            if (cls >= 64u) cls = 0u;
-            grp = (unsigned)cmap[cls];
-            if (grp >= (unsigned)k) grp = 0u;
-            grp_lut[b] = (uint8_t)grp;
-        }
         int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
-        for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
-            size_t l_start = start[lane];
-            size_t l_end = (lane + 1 < ZGEC_NLANES) ? start[lane + 1] : n_z;
-            if (l_start >= l_end) continue;
+        if (k <= 1 && !has_rs) {
+            /* Order-0 single context without runstarts: every interior byte
+             * maps to context 0. Count into 4 parallel accumulators and sum with AVX2. */
+            uint32_t c0[ZGEC_NSYM_LIT] = {0};
+            uint32_t c1[ZGEC_NSYM_LIT] = {0};
+            uint32_t c2[ZGEC_NSYM_LIT] = {0};
+            uint32_t c3[ZGEC_NSYM_LIT] = {0};
+            for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
+                size_t l_start = start[lane];
+                size_t l_end = (lane + 1 < ZGEC_NLANES) ? start[lane + 1] : n_z;
+                if (l_start >= l_end) continue;
 
-            /* First byte of each lane is a lane start -> rs_hist */
-            rs_hist[z[l_start]]++;
-            rs_total++;
+                rs_hist[z[l_start]]++;
+                rs_total++;
 
-            if (has_rs) {
-                for (j = l_start + 1; j < l_end; j++) {
-                    if (zgec_rs_get(runstart, j)) {
-                        rs_hist[z[j]]++;
-                        rs_total++;
-                    } else {
-                        unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                        cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                        grp_total[grp]++;
-                    }
-                }
-            } else {
-                /* Fast path: no runstarts and no lane boundary checks in interior */
                 j = l_start + 1;
-                for (; j + 8 <= l_end; j += 8) {
-                    unsigned ga = (unsigned)grp_lut[z[j - 1]];
-                    cls_hist[(size_t)ga * 256u + (uint32_t)z[j]]++;
-                    grp_total[ga]++;
-
-                    unsigned gb = (unsigned)grp_lut[z[j]];
-                    cls_hist[(size_t)gb * 256u + (uint32_t)z[j + 1]]++;
-                    grp_total[gb]++;
-
-                    unsigned gc = (unsigned)grp_lut[z[j + 1]];
-                    cls_hist[(size_t)gc * 256u + (uint32_t)z[j + 2]]++;
-                    grp_total[gc]++;
-
-                    unsigned gd = (unsigned)grp_lut[z[j + 2]];
-                    cls_hist[(size_t)gd * 256u + (uint32_t)z[j + 3]]++;
-                    grp_total[gd]++;
-
-                    unsigned ge = (unsigned)grp_lut[z[j + 3]];
-                    cls_hist[(size_t)ge * 256u + (uint32_t)z[j + 4]]++;
-                    grp_total[ge]++;
-
-                    unsigned gf = (unsigned)grp_lut[z[j + 4]];
-                    cls_hist[(size_t)gf * 256u + (uint32_t)z[j + 5]]++;
-                    grp_total[gf]++;
-
-                    unsigned gg = (unsigned)grp_lut[z[j + 5]];
-                    cls_hist[(size_t)gg * 256u + (uint32_t)z[j + 6]]++;
-                    grp_total[gg]++;
-
-                    unsigned gh = (unsigned)grp_lut[z[j + 6]];
-                    cls_hist[(size_t)gh * 256u + (uint32_t)z[j + 7]]++;
-                    grp_total[gh]++;
+                for (; j + 4 <= l_end; j += 4) {
+                    c0[z[j]]++;
+                    c1[z[j + 1]]++;
+                    c2[z[j + 2]]++;
+                    c3[z[j + 3]]++;
                 }
                 for (; j < l_end; j++) {
-                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                    grp_total[grp]++;
+                    c0[z[j]]++;
+                }
+            }
+#if defined(__AVX2__)
+            for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+                __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+                __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+                __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+                __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+                __m256i sum01 = _mm256_add_epi32(v0, v1);
+                __m256i sum23 = _mm256_add_epi32(v2, v3);
+                __m256i sum = _mm256_add_epi32(sum01, sum23);
+                _mm256_storeu_si256((__m256i *)(cls_hist + s), sum);
+            }
+#else
+            for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
+                cls_hist[s] = c0[s] + c1[s] + c2[s] + c3[s];
+            }
+#endif
+            grp_total[0] = (uint64_t)(n_z - rs_total);
+        } else {
+            uint16_t grp_lut_256[256];
+            unsigned b;
+            for (b = 0; b < 256u; b++) {
+                unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
+                unsigned grp;
+                if (cls >= 64u) cls = 0u;
+                grp = (unsigned)cmap[cls];
+                if (grp >= (unsigned)k) grp = 0u;
+                grp_lut_256[b] = (uint16_t)(grp << 8);
+            }
+            for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
+                size_t l_start = start[lane];
+                size_t l_end = (lane + 1 < ZGEC_NLANES) ? start[lane + 1] : n_z;
+                if (l_start >= l_end) continue;
+
+                /* First byte of each lane is a lane start -> rs_hist */
+                rs_hist[z[l_start]]++;
+                rs_total++;
+
+                if (has_rs) {
+                    for (j = l_start + 1; j < l_end; j++) {
+                        if (zgec_rs_get(runstart, j)) {
+                            rs_hist[z[j]]++;
+                            rs_total++;
+                        } else {
+                            uint32_t ga = (uint32_t)grp_lut_256[z[j - 1]];
+                            cls_hist[ga + (uint32_t)z[j]]++;
+                            grp_total[ga >> 8]++;
+                        }
+                    }
+                } else {
+                    /* Fast path: no runstarts and no lane boundary checks in interior */
+                    j = l_start + 1;
+                    for (; j + 8 <= l_end; j += 8) {
+                        uint32_t ga = (uint32_t)grp_lut_256[z[j - 1]];
+                        cls_hist[ga + (uint32_t)z[j]]++;
+                        grp_total[ga >> 8]++;
+
+                        uint32_t gb = (uint32_t)grp_lut_256[z[j]];
+                        cls_hist[gb + (uint32_t)z[j + 1]]++;
+                        grp_total[gb >> 8]++;
+
+                        uint32_t gc = (uint32_t)grp_lut_256[z[j + 1]];
+                        cls_hist[gc + (uint32_t)z[j + 2]]++;
+                        grp_total[gc >> 8]++;
+
+                        uint32_t gd = (uint32_t)grp_lut_256[z[j + 2]];
+                        cls_hist[gd + (uint32_t)z[j + 3]]++;
+                        grp_total[gd >> 8]++;
+
+                        uint32_t ge = (uint32_t)grp_lut_256[z[j + 3]];
+                        cls_hist[ge + (uint32_t)z[j + 4]]++;
+                        grp_total[ge >> 8]++;
+
+                        uint32_t gf = (uint32_t)grp_lut_256[z[j + 4]];
+                        cls_hist[gf + (uint32_t)z[j + 5]]++;
+                        grp_total[gf >> 8]++;
+
+                        uint32_t gg = (uint32_t)grp_lut_256[z[j + 5]];
+                        cls_hist[gg + (uint32_t)z[j + 6]]++;
+                        grp_total[gg >> 8]++;
+
+                        uint32_t gh = (uint32_t)grp_lut_256[z[j + 6]];
+                        cls_hist[gh + (uint32_t)z[j + 7]]++;
+                        grp_total[gh >> 8]++;
+                    }
+                    for (; j < l_end; j++) {
+                        uint32_t ga = (uint32_t)grp_lut_256[z[j - 1]];
+                        cls_hist[ga + (uint32_t)z[j]]++;
+                        grp_total[ga >> 8]++;
+                    }
                 }
             }
         }
