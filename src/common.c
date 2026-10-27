@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdio.h> /* Linux physical-core probe reads sysfs */
 #include <stdlib.h>
 #include <string.h>
@@ -175,6 +176,7 @@ static void *zgec_pool_take(size_t total)
 {
     unsigned i;
     unsigned best = ZGEC_POOL_SLOTS;
+    assert(zgec_pool_n <= ZGEC_POOL_SLOTS);
     for (i = 0; i < zgec_pool_n; i++) {
         if (zgec_pool[i].total >= total &&
             (best == ZGEC_POOL_SLOTS ||
@@ -186,6 +188,7 @@ static void *zgec_pool_take(size_t total)
     {
         void *raw = zgec_pool[best].raw;
         zgec_pool[best] = zgec_pool[--zgec_pool_n];
+        assert(zgec_pool_n <= ZGEC_POOL_SLOTS);
         return raw;
     }
 }
@@ -193,10 +196,12 @@ static void *zgec_pool_take(size_t total)
 /* Offer a block to the cache; returns 0 if it was not taken (caller frees). */
 static int zgec_pool_put(void *raw, size_t total)
 {
+    assert(zgec_pool_n <= ZGEC_POOL_SLOTS);
     if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
     zgec_pool[zgec_pool_n].raw = raw;
     zgec_pool[zgec_pool_n].total = total;
     zgec_pool_n++;
+    assert(zgec_pool_n <= ZGEC_POOL_SLOTS);
     return 1;
 }
 
@@ -264,6 +269,7 @@ void *zgec_alloc(size_t n, size_t align)
     aligned = sum & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
     ((size_t *)aligned)[-2] = total;
+    assert(((size_t *)aligned)[-2] >= n + prefix);
     return (void *)aligned;
 }
 

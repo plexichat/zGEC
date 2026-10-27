@@ -82,3 +82,7 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-27 - FSE Encoder Table Pool Bounding, Allocator Header Safety, and Pointer Nullification Audit
+Learning: Bounding thread-local pools (`zgec_fse_enc_pool` in `src/fse.c` capped to `ZGEC_FSE_ENC_POOL_SLOTS` = 8, and `zgec_pool` in `src/common.c` capped to `ZGEC_POOL_SLOTS` = 8 blocks / 32 MiB max) prevents unbounded memory retention across long-running or high-throughput encoding threads. In `zgec_alloc`, recording `total = n + prefix` in the header word `((size_t *)aligned)[-2]` guarantees that physical memory capacity is always `>= n + prefix` across block reuse cycles. Auditing all encoder and decoder table pointers (`enc_ll`, `enc_ml`, `enc_of`, `enc_of3`, `enc_ll3`, `dec_ll`, `dec_ml`, `dec_of`, `dec_of3`, `dec_ll3`) in `src/encode.c` confirmed that all pointers are NULL-initialized and cleared to NULL immediately after freeing on both success and error cleanup paths, preventing re-entrancy or double-free vulnerabilities.
+Action: Always enforce explicit slot bounds on thread-local pools, verify allocation header size invariants, and clear freed pointers to NULL on all error and success paths.
