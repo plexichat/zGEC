@@ -612,26 +612,42 @@ size_t zgec_rans_encode(const uint8_t *Z, size_t n_lit,
         size_t j2 = start[2] + round;                                           \
         size_t j1 = start[1] + round;                                           \
         size_t j0 = start[0] + round;                                           \
+        uint32_t ns7, wv7, nd7;                                                 \
+        uint32_t ns6, wv6, nd6;                                                 \
+        uint32_t ns5, wv5, nd5;                                                 \
+        uint32_t ns4, wv4, nd4;                                                 \
+        uint32_t ns3, wv3, nd3;                                                 \
+        uint32_t ns2, wv2, nd2;                                                 \
+        uint32_t ns1, wv1, nd1;                                                 \
+        uint32_t ns0, wv0, nd0;                                                 \
+        if (CORE(tab, Z[j7], state[7], &ns7, &wv7, &nd7) != 0) goto fail_words; \
+        if (CORE(tab, Z[j6], state[6], &ns6, &wv6, &nd6) != 0) goto fail_words; \
+        if (CORE(tab, Z[j5], state[5], &ns5, &wv5, &nd5) != 0) goto fail_words; \
+        if (CORE(tab, Z[j4], state[4], &ns4, &wv4, &nd4) != 0) goto fail_words; \
+        if (CORE(tab, Z[j3], state[3], &ns3, &wv3, &nd3) != 0) goto fail_words; \
+        if (CORE(tab, Z[j2], state[2], &ns2, &wv2, &nd2) != 0) goto fail_words; \
+        if (CORE(tab, Z[j1], state[1], &ns1, &wv1, &nd1) != 0) goto fail_words; \
+        if (CORE(tab, Z[j0], state[0], &ns0, &wv0, &nd0) != 0) goto fail_words; \
+        state[7] = ns7; state[6] = ns6; state[5] = ns5; state[4] = ns4;         \
+        state[3] = ns3; state[2] = ns2; state[1] = ns1; state[0] = ns0;         \
         uint32_t base = (uint32_t)nwords;                                       \
-        uint32_t off = 0;                                                       \
-        uint32_t ns, wv, nd;                                                    \
-        if (CORE(tab, Z[j7], state[7], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[7] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j6], state[6], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[6] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j5], state[5], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[5] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j4], state[4], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[4] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j3], state[3], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[3] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j2], state[2], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[2] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j1], state[1], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[1] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        if (CORE(tab, Z[j0], state[0], &ns, &wv, &nd) != 0) goto fail_words;    \
-        state[0] = ns; words[base + off] = (uint16_t)wv; off += nd;             \
-        nwords = (size_t)base + off;                                            \
+        uint32_t o7 = 0;                                                        \
+        uint32_t o6 = nd7;                                                      \
+        uint32_t o5 = o6 + nd6;                                                 \
+        uint32_t o4 = o5 + nd5;                                                 \
+        uint32_t o3 = o4 + nd4;                                                 \
+        uint32_t o2 = o3 + nd3;                                                 \
+        uint32_t o1 = o2 + nd2;                                                 \
+        uint32_t o0 = o1 + nd1;                                                 \
+        words[base + o7] = (uint16_t)wv7;                                       \
+        words[base + o6] = (uint16_t)wv6;                                       \
+        words[base + o5] = (uint16_t)wv5;                                       \
+        words[base + o4] = (uint16_t)wv4;                                       \
+        words[base + o3] = (uint16_t)wv3;                                       \
+        words[base + o2] = (uint16_t)wv2;                                       \
+        words[base + o1] = (uint16_t)wv1;                                       \
+        words[base + o0] = (uint16_t)wv0;                                       \
+        nwords = (size_t)base + o0 + nd0;                                       \
     } while (0)
 
 /* The same round for k > 1, where the table depends on the symbol: the
