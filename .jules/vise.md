@@ -82,3 +82,11 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-21 - Comprehensive Decompression Hot-Path Stack Fallbacks and Alignment Guarantees
+Learning: Transient allocations on the decompression hot path in `src/decode.c` and `src/dict.c` (segment header NEW descriptors, single-table rANS decoders, worker thread/job arrays, export cache slots, literal-reference predecessor gathering, and RLE decoding temporary buffers) caused heap allocation churn and mutex contention during multi-threaded frame decoding.
+1. Providing embedded `_Alignas(64) zgec_rans_dec_table stack_lit[1]` in `seg_tables` and `zgec_dict_prev` eliminates heap allocations for single-context literal decoding (k=1) while ensuring 64-byte SIMD alignment.
+2. Embedding a bounded `new_desc_t stack_descs[4]` inside `seg_hdr_t` avoids heap allocations for NEW FSE/rANS descriptors during header parsing when descriptor count <= 4, keeping individual header stack frames under ~2.2 KiB.
+3. Using stack fallback buffers for worker thread handles (`stack_hs[64]`, `stack_ths[64]`, `stack_started[64]`), block jobs/offsets (`stack_off[64]`, `stack_sz[64]`, `stack_ws[64]`, `stack_jobs[64]`), export cache slots (`stack_slot[64]`), litref gathering (`stack_litref[8192]`), and RLE buffers (`stack_tmp[8192]`) eliminates almost all heap allocations during block decompression, reducing per-frame heap allocations on standard inputs to zero for worker structs and table structures.
+4. Keeping stack frame sizes small (e.g. `stack_hdrs[8]`, `stack_tabs[16]`, `stack_jobs[16]` in parallel phase A) keeps total stack frames well below 32 KiB, preventing stack overflow on worker threads.
+Action: Prefer embedded `_Alignas(64)` stack fallback buffers for hot-path decompression structures (decoders, thread arrays, job descriptors, litref buffers) and keep stack frame footprints <= 32 KiB.

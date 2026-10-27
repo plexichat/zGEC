@@ -235,6 +235,8 @@ static zgec_fse_dec_table *zgec_dict_fse_clone(const zgec_fse_dec_table *s)
  * for REPEAT inheritance (section 7.4; repeats never cross blocks). */
 typedef struct {
     zgec_rans_dec_table *lit;   /* value tables: plain memcpy clone */
+    _Alignas(64) zgec_rans_dec_table stack_lit[1];
+    int lit_is_stack;
     int n_lit_tbl;
     int lit_form;
     int lit_k;
@@ -276,7 +278,7 @@ static void zgec_dict_prev_free(zgec_dict_prev *p)
         if ((int)i < p->n_of && p->of[i]) zgec_fse_free_dec(p->of[i]);
     }
     if (p->ml) zgec_fse_free_dec(p->ml);
-    zgec_free(p->lit);
+    if (p->lit && !p->lit_is_stack) zgec_free(p->lit);
     zgec_dict_prev_init(p);
 }
 
