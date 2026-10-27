@@ -1026,3 +1026,155 @@ faster at ratio 2.89 (our 162 vs 352 MB/s), 1.8x at 3.20 (124 vs 228), 4.6x at
 3.45 (21 vs 99), >5.8x at 3.58. zstd also wins ratio at equal level number.
 The ladder's l7-l10 half is where the gap now lives: 29 MB/s at ratio 3.42
 against zstd -6's 99 MB/s at 3.45.
+
+## 2026-10-27 - Steering: where the cycles actually are, and what to stop doing
+
+The intake above is the evidence base: 84 branches looked at, one accepted, and
+the accepted one was a *work-elimination* change (a duplicated residual build),
+not a new instruction shape. Thirty-odd of those branches were AVX2 rewrites of
+the same three loops. The next round has to change what we aim at, not how we
+spell the loop.
+
+### The gap is ratio-per-cycle, not instructions-per-byte
+
+Measured cycles per input byte on the final build (211.9 MB silesia, pinned
+-T1, thread cycles over 211,938,580 bytes; zstd figures derived from its wall
+time at the counter's ~3.7 GHz, so treat them as +/-5%):
+
+  level  ratio   cyc/B      zstd at that ratio        cyc/B
+  l1     2.630   16.0        -1  2.891               10.5
+  l4     3.258   33.1        -3  3.201               16.2
+  l5     3.327   41.5        -4  3.257               20.0
+  l6     3.353   51.7        -6  3.454               37.5
+  l7     3.423  115.6        -9  3.581               59.7
+  l10    3.465  425.0       -19  4.010             1480.0
+
+Three things fall out of that table:
+
+1. At the *same ratio* we are 1.5x-1.9x in cycles at the bottom of the ladder
+   and about 3x at 3.42. The "4.6x slower" headline is real but it is the ratio
+   interpolation talking: to match zstd -6's 3.454 we cannot use l6 (3.353),
+   we are forced up to l7, and l7 is 2.2x the cycles of l6.
+2. The marginal ratio per cycle is where we lose by an order of magnitude.
+   l6 -> l7 buys 0.67% ratio for +13 Gcycles (2.2x). zstd -6 -> -9 buys 3.7%
+   for 1.6x. Per point of ratio we spend roughly 5x-8x the cycles.
+3. The top of the ladder is model-limited, not speed-limited. l10 ceilings at
+   3.465; zstd -12 gets 3.651 at 26.6 MB/s, i.e. 2.4x our l10's speed *and*
+   5% smaller. No amount of SIMD at l8-l10 fixes that curve.
+
+So: we are not primarily wasting instructions in the loops. We are wasting
+*search*: 13 Gcycles to gain two thirds of one percent, and a model that stops
+buying ratio at 3.47 no matter how long it runs.
+
+### Do not spend more time on these shapes
+
+Every one of these has now been measured on this box, most of them twice:
+
+- Splitting, merging, or re-indexing the fused literal class histograms
+  (2-way, 4-pass, shift-vs-multiply addressing). The fused pass wins; the
+  class-histogram increments are not L2-latency-bound. Four-pass was +4.5% l5
+  and +7.3% l6.
+- `vpgatherdd` for table lookups (seq symbols, FSE entries). Zen 3 gather is
+  slower than eight dependent loads; measured +2.19% at l6.
+- Prescan passes over a row before encoding it (FSE pad/validity prescan), and
+  "validate everything, then encode" splits. The second pass re-reads what the
+  first just touched; the same shape was already rejected as the per-row pad
+  prescan.
+- More unrolling of a loop whose body is a store-to-load forwarding chain
+  (8x rd64 literal histogram, 8-wide bitmask rotations). +3.67% at l4.
+- Moving small allocations to the stack. Heap churn is no longer measurable;
+  the last stack-fallback branch was neutral at 9 pairs.
+- Prefetching *inserts* into the dense match table, and adding branches to make
+  `mf_bucket_hits` skip a zero-vector test (byte-identical, -0.33% median).
+- Rewriting the rANS 8-lane round for ILP (compute all eight states, then
+  commit). l5 +2.48% min, 1/11 wins. The chain is not the limit.
+- Capping parse work in a way that changes which matches are found (the span
+  cap: genuinely +20-25% for -0.009% ratio, but it moves the pinned bytes).
+  This is the one experiment worth *re-doing differently*, see below.
+
+Meta-rule for the next intake: a branch that reports a throughput number but
+not (cycles, level, ratio delta, and the pinned-size check) does not get
+merged, however plausible the mechanism.
+
+### The constraint that makes parity unreachable, stated plainly
+
+The project still requires byte-identical output at the pinned levels. That
+fixes the parse decisions, the sequence stream, the context partitions and the
+block segmentation. Everything still open is *layout and eliminated work*: we
+can change how the same decisions are computed, never what they are. The
+measured evidence is that this space is nearly exhausted - the last 84 branches
+found one win in it. Parity with zstd at ratio >= 3.5 therefore needs a
+different *algorithm*, i.e. a different bitstream.
+
+Recommendation: two tracks, explicitly separated.
+- v1 (shipped format): only changes that provably cannot alter a decision
+  (layout, prefetch of lookups, removing duplicated work, incremental caches
+  with exact tie-breaking).
+- v2 (new frame version, ratio targets pinned instead of byte-identity): the
+  place where the parse/model changes live. Keep v1 decode forever; keep the
+  v1 pinned-size test as the regression gate for the v1 encoder.
+
+If v2 is not on the table, the honest target for v1 is 1.5x-2x off zstd at the
+bottom and acceptance that l7+ stays ratio-starved, not parity.
+
+### What to focus on, in expected-value order
+
+1. High-tier parse cost (l7 116 cyc/B, l9 ~189, l10 ~425; zstd -6 is 37).
+   - The span-cap result is the signal: insertion work behind long matches is
+     pure waste. Make it decision-preserving with a *price gate*: keep the
+     interior insert only when the best alternative at that position could
+     still beat the match the parser is about to emit. Cap at 128 and accept
+     the insert when price(new) < price(committed) - epsilon. That is a
+     different algorithm from the branch (which capped unconditionally), and
+     it is testable as (ratio delta, cycle delta) rather than MB/s.
+     If it still moves the pinned sizes by 0.01%, it belongs in v2.
+   - Bounded-search lazy parsing with a match cache: once a match of length L
+     is found at i, positions i+1..i+L-1 cannot produce a longer match starting
+     there, so cache the (len, off) and re-use instead of re-probing. This is
+     a technique, not a port; it changes decisions only if the price model
+     disagrees, so gate it on "len >= threshold".
+   - Skip DP nodes that cannot change the decision: if the best price reaching
+     i is already dominated by the price reaching i+L via the cached match,
+     do not expand i. Report how many nodes are actually visited - that number
+     is the real search-depth dial.
+   - Success metric for this whole block: l7 cycles/B, and (delta ratio)/(delta
+     cycles) versus l6. Today l7's marginal return is ~0.05 ratio-points per
+     Gcycle; zstd's is ~0.28.
+2. The ratio ceiling (l8-l10). This is modelling, not speed.
+   - Add one genuinely stronger literal context candidate (second-order
+     predecessor, or a class map conditioned on match position) and let the
+     existing exact-cost selection choose it. Today all four candidates are
+     first-order-prefix variants, which is why the curve saturates.
+   - Larger/cheaper block segmentation is the other half: zstd's ratio at -9..
+     -12 comes substantially from window/lookahead economics we do not model.
+   - Target: ratio 3.6 at l10 under 200 cyc/B. Do not chase l10 throughput
+     until the ceiling moves; it is the wrong end of the curve.
+3. fast_parse L3 latency (70% of l4, 56% of l5, 43% of l6; 33 cyc/B at l4 vs
+   zstd -3's 16).
+   - Put the two 1 MiB tables' entries for the same hash in one 32-byte slot so
+     one probe is one cache miss instead of two. Same slots, same candidates,
+     same decisions; only the physical layout changes.
+   - Probe ring for lookups, not inserts: while stepping position i, prefetch
+     the bucket line the loop will read at i+K (K ~ 24-40 positions, sized to
+     the L3 latency). The already-rejected "dense insert prefetch" prefetched
+     the store target for positions it was about to insert anyway; this hides
+     the *load* latency of the next lookup. Different mechanism, so re-test it.
+   - Target l4 33 -> 25 cyc/B. That alone would put l4 at ~147 MB/s.
+4. Context selection / clustering (877 Mticks cluster at l5, ~0.93 G select at
+   l6). Keep exact deltas but maintain them incrementally in a lazy heap:
+   a merge invalidates only the O(k) deltas involving the merged class, and the
+   argmin tie-break (lowest class index) must be reproduced exactly. Verify by
+   comparing the chosen partition, not just the size.
+5. Entropy: seq FSE is 16.6 ticks/symbol, a serial state chain; three-stream
+   fusion was measured negative, so the only remaining v1 lever is *fewer
+   sequences* (parse quality), and the real fix (interleaved states per stream)
+   is a v2 format decision. Literal rANS is already eight-lane.
+
+### Measurement discipline that has to stay
+
+Pinned CPU 9, -T1, on-CPU thread cycles, interleaved A/B, min and median over
+>= 7 pairs, paired win count, sub-2% is noise unless the separation is clean.
+Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
+4/4 before any timing is believed. And report ratio, not just MB/s: the whole
+point of the table above is that MB/s at a level is meaningless without the
+ratio it buys.

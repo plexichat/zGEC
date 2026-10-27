@@ -82,3 +82,56 @@ at l7 and -12.9 ms (-2.0%, 5/6 wins) at l4. Decoded output SHA-256 matches
 exactly, ctest 4/4, encode pinned sizes and l7 SHA unchanged.
 Note: branches that delete decoder range checks remain rejected regardless of
 speed -- see the 2026-10-19 audit entry.
+
+2026-10-27 - Memory work is finished; the next lever is layout, not fewer allocations
+
+Learning: the 2026-10-27 intake had thirteen branches in this journal's area
+(vise-pool-hardening x3, vise-1-decode-stack-alloc x3, vise-2-pool-hardening,
+vise-decode-stack-fallbacks, vise-decoder-stack-fallbacks,
+vise-stack-fallback-buffers, vise-decoder-leak-fix-and-encoder-sbo,
+jules-13906346593682127824, jules-16465769277812124083,
+jules-16667722021506175466, jules-13222170761254327584). All were reviewed and
+none was taken: they are allocator hardening, leak/CI fixes, or one more
+malloc moved to the stack, and none of them is measurable on the current
+profile. Allocation churn is no longer a throughput term - the last two
+stack-fallback branches measured neutral at 9 interleaved pairs. The cycle
+budget now sits in the parser (70% of l4, 56% of l5, 43% of l6) and in the
+high-tier search (l7 is 116 cycles per input byte against zstd -6's ~37).
+
+Action: do not open another "remove a malloc / add a stack fallback" branch and
+do not expect it to show up on the clock. If a future allocation change is to
+be justified it must come with a profile showing allocator time as a line item,
+not with a code-shape argument. Large-transient reuse (the TLS pool) and the
+thread-exit drain stay as they are: they are memory-cost fixes, already done.
+
+What memory work *is* still worth doing is layout, because it changes misses
+rather than call counts:
+  - the fast-tier match finder's two 1 MiB tables are random-touch and
+    L3-latency-bound; interleaving the two entries for one hash into a single
+    32-byte slot turns one probe from two misses into one. Same logical slots,
+    same candidate set, same output.
+  - alignment and page behaviour of the 31 MiB literal path and the per-block
+    scratch: keep 64-byte alignment (the AVX2 loads assume it is safe to use
+    unaligned ops) and prefer one allocation over four for arrays consumed in
+    the same pass (SoA sections of one arena, as done for the sequence arrays).
+  - prefetch distance for lookups, not inserts: the rejected dense-insert
+    prefetch was the wrong access to hide. The lookup line for position i+K is
+    the one on the dependency chain.
+These are noted in .jules/bolt.md with the numbers; coordinate with that file so
+the same experiment is not run twice under two names.
+
+Safety invariants that are not negotiable, regardless of the speed claim:
+  - the decoder keeps every range check (symbol < nsym, pad <= 32, table index
+    sentinel, header length vs. buffer), because it consumes untrusted bytes;
+  - pooled blocks stay bounded and a released block's size stays recoverable
+    from the block itself; every pooled pointer is NULLed at its single free;
+  - zgec_thread_cleanup() runs before any worker thread exits;
+  - every change ships with pinned sizes at all ten levels, the l7 SHA-256,
+    ctest 4/4, and a measured cycle delta - a memory change that cannot show a
+    cycle delta is either free (take it with the proof) or pointless (leave it).
+
+Where the remaining budget is (cross-reference, same measurement session):
+l1 16.0, l4 33.1, l5 41.5, l6 51.7, l7 115.6, l10 425.0 cycles per input byte.
+Anything in this journal's area has to move the parser or the match finder to
+matter; below that, the only open question is the v2 format, where interleaved
+entropy states and a different block/segment policy are allowed.
