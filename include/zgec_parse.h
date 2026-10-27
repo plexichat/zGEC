@@ -79,13 +79,14 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
  * tables, 3 also drops the repeat-offset and short-table probes, and 4 runs a
  * separate single-table lean core; each rung trades ratio for encode
  * throughput and is only set by the new fast levels 1-3. Values outside 0-4
- * are clamped. Identical to zgec_parse_block_ex for fast_dial == 0. */
+ * are clamped. Identical to zgec_parse_block_ex for fast_dial == 0.
+ * lazy_max (0 = default 16) bounds the match length evaluated during lazy lookahead. */
 zgec_err zgec_parse_block_dial(zgec_parse **out,
                                       const uint8_t *src, size_t raw_size,
                                       const uint8_t *dict, size_t dict_size,
                                       const uint8_t *litref, size_t litref_size,
                                       zgec_tier tier, double lambda,
-                                      int fast_dial);
+                                      int fast_dial, int lazy_max);
 
 /* Segment a parse into segments (section 11.5).
  * Produces segment boundaries (indices into the

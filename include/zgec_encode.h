@@ -52,6 +52,9 @@ typedef struct {
                                   * short-table probes, and 4 runs the
                                   * single-table lean core. Only new levels
                                   * 1-3 set it. */
+    int          lazy_max;       /* maximum match length for lazy evaluation lookahead
+                                  * (default: 16). Levels 15-25 scale lazy_max up to
+                                  * 1024 to increase compression ratio. */
 } zgec_params;
 
 /* Default parameters. */

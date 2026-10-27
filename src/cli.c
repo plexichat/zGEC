@@ -394,6 +394,19 @@ static void cli_apply_level(zgec_params *p, int level)
      * uses, through the two-table fast parser's shed-feature rungs. See
      * zgec_parse_block_dial. */
     p->fast_dial = (level >= 1 && level <= 3) ? (5 - level) : 0;
+
+    /* Levels 15-25 scale lazy evaluation lookahead length threshold (lazy_max)
+     * progressively from 32 up to 1024 bytes to maximize compression ratio. */
+    if (level >= 15) {
+        static const int lazy_ladder[11] = {
+            32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024
+        };
+        int idx = level - 15;
+        if (idx > 10) idx = 10;
+        p->lazy_max = lazy_ladder[idx];
+    } else {
+        p->lazy_max = 16;
+    }
 }
 
 static int cli_tier(const char *s, zgec_tier *out)
