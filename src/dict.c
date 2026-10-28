@@ -1013,10 +1013,10 @@ lit_seq_fail:
         zgec_free(rs);
         zgec_free(lt);
         for (ti = 0; ti < 3; ti++) {
-            if (ti < n_ll && llt[ti]) zgec_fse_free_dec(llt[ti]);
-            if (ti < n_of && oft[ti]) zgec_fse_free_dec(oft[ti]);
+            if (ti < n_ll && llt[ti]) { zgec_fse_free_dec(llt[ti]); llt[ti] = NULL; }
+            if (ti < n_of && oft[ti]) { zgec_fse_free_dec(oft[ti]); oft[ti] = NULL; }
         }
-        if (mlt) zgec_fse_free_dec(mlt);
+        if (mlt) { zgec_fse_free_dec(mlt); mlt = NULL; }
         zgec_dict_seg_release(seg);
         return derr;
     }

@@ -135,3 +135,9 @@ l1 16.0, l4 33.1, l5 41.5, l6 51.7, l7 115.6, l10 425.0 cycles per input byte.
 Anything in this journal's area has to move the parser or the match finder to
 matter; below that, the only open question is the v2 format, where interleaved
 entropy states and a different block/segment policy are allowed.
+
+2026-10-28 - Hardening Allocator Pools and FSE Table Lifetime Audit
+
+Learning: Bounding thread-local memory retention pools and guarding against double-returns prevents memory leaks and linked-list cycles during multi-threaded encoding/decoding loops. `zgec_pool` in `src/common.c` now rejects duplicate pointer offers and enforces allocator layout assertions in debug builds. `zgec_fse_enc_pool` in `src/fse.c` is now strictly bounded to <= 8 table slots and <= 32 MiB per thread, releasing excess tables via `zgec_free` and validating pointer uniqueness to prevent list cycles. Furthermore, setting table pointers (`enc_ll`, `dec_ll`, `enc_ml`, `dec_ml`, `enc_of`, `dec_of`, `enc_of3`, `dec_of3`, `enc_ll3`, `dec_ll3`, `llt`, `oft`, `mlt`) to NULL immediately upon freeing in `src/encode.c` and `src/dict.c` ensures re-entrant error path safety.
+
+Action: Always bound thread-local storage pools in both slot count and byte capacity, check candidate pointers for duplicates before insertion to prevent list cycles/double-frees, and explicitly clear freed table pointers to NULL.

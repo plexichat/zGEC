@@ -26,6 +26,11 @@
  * process exit are still reachable from this pointer, so they are not
  * leaked in the LSan sense. */
 static ZGEC_FSE_TLS zgec_fse_enc_table *zgec_fse_enc_pool;
+static ZGEC_FSE_TLS unsigned zgec_fse_enc_pool_n;
+static ZGEC_FSE_TLS size_t zgec_fse_enc_pool_bytes;
+
+#define ZGEC_FSE_POOL_MAX_SLOTS 8u
+#define ZGEC_FSE_POOL_MAX_BYTES (32u * 1024u * 1024u)
 
 static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
 {
@@ -36,6 +41,10 @@ static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
         cap = sizeof(*t)
             + (size_t)t->nsym * ((size_t)1u << (unsigned)t->al)
             * sizeof(zgec_fse_enc_entry);
+        if (zgec_fse_enc_pool_n > 0) zgec_fse_enc_pool_n--;
+        if (zgec_fse_enc_pool_bytes >= cap) zgec_fse_enc_pool_bytes -= cap;
+        else zgec_fse_enc_pool_bytes = 0;
+
         if (cap >= need) return t;
         /* Too small for this request and no use to any other (all requests
          * are for the same few alphabet sizes); really release it. */
@@ -47,8 +56,24 @@ static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
 
 static void zgec_fse_enc_return(zgec_fse_enc_table *t)
 {
+    size_t cap;
+    zgec_fse_enc_table *curr;
+    if (!t) return;
+    for (curr = zgec_fse_enc_pool; curr != NULL; curr = (zgec_fse_enc_table *)(void *)curr->e) {
+        if (curr == t) return;
+    }
+    cap = sizeof(*t)
+        + (size_t)t->nsym * ((size_t)1u << (unsigned)t->al)
+        * sizeof(zgec_fse_enc_entry);
+    if (zgec_fse_enc_pool_n >= ZGEC_FSE_POOL_MAX_SLOTS ||
+        zgec_fse_enc_pool_bytes + cap > ZGEC_FSE_POOL_MAX_BYTES) {
+        zgec_free(t);
+        return;
+    }
     t->e = (zgec_fse_enc_entry *)(void *)zgec_fse_enc_pool;
     zgec_fse_enc_pool = t;
+    zgec_fse_enc_pool_n++;
+    zgec_fse_enc_pool_bytes += cap;
 }
 
 /* Free all cached FSE encoder tables in the thread-local pool for the calling thread. */
@@ -59,6 +84,8 @@ void zgec_fse_cleanup_tls(void)
         zgec_fse_enc_pool = (zgec_fse_enc_table *)(void *)t->e;
         zgec_free(t);
     }
+    zgec_fse_enc_pool_n = 0;
+    zgec_fse_enc_pool_bytes = 0;
 }
 
 /* ---- forward bit reader (LSB-first, little-endian words) ---- */
