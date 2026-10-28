@@ -1178,3 +1178,15 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+
+## 2026-10-28 - Decompression Throughput Optimization: 8-Lane rANS ILP Unrolling and AVX2 Sequence Post-Processing
+
+**Learning:**
+1. In `src/rans.c` (`zgec_rans_decode`), unrolling the 8-lane inner loops into explicit scalar register variables (`x0..x7`) for single-context (`k = 1`) and multi-context (`k > 1`, `!has_rs`) streams allows out-of-order execution pipelines to issue 8 parallel table lookups and state transitions simultaneously, bypassing sequential loop dependencies.
+2. In `src/decode.c` (`seq_decode_cond`), vectorizing match class map generation (`zgec_mlclass`) 8 elements at a time using 256-bit AVX2 SIMD (`_mm256_cmpgt_epi32` against match length thresholds 6 and 18, packed with `_mm_packs_epi32`/`_mm_packus_epi16`) accelerates conditioned sequence stream decoding.
+3. In `src/decode.c` (`decode_segment_streams`), vectorizing sequence field adjustments (`ml[i] += 3`, `of[i] += 1`) and summations (`sum_ml`, `sum_ll`) using AVX2 SIMD with unsigned XOR bias mapping (`0x80000000u`), alongside adding an `ob == 1` fast-path bypass during repeat offset resolution (`seg->of[i] = rep0`), reduces sequence post-processing latency.
+4. In `src/decode.c` (`exec_block`), match copy dispatch with fast 64-bit store paths for `moff >= 8` (1, 2, or 4 64-bit stores for `mlen <= 8, 16, 32`), 24-byte pattern expansion stores for 3-byte match offsets (`moff == 3`), and 4-byte chunk stores for `moff >= 4` avoids falling through to scalar single-byte loops during Phase B decompression.
+
+**Action:**
+Unroll multi-lane rANS decoders with explicit scalar state variables, vectorize sequence classification/field operations using AVX2 SIMD with unsigned bit-bias mapping, and optimize match reconstruction with periodic pattern stores.
