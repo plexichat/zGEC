@@ -67,7 +67,10 @@ double zgec_seq_cost_bits(const uint32_t *hist)
     for (; s_idx < ZGEC_NSYM_SEQ; s_idx++) total += (double)hist[s_idx];
     if (total == 0) return 0.0;
     double bits = 0.0;
-    for (int s = 0; s < ZGEC_NSYM_SEQ; s++) bits += zgec_bits(total, (double)hist[s]);
+    for (int s = 0; s < ZGEC_NSYM_SEQ; s++) {
+        if (hist[s] == 0) continue;
+        bits += zgec_bits(total, (double)hist[s]);
+    }
     /* zgec_bits() already returns a positive contribution, so negating
      * the total made the "cost" negative and would invert every
      * comparison the value feeds. */
@@ -346,6 +349,13 @@ static float parse_lbar(const uint32_t *lit_hist, size_t total)
     __m256 vprior = _mm256_set1_ps(PARSE_LBAR_PRIOR);
     for (; s + 8 <= 256; s += 8) {
         __m256i vhist = _mm256_loadu_si256((const __m256i *)(const void *)(lit_hist + s));
+        if (_mm256_testz_si256(vhist, vhist)) {
+            /* For zero-count symbols, c = PARSE_LBAR_PRIOR = 0.25f.
+             * c * (log2_t - log2f(c)) = 0.25f * (log2_t - (-2.0f)) = 0.25f * (log2_t + 2.0f).
+             * For 8 zero counts: 8 * 0.25f * (log2_t + 2.0f) = 8.0f * (PARSE_LBAR_PRIOR * (log2_t + 2.0f)). */
+            bits += 8.0f * (PARSE_LBAR_PRIOR * (log2_t + 2.0f));
+            continue;
+        }
         __m256 vc = _mm256_add_ps(_mm256_cvtepi32_ps(vhist), vprior);
         float c_arr[8];
         _mm256_storeu_ps(c_arr, vc);

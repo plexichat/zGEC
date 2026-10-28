@@ -1510,8 +1510,21 @@ static double zgec_seq_coded_bits_desc(const uint32_t *hist,
     double bits = 0.0;
     uint8_t tmp[1024];
     size_t nw = 0;
-    int s;
-    for (s = 0; s < ZGEC_NSYM_SEQ; s++) total += (uint64_t)hist[s];
+    int s = 0;
+#if defined(__AVX2__)
+    __m256i vsum = _mm256_setzero_si256();
+    for (; s + 8 <= ZGEC_NSYM_SEQ; s += 8) {
+        __m256i v = _mm256_loadu_si256((const __m256i *)(const void *)(hist + s));
+        vsum = _mm256_add_epi32(vsum, v);
+    }
+    __m128i vlow = _mm256_castsi256_si128(vsum);
+    __m128i vhigh = _mm256_extracti128_si256(vsum, 1);
+    vlow = _mm_add_epi32(vlow, vhigh);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    vlow = _mm_hadd_epi32(vlow, vlow);
+    total = (uint64_t)(uint32_t)_mm_cvtsi128_si32(vlow);
+#endif
+    for (; s < ZGEC_NSYM_SEQ; s++) total += (uint64_t)hist[s];
     if (total == 0) {
         if (desc_bytes_out) *desc_bytes_out = 0;
         return 0.0;
