@@ -574,11 +574,6 @@ static inline uint64_t fast_hash_l_raw(uint64_t v)
     return v * 0xD6E8FEB86659FD93ULL;
 }
 
-static inline uint32_t fast_hash_s_v(uint64_t v)
-{
-    return (uint32_t)(fast_hash_s_raw(v) >> (64u - ZGEC_FAST_SHORT_BITS));
-}
-
 static inline uint32_t fast_hash_l_v(uint64_t v)
 {
     return (uint32_t)(fast_hash_l_raw(v) >> (64u - ZGEC_FAST_LONG_BITS));
@@ -589,24 +584,10 @@ static inline uint32_t fast_tag_of(uint64_t h64)
     return (uint32_t)(((h64 >> 28) & 0xFEu) | 1u);
 }
 
-/* Entry packing for the two fast-tier tables. See the ZGEC_FAST_GEN comment. */
-#if ZGEC_FAST_GEN
-static ZGEC_ENC_TLS unsigned fast_scratch_gen;
-#endif
-
-static inline uint32_t fast_pack(uint32_t gen, size_t pos)
-{
-    return (gen << 24) | (uint32_t)pos;
-}
-
+/* Entry packing for the two fast-tier tables. */
 static inline uint32_t fast_pack_tag(uint32_t tag, size_t pos)
 {
     return (tag << 24) | ((uint32_t)pos & 0xFFFFFFu);
-}
-
-static inline int fast_live(uint32_t e, uint32_t gen)
-{
-    return (e >> 24) == gen;
 }
 
 static inline size_t fast_pos_of(uint32_t e)
