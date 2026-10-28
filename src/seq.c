@@ -33,7 +33,7 @@ const uint8_t zgec_seq_nbits[ZGEC_NSYM_SEQ] = {
     [64] = 30, [65] = 30
 };
 
-const uint16_t zgec_seq_lut512[512] = {
+const uint16_t zgec_seq_lut512[513] = {
     0x0000, 0x0100, 0x0200, 0x0300, 0x0400, 0x0500, 0x0600, 0x0700,
     0x0802, 0x0802, 0x0802, 0x0802, 0x0902, 0x0902, 0x0902, 0x0902,
     0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03, 0x0a03,
@@ -98,6 +98,7 @@ const uint16_t zgec_seq_lut512[512] = {
     0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307,
     0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307,
     0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307, 0x1307,
+    0x1307
 };
 
 /* ---- stream decode (tANS section 8.4, RLE section 8.5) ---- */
@@ -227,14 +228,11 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
     while (i + 8 <= n) {
         __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
         if (_mm256_testz_si256(vv, vmask)) {
-            syms[i + 0] = (uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8);
-            syms[i + 1] = (uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8);
-            syms[i + 2] = (uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8);
-            syms[i + 3] = (uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8);
-            syms[i + 4] = (uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8);
-            syms[i + 5] = (uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8);
-            syms[i + 6] = (uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8);
-            syms[i + 7] = (uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8);
+            __m256i vcode_raw = _mm256_i32gather_epi32((const int *)(const void *)zgec_seq_lut512, vv, 2);
+            __m256i vcode32 = _mm256_and_si256(_mm256_srli_epi32(vcode_raw, 8), _mm256_set1_epi32(0xFF));
+            __m128i vcode16 = _mm_packus_epi32(_mm256_castsi256_si128(vcode32), _mm256_extracti128_si256(vcode32, 1));
+            __m128i vcode8 = _mm_packus_epi16(vcode16, vcode16);
+            zgec_wr64(syms + i, (uint64_t)_mm_cvtsi128_si64(vcode8));
         } else {
             for (size_t k = 0; k < 8; k++) {
                 uint8_t nb_dummy;
@@ -320,14 +318,11 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
     while (i + 8 <= n) {
         __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
         if (_mm256_testz_si256(vv, vmask)) {
-            syms[i + 0] = (uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8);
-            syms[i + 1] = (uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8);
-            syms[i + 2] = (uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8);
-            syms[i + 3] = (uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8);
-            syms[i + 4] = (uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8);
-            syms[i + 5] = (uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8);
-            syms[i + 6] = (uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8);
-            syms[i + 7] = (uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8);
+            __m256i vcode_raw = _mm256_i32gather_epi32((const int *)(const void *)zgec_seq_lut512, vv, 2);
+            __m256i vcode32 = _mm256_and_si256(_mm256_srli_epi32(vcode_raw, 8), _mm256_set1_epi32(0xFF));
+            __m128i vcode16 = _mm_packus_epi32(_mm256_castsi256_si128(vcode32), _mm256_extracti128_si256(vcode32, 1));
+            __m128i vcode8 = _mm_packus_epi16(vcode16, vcode16);
+            zgec_wr64(syms + i, (uint64_t)_mm_cvtsi128_si64(vcode8));
         } else {
             for (size_t k = 0; k < 8; k++) {
                 uint8_t nb;

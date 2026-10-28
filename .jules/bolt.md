@@ -1178,3 +1178,12 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## bolt-2 — Sequence FSE encode + table build vectorization
+
+- **Change**: Vectorized symbol generation in `zgec_seq_stream_encode` and `zgec_seq_stream_encode_cond` using AVX2 SIMD gather (`_mm256_i32gather_epi32` from `zgec_seq_lut512`), 8-bit bitwise AND masking (`_mm256_and_si256`), and 2-stage vector packing (`_mm_packus_epi32` and `_mm_packus_epi16`) with 64-bit stores (`zgec_wr64`). Padded `zgec_seq_lut512` array declaration and definition to 513 entries in `include/zgec_seq.h` and `src/seq.c` to prevent out-of-bounds reads during 32-bit SIMD gathers at scale 2.
+- **Verification**: Output confirmed byte-identical across all compression levels. All 4/4 ctest unit test suites passed.
+- **Benchmark results**: Interleaved A/B benchmark (min and median of N=9 runs on 20MB input):
+  - Level 1: Base min=60.75ms / med=62.50ms, New min=61.37ms / med=62.07ms (med speedup +0.70%)
+  - Level 2: Base min=121.96ms / med=123.83ms, New min=122.65ms / med=123.49ms (med speedup +0.27%)
+  - Level 4: Base min=157.31ms / med=158.71ms, New min=157.35ms / med=158.64ms (med speedup +0.05%)
