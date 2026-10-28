@@ -668,10 +668,22 @@ static void zgec_granule_merge(zgec_granule *dst, const zgec_granule *src)
 {
     int s = 0;
 #if defined(__AVX2__)
-    for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-        __m256i vd = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s));
-        __m256i vs = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s));
-        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s), _mm256_add_epi32(vd, vs));
+    for (; s + 32 <= ZGEC_NSYM_LIT; s += 32) {
+        __m256i vd0 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s));
+        __m256i vs0 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s), _mm256_add_epi32(vd0, vs0));
+
+        __m256i vd1 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s + 8));
+        __m256i vs1 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s + 8));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s + 8), _mm256_add_epi32(vd1, vs1));
+
+        __m256i vd2 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s + 16));
+        __m256i vs2 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s + 16));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s + 16), _mm256_add_epi32(vd2, vs2));
+
+        __m256i vd3 = _mm256_loadu_si256((const __m256i *)(const void *)(dst->lit + s + 24));
+        __m256i vs3 = _mm256_loadu_si256((const __m256i *)(const void *)(src->lit + s + 24));
+        _mm256_storeu_si256((__m256i *)(void *)(dst->lit + s + 24), _mm256_add_epi32(vd3, vs3));
     }
 #endif
     for (; s < ZGEC_NSYM_LIT; s++) dst->lit[(size_t)s] += src->lit[(size_t)s];
@@ -1278,45 +1290,45 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
                 uint8_t p6 = lit[j + 5], n6 = lit[j + 6];
                 uint8_t p7 = lit[j + 6], n7 = lit[j + 7];
 
-                h0[(size_t)(p0 & 63u) * 256u + n0]++;
-                h1[(size_t)(p0 >> 2u) * 256u + n0]++;
-                h2[(size_t)zgec_ctx_text_lut[p0] * 256u + n0]++;
-                h3[(size_t)zgec_ctx_signed_lut[p0] * 256u + n0]++;
+                h0[((size_t)(p0 & 63u) << 8) + n0]++;
+                h1[((size_t)(p0 >> 2u) << 8) + n0]++;
+                h2[((size_t)zgec_ctx_text_lut[p0] << 8) + n0]++;
+                h3[((size_t)zgec_ctx_signed_lut[p0] << 8) + n0]++;
 
-                h0[(size_t)(p1 & 63u) * 256u + n1]++;
-                h1[(size_t)(p1 >> 2u) * 256u + n1]++;
-                h2[(size_t)zgec_ctx_text_lut[p1] * 256u + n1]++;
-                h3[(size_t)zgec_ctx_signed_lut[p1] * 256u + n1]++;
+                h0[((size_t)(p1 & 63u) << 8) + n1]++;
+                h1[((size_t)(p1 >> 2u) << 8) + n1]++;
+                h2[((size_t)zgec_ctx_text_lut[p1] << 8) + n1]++;
+                h3[((size_t)zgec_ctx_signed_lut[p1] << 8) + n1]++;
 
-                h0[(size_t)(p2 & 63u) * 256u + n2]++;
-                h1[(size_t)(p2 >> 2u) * 256u + n2]++;
-                h2[(size_t)zgec_ctx_text_lut[p2] * 256u + n2]++;
-                h3[(size_t)zgec_ctx_signed_lut[p2] * 256u + n2]++;
+                h0[((size_t)(p2 & 63u) << 8) + n2]++;
+                h1[((size_t)(p2 >> 2u) << 8) + n2]++;
+                h2[((size_t)zgec_ctx_text_lut[p2] << 8) + n2]++;
+                h3[((size_t)zgec_ctx_signed_lut[p2] << 8) + n2]++;
 
-                h0[(size_t)(p3 & 63u) * 256u + n3]++;
-                h1[(size_t)(p3 >> 2u) * 256u + n3]++;
-                h2[(size_t)zgec_ctx_text_lut[p3] * 256u + n3]++;
-                h3[(size_t)zgec_ctx_signed_lut[p3] * 256u + n3]++;
+                h0[((size_t)(p3 & 63u) << 8) + n3]++;
+                h1[((size_t)(p3 >> 2u) << 8) + n3]++;
+                h2[((size_t)zgec_ctx_text_lut[p3] << 8) + n3]++;
+                h3[((size_t)zgec_ctx_signed_lut[p3] << 8) + n3]++;
 
-                h0[(size_t)(p4 & 63u) * 256u + n4]++;
-                h1[(size_t)(p4 >> 2u) * 256u + n4]++;
-                h2[(size_t)zgec_ctx_text_lut[p4] * 256u + n4]++;
-                h3[(size_t)zgec_ctx_signed_lut[p4] * 256u + n4]++;
+                h0[((size_t)(p4 & 63u) << 8) + n4]++;
+                h1[((size_t)(p4 >> 2u) << 8) + n4]++;
+                h2[((size_t)zgec_ctx_text_lut[p4] << 8) + n4]++;
+                h3[((size_t)zgec_ctx_signed_lut[p4] << 8) + n4]++;
 
-                h0[(size_t)(p5 & 63u) * 256u + n5]++;
-                h1[(size_t)(p5 >> 2u) * 256u + n5]++;
-                h2[(size_t)zgec_ctx_text_lut[p5] * 256u + n5]++;
-                h3[(size_t)zgec_ctx_signed_lut[p5] * 256u + n5]++;
+                h0[((size_t)(p5 & 63u) << 8) + n5]++;
+                h1[((size_t)(p5 >> 2u) << 8) + n5]++;
+                h2[((size_t)zgec_ctx_text_lut[p5] << 8) + n5]++;
+                h3[((size_t)zgec_ctx_signed_lut[p5] << 8) + n5]++;
 
-                h0[(size_t)(p6 & 63u) * 256u + n6]++;
-                h1[(size_t)(p6 >> 2u) * 256u + n6]++;
-                h2[(size_t)zgec_ctx_text_lut[p6] * 256u + n6]++;
-                h3[(size_t)zgec_ctx_signed_lut[p6] * 256u + n6]++;
+                h0[((size_t)(p6 & 63u) << 8) + n6]++;
+                h1[((size_t)(p6 >> 2u) << 8) + n6]++;
+                h2[((size_t)zgec_ctx_text_lut[p6] << 8) + n6]++;
+                h3[((size_t)zgec_ctx_signed_lut[p6] << 8) + n6]++;
 
-                h0[(size_t)(p7 & 63u) * 256u + n7]++;
-                h1[(size_t)(p7 >> 2u) * 256u + n7]++;
-                h2[(size_t)zgec_ctx_text_lut[p7] * 256u + n7]++;
-                h3[(size_t)zgec_ctx_signed_lut[p7] * 256u + n7]++;
+                h0[((size_t)(p7 & 63u) << 8) + n7]++;
+                h1[((size_t)(p7 >> 2u) << 8) + n7]++;
+                h2[((size_t)zgec_ctx_text_lut[p7] << 8) + n7]++;
+                h3[((size_t)zgec_ctx_signed_lut[p7] << 8) + n7]++;
             }
             for (; j < n_lit; j++) {
                 uint8_t prev = lit[j - 1];
@@ -1580,6 +1592,49 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     memset(rs_hist, 0, sizeof(rs_hist));
     memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
+    int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
+
+    if (k <= 1 && !has_rs) {
+        uint32_t c0[256] = {0}, c1[256] = {0}, c2[256] = {0}, c3[256] = {0};
+        for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
+            size_t l_start = start[lane];
+            size_t l_end = (lane + 1 < ZGEC_NLANES) ? start[lane + 1] : n_z;
+            if (l_start >= l_end) continue;
+
+            rs_hist[z[l_start]]++;
+            rs_total++;
+
+            j = l_start + 1;
+            for (; j + 8 <= l_end; j += 8) {
+                c0[z[j]]++;     c1[z[j + 1]]++; c2[z[j + 2]]++; c3[z[j + 3]]++;
+                c0[z[j + 4]]++; c1[z[j + 5]]++; c2[z[j + 6]]++; c3[z[j + 7]]++;
+            }
+            for (; j < l_end; j++) {
+                c0[z[j]]++;
+            }
+            grp_total[0] += (l_end - (l_start + 1));
+        }
+#if defined(__AVX2__)
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s += 8) {
+            __m256i v0 = _mm256_loadu_si256((const __m256i *)(const void *)(c0 + s));
+            __m256i v1 = _mm256_loadu_si256((const __m256i *)(const void *)(c1 + s));
+            __m256i v2 = _mm256_loadu_si256((const __m256i *)(const void *)(c2 + s));
+            __m256i v3 = _mm256_loadu_si256((const __m256i *)(const void *)(c3 + s));
+            __m256i sum01 = _mm256_add_epi32(v0, v1);
+            __m256i sum23 = _mm256_add_epi32(v2, v3);
+            __m256i sum = _mm256_add_epi32(sum01, sum23);
+            _mm256_storeu_si256((__m256i *)(cls_hist + s), sum);
+        }
+#else
+        for (size_t s = 0; s < ZGEC_NSYM_LIT; s++) {
+            cls_hist[s] = c0[s] + c1[s] + c2[s] + c3[s];
+        }
+#endif
+        body += zgec_enc_entropy_bits_u32(cls_hist, ZGEC_NSYM_LIT, grp_total[0]);
+        body += zgec_enc_entropy_bits_u32(rs_hist, ZGEC_NSYM_LIT, rs_total);
+        return body;
+    }
+
     {
         /* Byte -> context group, resolved once (estimate-only: out-of-range
          * classes/groups fold to 0, as the per-byte clamps below did). */
@@ -1593,7 +1648,6 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (grp >= (unsigned)k) grp = 0u;
             grp_lut[b] = (uint8_t)grp;
         }
-        int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
         for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
             size_t l_start = start[lane];
             size_t l_end = (lane + 1 < ZGEC_NLANES) ? start[lane + 1] : n_z;
@@ -1771,6 +1825,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
     uint8_t stack_rs[8192];
     uint8_t *runstart = NULL;
     int rs_owned = 0;
+        int rs_built = 0;
     uint8_t *resid = NULL;
     int resid_owned = 0;
     double seq_bits;
@@ -1849,6 +1904,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                     pos += (size_t)ll_arr[t];
                 }
                 if (pos < n_lit_slice) zgec_rs_set(runstart, pos);
+                rs_built = 1;
             }
             {
                 double body = zgec_ctx_body_bits(seg_lit, n_lit_slice,
@@ -1927,7 +1983,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                         rs_owned = 1;
                     }
                 }
-                {
+                if (!rs_built) {
                     size_t pos = 0;
                     size_t t2;
                     zgec_rs_clear(runstart, n_lit_slice);
@@ -1937,6 +1993,7 @@ static zgec_err zgec_select_coder(const zgec_params *params,
                         pos += (size_t)ll_arr[t2];
                     }
                     if (pos < n_lit_slice) zgec_rs_set(runstart, pos);
+                    rs_built = 1;
                 }
                 if (!cls_hist) {
                     cls_hist = (uint32_t *)zgec_alloc(
