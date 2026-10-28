@@ -564,14 +564,29 @@ static unsigned fast_table_bits(size_t positions, unsigned extra_bits)
  * out is a pure load elimination: the hashes are bit-identical to the older
  * pair that each read the bytes themselves, so the parse, the ratio and the
  * byte stream do not move. */
+static inline uint64_t fast_hash_s_raw(uint64_t v)
+{
+    return (v << (64u - 8u * ZGEC_FAST_SHORT_HASH_BYTES)) * 0x9E3779B97F4A7C15ULL;
+}
+
+static inline uint64_t fast_hash_l_raw(uint64_t v)
+{
+    return v * 0xD6E8FEB86659FD93ULL;
+}
+
 static inline uint32_t fast_hash_s_v(uint64_t v)
 {
-    return (uint32_t)(((v << (64u - 8u * ZGEC_FAST_SHORT_HASH_BYTES)) * 0x9E3779B97F4A7C15ULL) >> (64u - ZGEC_FAST_SHORT_BITS));
+    return (uint32_t)(fast_hash_s_raw(v) >> (64u - ZGEC_FAST_SHORT_BITS));
 }
 
 static inline uint32_t fast_hash_l_v(uint64_t v)
 {
-    return (uint32_t)((v * 0xD6E8FEB86659FD93ULL) >> (64u - ZGEC_FAST_LONG_BITS));
+    return (uint32_t)(fast_hash_l_raw(v) >> (64u - ZGEC_FAST_LONG_BITS));
+}
+
+static inline uint32_t fast_tag_of(uint64_t h64)
+{
+    return (uint32_t)(((h64 >> 28) & 0xFEu) | 1u);
 }
 
 /* Entry packing for the two fast-tier tables. See the ZGEC_FAST_GEN comment. */
@@ -582,6 +597,11 @@ static ZGEC_ENC_TLS unsigned fast_scratch_gen;
 static inline uint32_t fast_pack(uint32_t gen, size_t pos)
 {
     return (gen << 24) | (uint32_t)pos;
+}
+
+static inline uint32_t fast_pack_tag(uint32_t tag, size_t pos)
+{
+    return (tag << 24) | ((uint32_t)pos & 0xFFFFFFu);
 }
 
 static inline int fast_live(uint32_t e, uint32_t gen)
@@ -761,7 +781,6 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
     unsigned fbits = fast_table_bits(end - prefix, extra_bits);
     unsigned sshift = (unsigned)ZGEC_FAST_SHORT_BITS - fbits;
     unsigned lshift = (unsigned)ZGEC_FAST_LONG_BITS - fbits;
-    uint32_t gen = 1u;      /* validity tag written into every entry */
 #if ZGEC_FAST_PIPE
     size_t pipe_ip = (size_t)-1; /* position the carried candidate belongs to */
     uint32_t pipe_hl = 0u;
@@ -784,32 +803,16 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         zgec_free(seq);
         return ZGEC_ERR_NOMEM;
     }
-#if ZGEC_FAST_GEN
-    if (ts_owned) {
-        /* A fresh allocation is not zeroed, so clear it and pin the tag. */
-        memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
-        memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
-        gen = 1u;
-    } else {
-        /* Scratch tables: bump the tag, clearing only when it wraps. */
-        gen = (fast_scratch_gen % 255u) + 1u;
-        if (gen == 1u) {
-            memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
-            memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
-        }
-        fast_scratch_gen = gen;
-    }
-#else
     memset(ts, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
     memset(tl, 0, ((size_t)1u << fbits) * sizeof(uint32_t));
-    gen = 1u;
-#endif
 
     /* Seed the tables with the dictionary / literal-reference prefix, sparsely. */
     for (pos = 0; pos + 8u <= prefix; pos += 4u) {
         uint64_t sv = zgec_rd64(vb + pos);
-        ts[fast_hash_s_v(sv) >> sshift] = fast_pack(gen, pos);
-        tl[fast_hash_l_v(sv) >> lshift] = fast_pack(gen, pos);
+        uint64_t hs_raw = fast_hash_s_raw(sv);
+        uint64_t hl_raw = fast_hash_l_raw(sv);
+        ts[(uint32_t)(hs_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift] = fast_pack_tag(fast_tag_of(hs_raw), pos);
+        tl[(uint32_t)(hl_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift] = fast_pack_tag(fast_tag_of(hl_raw), pos);
     }
 
     zgec_reps_init(&reps);
@@ -822,59 +825,16 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         uint32_t best_len = 0u;
         uint32_t best_off = 0u;
         uint64_t cur8 = zgec_rd64(vb + ip);
-        (void)cur8;
-        uint32_t hs = fast_hash_s_v(cur8) >> sshift;
-        uint32_t hl;
-        uint32_t cl;
-#if ZGEC_FAST_PIPE
-        if (pipe_ip == ip) {
-            hl = pipe_hl;
-            cl = pipe_cl;
-        } else {
-            hl = fast_hash_l_v(cur8) >> lshift;
-            cl = tl[hl];
-        }
-#else
-        hl = fast_hash_l_v(cur8) >> lshift;
-        cl = tl[hl];
-#endif
-#if ZGEC_FAST_PREFETCH
-        {
-            /* Prefetch the buckets of the position the skip schedule visits
-             * next if no match is taken here; the probes below then overlap
-             * the miss instead of waiting for it. */
-            size_t nxt = ip + (((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u);
-            if (nxt + 8u <= end) {
-                uint64_t nv = zgec_rd64(vb + nxt);
-                __builtin_prefetch(&ts[fast_hash_s_v(nv) >> sshift], 1, 3);
-                __builtin_prefetch(&tl[fast_hash_l_v(nv) >> lshift], 1, 3);
-            }
-        }
-#endif
-        uint32_t cs;
-        if (no_short) {
-            /* A dead tag no live entry can carry, so every short-table probe
-             * below short-circuits: fast_live(~0u, gen) is false for every
-             * gen. Output is exactly the long-table-only parse. */
-            cs = ~0u;
-        } else {
-            cs = ts[hs];
-        }
+        uint64_t hs_raw = fast_hash_s_raw(cur8);
+        uint64_t hl_raw = fast_hash_l_raw(cur8);
+        uint32_t hs = (uint32_t)(hs_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+        uint32_t hl = (uint32_t)(hl_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+        uint32_t tag_s = fast_tag_of(hs_raw);
+        uint32_t tag_l = fast_tag_of(hl_raw);
+        uint32_t cl = tl[hl];
+        uint32_t cs = no_short ? 0u : ts[hs];
+
         size_t cap = end - ip;
-        size_t step = ((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u;
-#if ZGEC_FAST_PIPE
-        {
-            size_t pnext = ip + step;
-            if (pnext + 8u <= end) {
-                uint64_t nv = zgec_rd64(vb + pnext);
-                pipe_hl = fast_hash_l_v(nv) >> lshift;
-                pipe_cl = tl[pipe_hl];
-                pipe_ip = pnext;
-            } else {
-                pipe_ip = (size_t)-1;
-            }
-        }
-#endif
 
         /* 1. Repeat offsets rep0, rep1, rep2 (4-byte minimum). Probing the
          * whole chain costs two extra 4-byte compares on the common path and
@@ -948,7 +908,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
          * When cs == cl, both tables point to the same candidate position,
          * so a single combined probe evaluates both 5-byte short and 8-byte
          * long match criteria without re-reading memory or re-calculating tail lengths. */
-        if (cs == cl && fast_live(cl, gen)) {
+        if (cs == cl && (cl >> 24) == tag_l) {
             if (fast_pos_of(cl) < ip) {
                 size_t d = ip - fast_pos_of(cl);
                 size_t check_idx_combo = (best_len >= ZGEC_FAST_MIN_SHORT) ? (size_t)best_len : (size_t)ZGEC_FAST_MIN_SHORT - 1u;
@@ -971,7 +931,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             }
         } else {
             /* 2. Long table (8-byte hash, minimum length 8). */
-            if (fast_live(cl, gen) && fast_pos_of(cl) < ip) {
+            if ((cl >> 24) == tag_l && fast_pos_of(cl) < ip) {
                 size_t d = ip - fast_pos_of(cl);
                 if (d != (size_t)best_off) {
                     uint64_t diff = zgec_rd64(vb + ip - d) ^ cur8;
@@ -987,7 +947,7 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 }
             }
             /* 3. Short table (5-byte hash, minimum length 5). */
-            if (fast_live(cs, gen) && fast_pos_of(cs) < ip) {
+            if ((cs >> 24) == tag_s && fast_pos_of(cs) < ip) {
                 size_t d = ip - fast_pos_of(cs);
                 size_t check_idx_s = (best_len >= ZGEC_FAST_MIN_SHORT) ? (size_t)best_len : (size_t)ZGEC_FAST_MIN_SHORT - 1u;
                 if (d != (size_t)best_off && check_idx_s < cap && vb[ip - d + check_idx_s] == vb[ip + check_idx_s]) {
@@ -1010,14 +970,9 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
         }
         /* Insert the visited position. */
         if (!no_short) {
-            ts[hs] = fast_pack(gen, ip);
+            ts[hs] = fast_pack_tag(tag_s, ip);
         }
-        tl[hl] = fast_pack(gen, ip);
-#if ZGEC_FAST_PIPE
-        /* The lookahead read above may have taken this very bucket before the
-         * store; the carried value must agree with a fresh load. */
-        if (pipe_ip != (size_t)-1 && pipe_hl == hl) pipe_cl = fast_pack(gen, ip);
-#endif
+        tl[hl] = fast_pack_tag(tag_l, ip);
 
 #if ZGEC_FAST_LAZY
         if (best_len >= 4u && best_len < ZGEC_FAST_LAZY_MAX && ip + 9u <= end) {
@@ -1026,8 +981,11 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
             size_t p1 = ip + 1u;
             uint32_t l1 = 0u;
             uint64_t v1 = zgec_rd64(vb + p1);
-            uint32_t c1 = tl[fast_hash_l_v(v1) >> lshift];
-            if (fast_live(c1, gen) && fast_pos_of(c1) < p1) {
+            uint64_t hl1_raw = fast_hash_l_raw(v1);
+            uint32_t hl1 = (uint32_t)(hl1_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+            uint32_t tag_l1 = fast_tag_of(hl1_raw);
+            uint32_t c1 = tl[hl1];
+            if ((c1 >> 24) == tag_l1 && fast_pos_of(c1) < p1) {
                 size_t d1 = p1 - fast_pos_of(c1);
                 uint64_t diff1 = zgec_rd64(vb + p1 - d1) ^ v1;
                 if (diff1 == 0u) {
@@ -1036,8 +994,11 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 }
             }
 #if !ZGEC_FAST_LAZY_LONG_ONLY
-            c1 = ts[fast_hash_s_v(v1) >> sshift];
-            if (fast_live(c1, gen) && fast_pos_of(c1) < p1) {
+            uint64_t hs1_raw = fast_hash_s_raw(v1);
+            uint32_t hs1 = (uint32_t)(hs1_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+            uint32_t tag_s1 = fast_tag_of(hs1_raw);
+            c1 = ts[hs1];
+            if ((c1 >> 24) == tag_s1 && fast_pos_of(c1) < p1) {
                 size_t d1 = p1 - fast_pos_of(c1);
                 uint64_t diff1 = zgec_rd64(vb + p1 - d1) ^ v1;
                 if (diff1 != 0u) {
@@ -1108,24 +1069,32 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 for (; ins + 2u <= ins_end; ins += 2u) {
                     uint64_t iv0 = zgec_rd64(vb + ins);
                     uint64_t iv1 = zgec_rd64(vb + ins + 1u);
-                    uint32_t hs0 = fast_hash_s_v(iv0) >> sshift;
-                    uint32_t hl0 = fast_hash_l_v(iv0) >> lshift;
-                    uint32_t hs1 = fast_hash_s_v(iv1) >> sshift;
-                    uint32_t hl1 = fast_hash_l_v(iv1) >> lshift;
-                    ts[hs0] = fast_pack(gen, ins);
+                    uint64_t hs0_raw = fast_hash_s_raw(iv0);
+                    uint64_t hl0_raw = fast_hash_l_raw(iv0);
+                    uint64_t hs1_raw = fast_hash_s_raw(iv1);
+                    uint64_t hl1_raw = fast_hash_l_raw(iv1);
+                    uint32_t hs0 = (uint32_t)(hs0_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+                    uint32_t hl0 = (uint32_t)(hl0_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+                    uint32_t hs1 = (uint32_t)(hs1_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+                    uint32_t hl1 = (uint32_t)(hl1_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+                    if (!no_short) ts[hs0] = fast_pack_tag(fast_tag_of(hs0_raw), ins);
 #if ZGEC_FAST_INS_LONG
-                    tl[hl0] = fast_pack(gen, ins);
+                    tl[hl0] = fast_pack_tag(fast_tag_of(hl0_raw), ins);
 #endif
-                    ts[hs1] = fast_pack(gen, ins + 1u);
+                    if (!no_short) ts[hs1] = fast_pack_tag(fast_tag_of(hs1_raw), ins + 1u);
 #if ZGEC_FAST_INS_LONG
-                    tl[hl1] = fast_pack(gen, ins + 1u);
+                    tl[hl1] = fast_pack_tag(fast_tag_of(hl1_raw), ins + 1u);
 #endif
                 }
                 for (; ins < ins_end; ins++) {
                     uint64_t iv = zgec_rd64(vb + ins);
-                    ts[fast_hash_s_v(iv) >> sshift] = fast_pack(gen, ins);
+                    uint64_t hs_raw_i = fast_hash_s_raw(iv);
+                    uint64_t hl_raw_i = fast_hash_l_raw(iv);
+                    uint32_t hs_idx = (uint32_t)(hs_raw_i >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+                    uint32_t hl_idx = (uint32_t)(hl_raw_i >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+                    if (!no_short) ts[hs_idx] = fast_pack_tag(fast_tag_of(hs_raw_i), ins);
 #if ZGEC_FAST_INS_LONG
-                    tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, ins);
+                    tl[hl_idx] = fast_pack_tag(fast_tag_of(hl_raw_i), ins);
 #endif
                 }
                 ins = ip + (size_t)best_len;
@@ -1141,25 +1110,33 @@ static zgec_err fast_parse(zgec_parse *p, const uint8_t *vb, size_t prefix, size
                 size_t ie = ip + (size_t)best_len;
                 if (i2 + 8u <= end) {
                     uint64_t iv = zgec_rd64(vb + i2);
-                    ts[fast_hash_s_v(iv) >> sshift] = fast_pack(gen, i2);
-                    tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i2);
+                    uint64_t hs_raw = fast_hash_s_raw(iv);
+                    uint64_t hl_raw = fast_hash_l_raw(iv);
+                    uint32_t hs_idx = (uint32_t)(hs_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+                    uint32_t hl_idx = (uint32_t)(hl_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+                    if (!no_short) ts[hs_idx] = fast_pack_tag(fast_tag_of(hs_raw), i2);
+                    tl[hl_idx] = fast_pack_tag(fast_tag_of(hl_raw), i2);
                 }
                 if (ie >= 2u && ie - 2u + 8u <= end) {
                     size_t i1 = ie - 2u;
                     uint64_t iv = zgec_rd64(vb + i1);
-                    tl[fast_hash_l_v(iv) >> lshift] = fast_pack(gen, i1);
+                    uint64_t hl_raw = fast_hash_l_raw(iv);
+                    uint32_t hl_idx = (uint32_t)(hl_raw >> (64u - ZGEC_FAST_LONG_BITS)) >> lshift;
+                    tl[hl_idx] = fast_pack_tag(fast_tag_of(hl_raw), i1);
                 }
                 if (ie >= 1u && ie - 1u + 8u <= end) {
                     size_t i1 = ie - 1u;
                     uint64_t iv = zgec_rd64(vb + i1);
-                    ts[fast_hash_s_v(iv) >> sshift] = fast_pack(gen, i1);
+                    uint64_t hs_raw = fast_hash_s_raw(iv);
+                    uint32_t hs_idx = (uint32_t)(hs_raw >> (64u - ZGEC_FAST_SHORT_BITS)) >> sshift;
+                    if (!no_short) ts[hs_idx] = fast_pack_tag(fast_tag_of(hs_raw), i1);
                 }
             }
 #endif
             ip += best_len;
             anchor = ip;
         } else {
-            step = ((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u;
+            size_t step = ((ip - anchor) >> ZGEC_FAST_SHIFT) + 1u;
             ip += step;
         }
     }
