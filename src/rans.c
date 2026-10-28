@@ -846,8 +846,47 @@ void zgec_rans_histograms(uint32_t *tables_counts, int n_tables,
     zgec_rans_build_idx_lut(idx_lut, ctx_mode, class_map, n_tables - 1);
 
     int rs_empty = zgec_rs_is_empty(runstart, n_lit);
+    int has_sentinel = 0;
+    for (unsigned b = 0; b < 256u; b++) {
+        if (idx_lut[b] == 0xFFu) { has_sentinel = 1; break; }
+    }
 
-    if (rs_empty) {
+    if (rs_empty && !has_sentinel) {
+        /* Fast path: no runstarts and no sentinels in idx_lut */
+        for (unsigned lane = 0; lane < 8; lane++) {
+            size_t lane_len = len[lane];
+            size_t lane_start = start[lane];
+            if (lane_len > 0) {
+                tables_counts[(size_t)(n_tables - 1) * (size_t)ZGEC_NSYM_LIT + (size_t)Z[lane_start]]++;
+                size_t t = 1;
+                for (; t + 8 <= lane_len; t += 8) {
+                    size_t j = lane_start + t;
+                    uint64_t w0 = zgec_rd64(Z + j - 1);
+                    uint8_t p0 = (uint8_t)w0,        n0 = (uint8_t)(w0 >> 8);
+                    uint8_t p1 = (uint8_t)(w0 >> 8),  n1 = (uint8_t)(w0 >> 16);
+                    uint8_t p2 = (uint8_t)(w0 >> 16), n2 = (uint8_t)(w0 >> 24);
+                    uint8_t p3 = (uint8_t)(w0 >> 24), n3 = (uint8_t)(w0 >> 32);
+                    uint8_t p4 = (uint8_t)(w0 >> 32), n4 = (uint8_t)(w0 >> 40);
+                    uint8_t p5 = (uint8_t)(w0 >> 40), n5 = (uint8_t)(w0 >> 48);
+                    uint8_t p6 = (uint8_t)(w0 >> 48), n6 = (uint8_t)(w0 >> 56);
+                    uint8_t p7 = (uint8_t)(w0 >> 56), n7 = Z[j + 7];
+
+                    tables_counts[(size_t)idx_lut[p0] * 256u + n0]++;
+                    tables_counts[(size_t)idx_lut[p1] * 256u + n1]++;
+                    tables_counts[(size_t)idx_lut[p2] * 256u + n2]++;
+                    tables_counts[(size_t)idx_lut[p3] * 256u + n3]++;
+                    tables_counts[(size_t)idx_lut[p4] * 256u + n4]++;
+                    tables_counts[(size_t)idx_lut[p5] * 256u + n5]++;
+                    tables_counts[(size_t)idx_lut[p6] * 256u + n6]++;
+                    tables_counts[(size_t)idx_lut[p7] * 256u + n7]++;
+                }
+                for (; t < lane_len; t++) {
+                    size_t j = lane_start + t;
+                    tables_counts[(size_t)idx_lut[Z[j - 1]] * 256u + Z[j]]++;
+                }
+            }
+        }
+    } else if (rs_empty) {
         /* When runstart has no bits set, skip testing zgec_rs_get() per literal. */
         for (unsigned lane = 0; lane < 8; lane++) {
             size_t lane_len = len[lane];

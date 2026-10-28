@@ -1690,8 +1690,19 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
 #endif
 
             if (ll > 0) {
-                uint32_t u;
-                for (u = 0; u < ll; u++) lit_hist[vb[anchor + (size_t)u]]++;
+                size_t u = 0;
+                for (; u + 8 <= ll; u += 8) {
+                    uint64_t v8 = zgec_rd64(vb + anchor + u);
+                    lit_hist[(uint8_t)v8]++;
+                    lit_hist[(uint8_t)(v8 >> 8)]++;
+                    lit_hist[(uint8_t)(v8 >> 16)]++;
+                    lit_hist[(uint8_t)(v8 >> 24)]++;
+                    lit_hist[(uint8_t)(v8 >> 32)]++;
+                    lit_hist[(uint8_t)(v8 >> 40)]++;
+                    lit_hist[(uint8_t)(v8 >> 48)]++;
+                    lit_hist[(uint8_t)(v8 >> 56)]++;
+                }
+                for (; u < ll; u++) lit_hist[vb[anchor + u]]++;
                 memcpy(p->lit + p->n_lit, vb + anchor, ll);
                 p->n_lit += ll;
                 lit_total += ll;

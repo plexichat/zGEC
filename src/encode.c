@@ -422,19 +422,24 @@ static double zgec_enc_entropy_bits_u32(const uint32_t *hist, int nsym,
     {
         const uint16_t *lt = zgec_l256_get();
         uint64_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+        uint64_t a4 = 0, a5 = 0, a6 = 0, a7 = 0;
         int s = 0;
-        /* Four accumulators: the adds are exact integers, so the split
+        /* Eight accumulators: the adds are exact integers, so the split
          * cannot change the value, and it keeps the sum off a single
          * nsym-deep dependency chain. */
-        for (; s + 4 <= nsym; s += 4) {
+        for (; s + 8 <= nsym; s += 8) {
             a0 += zgec_l256_term(hist[s + 0], lt);
             a1 += zgec_l256_term(hist[s + 1], lt);
             a2 += zgec_l256_term(hist[s + 2], lt);
             a3 += zgec_l256_term(hist[s + 3], lt);
+            a4 += zgec_l256_term(hist[s + 4], lt);
+            a5 += zgec_l256_term(hist[s + 5], lt);
+            a6 += zgec_l256_term(hist[s + 6], lt);
+            a7 += zgec_l256_term(hist[s + 7], lt);
         }
         for (; s < nsym; s++) a0 += zgec_l256_term(hist[s], lt);
         {
-            uint64_t acc = (a0 + a1) + (a2 + a3);
+            uint64_t acc = ((a0 + a1) + (a2 + a3)) + ((a4 + a5) + (a6 + a7));
             int64_t diff = (int64_t)(total * (uint64_t)zgec_l256_u64(total))
                          - (int64_t)acc;
             return (double)diff * (1.0 / 256.0);
@@ -1055,7 +1060,17 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
     /* Seed the delta cache once (all pairs of singletons). */
     for (c = 0; c < ZGEC_ENC_NCLASS; c++) {
         int bb;
+        if (ctot[(size_t)c] == 0) {
+            for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+                dlt[(size_t)c][(size_t)bb] = 0.0;
+            }
+            continue;
+        }
         for (bb = c + 1; bb < ZGEC_ENC_NCLASS; bb++) {
+            if (ctot[(size_t)bb] == 0) {
+                dlt[(size_t)c][(size_t)bb] = 0.0;
+                continue;
+            }
             uint64_t mt = ctot[(size_t)c] + ctot[(size_t)bb];
             s = 0;
 #if defined(__AVX2__)
@@ -1115,29 +1130,33 @@ static void zgec_cluster_greedy(const uint32_t *cls_hist /*[64][256]*/,
             int ver_a = -1;
             int ver_b = -1;
             double ver_delta = 0.0;
-            s = 0;
+            if (ctot[(size_t)cand_a] == 0 || ctot[(size_t)cand_b] == 0) {
+                cand_delta = 0.0;
+            } else {
+                s = 0;
 #if defined(__AVX2__)
-            for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
-                __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
-                __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
-                _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va, vb256));
-            }
-            for (; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)cand_a][(size_t)s] +
-                    work[(size_t)cand_b][(size_t)s];
-            }
+                for (; s + 8 <= ZGEC_NSYM_LIT; s += 8) {
+                    __m256i va = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_a] + s));
+                    __m256i vb256 = _mm256_loadu_si256((const __m256i *)(const void *)(work[(size_t)cand_b] + s));
+                    _mm256_storeu_si256((__m256i *)(void *)(merged + s), _mm256_add_epi32(va, vb256));
+                }
+                for (; s < ZGEC_NSYM_LIT; s++) {
+                    merged[(size_t)s] =
+                        work[(size_t)cand_a][(size_t)s] +
+                        work[(size_t)cand_b][(size_t)s];
+                }
 #else
-            for (; s < ZGEC_NSYM_LIT; s++) {
-                merged[(size_t)s] =
-                    work[(size_t)cand_a][(size_t)s] +
-                    work[(size_t)cand_b][(size_t)s];
-            }
+                for (; s < ZGEC_NSYM_LIT; s++) {
+                    merged[(size_t)s] =
+                        work[(size_t)cand_a][(size_t)s] +
+                        work[(size_t)cand_b][(size_t)s];
+                }
 #endif
-            cand_delta =
-                zgec_class_entropy(merged, ctot[(size_t)cand_a] +
-                                           ctot[(size_t)cand_b]) -
-                cent[(size_t)cand_a] - cent[(size_t)cand_b];
+                cand_delta =
+                    zgec_class_entropy(merged, ctot[(size_t)cand_a] +
+                                               ctot[(size_t)cand_b]) -
+                    cent[(size_t)cand_a] - cent[(size_t)cand_b];
+            }
             dlt[(size_t)cand_a][(size_t)cand_b] = cand_delta;
             for (a = 0; a < ZGEC_ENC_NCLASS; a++) {
                 int bb;
@@ -1269,14 +1288,15 @@ static zgec_err zgec_select_contexts(const uint8_t *lit, size_t n_lit,
         if (zgec_rs_is_empty(runstart, n_lit)) {
             j = 1;
             for (; j + 8 <= n_lit; j += 8) {
-                uint8_t p0 = lit[j - 1], n0 = lit[j];
-                uint8_t p1 = lit[j], n1 = lit[j + 1];
-                uint8_t p2 = lit[j + 1], n2 = lit[j + 2];
-                uint8_t p3 = lit[j + 2], n3 = lit[j + 3];
-                uint8_t p4 = lit[j + 3], n4 = lit[j + 4];
-                uint8_t p5 = lit[j + 4], n5 = lit[j + 5];
-                uint8_t p6 = lit[j + 5], n6 = lit[j + 6];
-                uint8_t p7 = lit[j + 6], n7 = lit[j + 7];
+                uint64_t w0 = zgec_rd64(lit + j - 1);
+                uint8_t p0 = (uint8_t)w0,        n0 = (uint8_t)(w0 >> 8);
+                uint8_t p1 = (uint8_t)(w0 >> 8),  n1 = (uint8_t)(w0 >> 16);
+                uint8_t p2 = (uint8_t)(w0 >> 16), n2 = (uint8_t)(w0 >> 24);
+                uint8_t p3 = (uint8_t)(w0 >> 24), n3 = (uint8_t)(w0 >> 32);
+                uint8_t p4 = (uint8_t)(w0 >> 32), n4 = (uint8_t)(w0 >> 40);
+                uint8_t p5 = (uint8_t)(w0 >> 40), n5 = (uint8_t)(w0 >> 48);
+                uint8_t p6 = (uint8_t)(w0 >> 48), n6 = (uint8_t)(w0 >> 56);
+                uint8_t p7 = (uint8_t)(w0 >> 56), n7 = lit[j + 7];
 
                 h0[(size_t)(p0 & 63u) * 256u + n0]++;
                 h1[(size_t)(p0 >> 2u) * 256u + n0]++;
