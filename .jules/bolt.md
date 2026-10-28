@@ -1178,3 +1178,10 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## Task jules-2 (bolt-context-sublit-opt)
+- Vectorized `zgec_cluster_greedy` in `src/encode.c` using 4-wide 256-bit AVX2 SIMD (`_mm256_add_epi32` across 32 uint32_t elements per step, `s += 32`) for initial class histogram copying and total accumulation, singleton delta seeding, candidate delta verification, and cluster merging with zero-class total (`ctot == 0`) short-circuiting.
+- Optimized `zgec_select_coder` by tracking `rs_built` to eliminate redundant runstart bitmask rebuilds when evaluating sub-literal contexts after plain literal context evaluation.
+- Optimized `zgec_select_contexts` by splitting 4-way class histogram accumulation into two 2-way passes (`h0`+`h1` and `h2`+`h3`), eliminating L1 cache store forwarding stalls and reducing active cache line write streams.
+- Optimized `zgec_ctx_body_bits` by pre-scaling group lookup table entries (`grp_off_lut` storing `grp << 8`) and removing loop-carried `grp_total` scalar increments (passing `ZGEC_ENC_TOTAL_UNKNOWN` to `zgec_enc_entropy_bits_u32`).
+- Result: Byte-identical output across all levels, 100% test pass rate on `ctest` conformance/smoke/block/dedup test suites and lossless roundtrip verification.
