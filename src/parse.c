@@ -1508,6 +1508,10 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
     size_t end = prefix + raw_size;
     size_t anchor = ip;
 
+    int has_deferred = 0;
+    zgec_match deferred_match;
+    uint32_t deferred_rep_len[3] = {0, 0, 0};
+
     /* Per-position order (section 11.3): hash plus
      * bucket prefetch for visited positions, rep
      * checks, long table then short table with SIMD
@@ -1525,28 +1529,36 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
         uint32_t cur_len = 0;
         uint32_t cur_off = 0;
         zgec_match match;
-
-        /* Prefetch the upcoming input line; the
-         * finder prefetches the hash bucket lines of
-         * each visited position internally. */
-        if (ip + (size_t)64 <= end) {
-            __builtin_prefetch((const void *)(vb + ip + (size_t)64), 0, 3);
-        }
-#if ZGEC_PARSE_PREFETCH
-        {
-            /* Hide table latency: prefetch the buckets of the position the
-             * skip schedule visits next (and ip + 1 for the lazy probe)
-             * before spending a whole find on ip. */
-            size_t nstep = ((ip - anchor) >> shift) + (size_t)1;
-            if (nstep > (size_t)PARSE_MAX_STEP) nstep = (size_t)PARSE_MAX_STEP;
-            zgec_matcher_prefetch(m, vb, ip + nstep);
-            if (nstep != (size_t)1) zgec_matcher_prefetch(m, vb, ip + (size_t)1);
-        }
-#endif
         uint32_t rep_len[3];
-        match = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1],
-                                      reps.rep[2], 4u, (uint32_t)(end - ip),
-                                      rep_len);
+
+        if (has_deferred) {
+            match = deferred_match;
+            rep_len[0] = deferred_rep_len[0];
+            rep_len[1] = deferred_rep_len[1];
+            rep_len[2] = deferred_rep_len[2];
+            has_deferred = 0;
+        } else {
+            /* Prefetch the upcoming input line; the
+             * finder prefetches the hash bucket lines of
+             * each visited position internally. */
+            if (ip + (size_t)64 <= end) {
+                __builtin_prefetch((const void *)(vb + ip + (size_t)64), 0, 3);
+            }
+#if ZGEC_PARSE_PREFETCH
+            {
+                /* Hide table latency: prefetch the buckets of the position the
+                 * skip schedule visits next (and ip + 1 for the lazy probe)
+                 * before spending a whole find on ip. */
+                size_t nstep = ((ip - anchor) >> shift) + (size_t)1;
+                if (nstep > (size_t)PARSE_MAX_STEP) nstep = (size_t)PARSE_MAX_STEP;
+                zgec_matcher_prefetch(m, vb, ip + nstep);
+                if (nstep != (size_t)1) zgec_matcher_prefetch(m, vb, ip + (size_t)1);
+            }
+#endif
+            match = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1],
+                                          reps.rep[2], 4u, (uint32_t)(end - ip),
+                                          rep_len);
+        }
         ll = (uint32_t)(ip - anchor);
         float ll_cost = parse_ll_cost(ll, l2tot[0], ll_base);
         if (match.length >= 4u) {
@@ -1667,6 +1679,12 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
              * 0/1 select, not a length branch. */
             defer = (nscore > base) ? 1u : 0u;
             if (defer != 0u) {
+                has_deferred = 1;
+                deferred_match = nm;
+                deferred_rep_len[0] = nrep_len[0];
+                deferred_rep_len[1] = nrep_len[1];
+                deferred_rep_len[2] = nrep_len[2];
+
                 zgec_matcher_insert(m, vb, ip);
                 ip += (size_t)1;
                 continue;
@@ -1690,9 +1708,20 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
 #endif
 
             if (ll > 0) {
-                uint32_t u;
-                for (u = 0; u < ll; u++) lit_hist[vb[anchor + (size_t)u]]++;
-                memcpy(p->lit + p->n_lit, vb + anchor, ll);
+                size_t u = 0;
+                const uint8_t *lptr = vb + anchor;
+                for (; u + 8u <= (size_t)ll; u += 8u) {
+                    lit_hist[lptr[u]]++;
+                    lit_hist[lptr[u + 1]]++;
+                    lit_hist[lptr[u + 2]]++;
+                    lit_hist[lptr[u + 3]]++;
+                    lit_hist[lptr[u + 4]]++;
+                    lit_hist[lptr[u + 5]]++;
+                    lit_hist[lptr[u + 6]]++;
+                    lit_hist[lptr[u + 7]]++;
+                }
+                for (; u < (size_t)ll; u++) lit_hist[lptr[u]]++;
+                memcpy(p->lit + p->n_lit, lptr, ll);
                 p->n_lit += ll;
                 lit_total += ll;
             }

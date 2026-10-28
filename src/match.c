@@ -1142,27 +1142,29 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                  * the hoisted validation above already covers it in-tree. */
                 if ((size_t)d <= m->vb_capacity && hash_min <= cap) {
                     uint32_t target_len_long = (best.length > hash_min) ? best.length : hash_min;
-                    uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
-                    if (target_len_long >= 8u) {
-                        if (diff == 0u) {
-                            if (target_len_long <= 8u ||
-                                (target_len_long <= cap &&
-                                 vb[ip - (size_t)d + (size_t)target_len_long - 1u] ==
-                                 vb[ip + (size_t)target_len_long - 1u])) {
+                    if (target_len_long > 8u &&
+                        (target_len_long > cap ||
+                         vb[ip - (size_t)d + (size_t)target_len_long - 1u] !=
+                         vb[ip + (size_t)target_len_long - 1u])) {
+                        /* Cannot reach target_len_long */
+                    } else {
+                        uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
+                        if (target_len_long >= 8u) {
+                            if (diff == 0u) {
                                 len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                                 if (len >= hash_min) {
                                     mf_update_best(d, len, &best, rep0, rep1, rep2,
                                                    &best_is_rep);
                                 }
                             }
-                        }
-                    } else {
-                        uint32_t match_bytes = (diff == 0u)
-                                              ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
-                                              : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
-                        if (match_bytes >= target_len_long && match_bytes >= hash_min) {
-                            mf_update_best(d, match_bytes, &best, rep0, rep1, rep2,
-                                           &best_is_rep);
+                        } else {
+                            uint32_t match_bytes = (diff == 0u)
+                                                  ? mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap)
+                                                  : (uint32_t)((unsigned)__builtin_ctzll(diff) >> 3);
+                            if (match_bytes >= target_len_long && match_bytes >= hash_min) {
+                                mf_update_best(d, match_bytes, &best, rep0, rep1, rep2,
+                                               &best_is_rep);
+                            }
                         }
                     }
                 }
@@ -1253,15 +1255,15 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
                  * candidate. */
                 uint32_t target_len = (best.length > hash_min) ? best.length : hash_min;
                 if (has_v8) {
+                    if (target_len > 8u &&
+                        (target_len > cap ||
+                         vb[ip - (size_t)d + (size_t)target_len - 1u] !=
+                         vb[ip + (size_t)target_len - 1u])) {
+                        continue;
+                    }
                     uint64_t diff = zgec_rd64(vb + ip - (size_t)d) ^ v8;
                     if (target_len >= 8u) {
                         if (diff != 0u) continue;
-                        if (target_len > 8u &&
-                            (target_len > cap ||
-                             vb[ip - (size_t)d + (size_t)target_len - 1u] !=
-                             vb[ip + (size_t)target_len - 1u])) {
-                            continue;
-                        }
                         len = mf_match_len_slow(vb + ip - (size_t)d, vb + ip, cap);
                     } else {
                         uint32_t match_bytes = (diff == 0u)
