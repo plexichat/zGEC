@@ -2716,6 +2716,8 @@ typedef struct {
     const zgec_footer *f;
     const uint8_t *src;
     size_t src_size;
+    int slot_owned;
+    zgec_export_slot stack_slot[64];
 } zgec_export_cache;
 
 /* Export one predecessor record's literals. RAW and RLE yield the block
@@ -2766,13 +2768,13 @@ static void zgec_export_cache_free(zgec_export_cache *c)
     if (c == NULL) return;
     if (c->slot != NULL) {
         for (i = 0; i < c->nblk; i++) {
-            zgec_mu_destroy(&c->slot[i].mu);
+            if (c->slot[i].mu.ok) zgec_mu_destroy(&c->slot[i].mu);
             /* An alias points into the frame: releasing it would free a
              * pointer that was never allocated. */
             if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
         }
     }
-    zgec_free(c->slot);
+    if (c->slot_owned && c->slot != NULL) zgec_free(c->slot);
     memset(c, 0, sizeof(*c));
 }
 
@@ -2806,23 +2808,19 @@ static void zgec_export_cache_init(zgec_export_cache *c,
     c->src_size = src_size;
     c->nblk = (size_t)f->block_count;
     if (c->nblk > SIZE_MAX / sizeof(*c->slot)) return; /* stays disabled */
-    c->slot = (zgec_export_slot *)zgec_alloc(c->nblk * sizeof(*c->slot),
-                                            _Alignof(zgec_export_slot));
-    if (c->slot == NULL) {
-        c->nblk = 0u;
-        return;
-    }
-    memset(c->slot, 0, c->nblk * sizeof(*c->slot));
-    for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
-    for (i = 0; i < c->nblk; i++) {
-        if (c->slot[i].mu.ok == 0) {
-            /* Without the slot locks the exporters could not agree on a
-             * result, so the frame has to go without the cache rather
-             * than risk a duplicated export. */
-            zgec_export_cache_free(c);
+    if (c->nblk <= sizeof(c->stack_slot) / sizeof(c->stack_slot[0])) {
+        c->slot = c->stack_slot;
+        c->slot_owned = 0;
+    } else {
+        c->slot = (zgec_export_slot *)zgec_alloc(c->nblk * sizeof(*c->slot),
+                                                _Alignof(zgec_export_slot));
+        if (c->slot == NULL) {
+            c->nblk = 0u;
             return;
         }
+        c->slot_owned = 1;
     }
+    memset(c->slot, 0, c->nblk * sizeof(*c->slot));
     for (i = 0; i < c->nblk; i++) {
         const zgec_footer_block_entry *be = &f->blocks[i];
         uint8_t D = be->lit_ref_depth;
@@ -2830,6 +2828,18 @@ static void zgec_export_cache_init(zgec_export_cache *c,
         if (D == 0u || (size_t)D > i) continue;
         for (k = 0; k < D; k++)
             c->slot[i - (size_t)D + (size_t)k].refs++;
+    }
+    for (i = 0; i < c->nblk; i++) {
+        if (c->slot[i].refs > 0) {
+            zgec_mu_init(&c->slot[i].mu);
+            if (c->slot[i].mu.ok == 0) {
+                /* Without the slot locks the exporters could not agree on a
+                 * result, so the frame has to go without the cache rather
+                 * than risk a duplicated export. */
+                zgec_export_cache_free(c);
+                return;
+            }
+        }
     }
 }
 
