@@ -347,6 +347,51 @@ static void test_corrupted_bitstreams(void)
         CHECK(err != ZGEC_OK, "random noise length rejected");
         zgec_free(out); out = NULL;
     }
+
+    /* Valid compressed stream generation and mutation fuzzing */
+    uint8_t src_data[512];
+    for (size_t i = 0; i < sizeof(src_data); i++) {
+        src_data[i] = (uint8_t)((i * 31 + 17) & 0xFF);
+    }
+    uint8_t *cmp = NULL;
+    size_t cmp_size = 0;
+    err = zgec_compress(src_data, sizeof(src_data), &cmp, &cmp_size);
+    CHECK(err == ZGEC_OK && cmp != NULL && cmp_size > 0, "compress sample data");
+
+    if (err == ZGEC_OK && cmp != NULL) {
+        /* Verify truncation at every byte boundary */
+        for (size_t t = 0; t < cmp_size; t++) {
+            out = NULL; out_size = 0;
+            err = zgec_decompress(cmp, t, &out, &out_size);
+            CHECK(err != ZGEC_OK, "truncated valid stream rejected");
+            zgec_free(out);
+        }
+
+        /* Bit flip / byte corruption mutation fuzzing */
+        uint8_t *corrupt_buf = (uint8_t *)zgec_alloc(cmp_size, 64);
+        CHECK(corrupt_buf != NULL, "alloc corrupt_buf");
+        if (corrupt_buf) {
+            static const uint8_t mut_vals[] = {0x00, 0x7F, 0x80, 0xFF, 0x5A};
+            memcpy(corrupt_buf, cmp, cmp_size);
+            for (size_t off = 0; off < cmp_size; off += 3) {
+                for (size_t vi = 0; vi < sizeof(mut_vals); vi++) {
+                    uint8_t orig = corrupt_buf[off];
+                    corrupt_buf[off] = mut_vals[vi];
+                    out = NULL; out_size = 0;
+                    err = zgec_decompress(corrupt_buf, cmp_size, &out, &out_size);
+                    if (err == ZGEC_OK) {
+                        /* Decompression succeeded without memory fault */
+                        CHECK(out != NULL || out_size == 0, "valid mutate non-null out");
+                    }
+                    zgec_free(out);
+                    corrupt_buf[off] = orig;
+                }
+            }
+            zgec_free(corrupt_buf);
+        }
+        zgec_free(cmp);
+    }
+
     printf("corrupted bitstreams ok\n");
 }
 
