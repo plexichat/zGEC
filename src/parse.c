@@ -1314,7 +1314,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
                           const uint8_t *src, size_t raw_size,
                           const uint8_t *dict, size_t dict_size,
                           const uint8_t *litref, size_t litref_size,
-                          zgec_tier tier, double lambda, int fast_dial)
+                          zgec_tier tier, double lambda, int fast_dial, int lazy_max)
 {
     if (!out) return ZGEC_ERR_INVAL;
     /* Never leave a stale pointer behind on the failure paths below. */
@@ -1350,6 +1350,7 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
     if (!isfinite(lambda)) lambda = 0.0;
     double lam = (lambda < 0.0) ? 0.0 : ((lambda > 4.0) ? 4.0 : lambda);
     float lscale = 1.0f + 0.25f * (float)lam;
+    uint32_t lazy_max_cap = (lazy_max > 0) ? (uint32_t)lazy_max : PARSE_LAZY_MAX_LEN;
 
     /* Sequence capacity from the input rather than a flat 65536 records:
      * at 12 bytes a record that is ~768 KiB, allocated even for a 64-byte
@@ -1507,6 +1508,11 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
     size_t ip = prefix;
     size_t end = prefix + raw_size;
     size_t anchor = ip;
+    int has_deferred_match = 0;
+    zgec_match deferred_match;
+    uint32_t deferred_rep_len[3] = { 0u, 0u, 0u };
+    deferred_match.offset = 0;
+    deferred_match.length = 0;
 
     /* Per-position order (section 11.3): hash plus
      * bucket prefetch for visited positions, rep
@@ -1544,9 +1550,17 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
         }
 #endif
         uint32_t rep_len[3];
-        match = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1],
-                                      reps.rep[2], 4u, (uint32_t)(end - ip),
-                                      rep_len);
+        if (has_deferred_match) {
+            match = deferred_match;
+            rep_len[0] = deferred_rep_len[0];
+            rep_len[1] = deferred_rep_len[1];
+            rep_len[2] = deferred_rep_len[2];
+            has_deferred_match = 0;
+        } else {
+            match = zgec_matcher_find_lens(m, vb, ip, reps.rep[0], reps.rep[1],
+                                          reps.rep[2], 4u, (uint32_t)(end - ip),
+                                          rep_len);
+        }
         ll = (uint32_t)(ip - anchor);
         float ll_cost = parse_ll_cost(ll, l2tot[0], ll_base);
         if (match.length >= 4u) {
@@ -1609,8 +1623,8 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
         /* Lazy evaluation at ip + 1, driven by the
          * same price score and selected with a
          * conditional move on the score. */
-        if (PARSE_LAZY_MAX_LEN > 0u && cur_len > 0u &&
-            cur_len <= PARSE_LAZY_MAX_LEN &&
+        if (lazy_max_cap > 0u && cur_len > 0u &&
+            cur_len <= lazy_max_cap &&
             tier >= ZGEC_TIER_MAIN && ip + (size_t)5 <= end) {
             uint32_t min_lazy_len = (uint32_t)(cur_score / lbar) + 1u;
             if (min_lazy_len < 4u) min_lazy_len = 4u;
@@ -1668,6 +1682,11 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
             defer = (nscore > base) ? 1u : 0u;
             if (defer != 0u) {
                 zgec_matcher_insert(m, vb, ip);
+                has_deferred_match = 1;
+                deferred_match = nm;
+                deferred_rep_len[0] = nrep_len[0];
+                deferred_rep_len[1] = nrep_len[1];
+                deferred_rep_len[2] = nrep_len[2];
                 ip += (size_t)1;
                 continue;
             }
@@ -1805,5 +1824,5 @@ zgec_err zgec_parse_block_ex(zgec_parse **out,
                           zgec_tier tier, double lambda)
 {
     return zgec_parse_block_dial(out, src, raw_size, dict, dict_size,
-                                 litref, litref_size, tier, lambda, 0);
+                                 litref, litref_size, tier, lambda, 0, 0);
 }

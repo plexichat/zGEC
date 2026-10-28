@@ -281,6 +281,7 @@ typedef struct {
     int       filter;
     int       ck;
     int       block_log2;
+    int       lazy_max;
     int       impl;   /* 1 = implemented preset, 0 = reserved slot */
 } cli_level;
 
@@ -345,31 +346,31 @@ typedef struct {
  * (fast+ctx+sub+cond, 63,055,806 B at 4.7 s) stays reachable as level 6
  * plus --conditioning. */
 static const cli_level cli_levels[CLI_LEVEL_MAX] = {
-    /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  6 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 0, 0, 0, 0, 0, 21, 1 },
-    /*  7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
-    /*  8 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
-    /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 1 },
-    /* 11 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 12 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21, 1 },
-    /* 13 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 1, 21, 1 },
-    /* 14 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 21, 1 },
-    /* 15 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 1 },
-    /* 16 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 1 },
-    /* 17 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 1 },
-    /* 18 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 1 },
-    /* 19 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 20 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 21 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 22 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 23 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 24 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 25 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 }
+    /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  6 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 0, 1 },
+    /*  8 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 0, 1 },
+    /*  9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 0, 1 },
+    /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0, 1 },
+    /* 11 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0, 0 },
+    /* 12 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21, 0, 1 },
+    /* 13 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 1, 21, 0, 1 },
+    /* 14 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 21, 0, 1 },
+    /* 15 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 32, 1 },
+    /* 16 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 48, 1 },
+    /* 17 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 64, 1 },
+    /* 18 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 96, 1 },
+    /* 19 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 128, 1 },
+    /* 20 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 192, 1 },
+    /* 21 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 256, 1 },
+    /* 22 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 384, 1 },
+    /* 23 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 512, 1 },
+    /* 24 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 768, 1 },
+    /* 25 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1024, 1 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)
@@ -388,6 +389,7 @@ static void cli_apply_level(zgec_params *p, int level)
     p->use_dicts = l->dicts;
     p->use_filter = l->filter;
     p->block_checksums = l->ck;
+    p->lazy_max = l->lazy_max;
     /* Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and
      * largest, running the single-table lean core (dial 4); levels 2 and 3
      * step the parser back toward the pinned default (dial 0) that level 4
