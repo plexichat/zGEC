@@ -1178,3 +1178,12 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## 2026-10-28 - Unrolled Greedy Context Clustering AVX2 Copy & Sum Loops
+
+**Learning:**
+1. In `src/encode.c` (`zgec_cluster_greedy`), the initial class row copying and horizontal summation loop ran 8 elements per iteration. Extending the loop to 32 elements (4x unrolled) using four 256-bit AVX2 accumulators (`vsum0`..`vsum3`) processes 256 symbol histogram entries per row in 8 iterations without scalar tails.
+2. In `zgec_cluster_greedy`, delta cache initialization across all class pairs was similarly unrolled 4-wide (32 elements per iteration), vectorizing 256-element row additions branchlessly.
+
+**Action:**
+In 256-symbol class histogram processing, unroll AVX2 SIMD vector operations 4-wide across 32-byte chunks to eliminate scalar loop iterations.
