@@ -239,6 +239,17 @@ static uint64_t dec_eff_max_dict(const zgec_decoder *d, uint64_t frame_cap)
     return (cfg != 0u) ? cfg : frame_cap;
 }
 
+/* Validate trailer footer_offset and footer_size bounds without integer overflow. */
+static inline int zgec_validate_trailer_bounds(const zgec_trailer *tr, size_t src_size)
+{
+    if (tr == NULL || src_size < 48) return 0;
+    if (tr->footer_size < 24u || (uint64_t)tr->footer_size > (uint64_t)src_size - 16u)
+        return 0;
+    if (tr->footer_offset < 32u || tr->footer_offset != (uint64_t)src_size - 16u - (uint64_t)tr->footer_size)
+        return 0;
+    return 1;
+}
+
 /* Check one block's sizes up front: raw + dict + litref + slack. */
 static zgec_err dec_check_worker_limits(const zgec_decoder *d,
                                          uint8_t block_log2,
@@ -256,6 +267,10 @@ static zgec_err dec_check_worker_limits(const zgec_decoder *d,
     if (max_dict_log2 > ZGEC_MAX_DICT_LOG2) return ZGEC_ERR_INVAL;
     if (expect_raw > dec_eff_max_block(d, bcap)) return ZGEC_ERR_INVAL;
     if (dict_sz > dec_eff_max_dict(d, dcap)) return ZGEC_ERR_INVAL;
+    if (litref_len > UINT64_MAX - bcap - dcap - (uint64_t)ZGEC_OUTPUT_SLACK ||
+        litref_len > UINT64_MAX - expect_raw - dict_sz - (uint64_t)ZGEC_OUTPUT_SLACK) {
+        return ZGEC_ERR_NOMEM;
+    }
     /* Up-front bound with the frame caps (pre-decode, §13). */
     bound = bcap + dcap + litref_len + (uint64_t)ZGEC_OUTPUT_SLACK;
     actual = expect_raw + dict_sz + litref_len + (uint64_t)ZGEC_OUTPUT_SLACK;
@@ -2319,6 +2334,10 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
         if (dir_owned) zgec_free(dir);
         return e;
     }
+    if ((uint64_t)litref_len > 0xFFFFFFFFu - (uint64_t)Ld - (uint64_t)expect_raw) {
+        if (dir_owned) zgec_free(dir);
+        return ZGEC_ERR_OUTPUT_SIZE;
+    }
     vb_total = (uint64_t)Ld + (uint64_t)litref_len + (uint64_t)expect_raw;
     if (vb_total > 0xFFFFFFFFu) { /* format limit 2^32-1 (V9) */
         if (dir_owned) zgec_free(dir);
@@ -3495,11 +3514,22 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
     *took = 0;
     memset(&xc, 0, sizeof(xc));
     if ((uint64_t)nblk * (uint64_t)sizeof(*off) > (uint64_t)SIZE_MAX) { err = ZGEC_ERR_NOMEM; goto done; }
-    off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
-    sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
-    if (off == NULL || sz == NULL) {
-        err = ZGEC_ERR_NOMEM;
-        goto done;
+    size_t stack_off[64];
+    size_t stack_sz[64];
+    int off_owned = 0;
+    if (nblk <= 64) {
+        off = stack_off;
+        sz = stack_sz;
+    } else {
+        off = (size_t *)zgec_alloc((size_t)nblk * sizeof(*off), _Alignof(size_t));
+        sz = (size_t *)zgec_alloc((size_t)nblk * sizeof(*sz), _Alignof(size_t));
+        if (off == NULL || sz == NULL) {
+            zgec_free(off);
+            zgec_free(sz);
+            err = ZGEC_ERR_NOMEM;
+            goto done;
+        }
+        off_owned = 1;
     }
 
     /* Pass 1: walk the records exactly as the sequential scan does, but
@@ -3713,8 +3743,10 @@ done:
     }
     zgec_free(ws);
     zgec_free(jobs);
-    zgec_free(off);
-    zgec_free(sz);
+    if (off_owned) {
+        zgec_free(off);
+        zgec_free(sz);
+    }
     zgec_free(out);
     return err;
 }
@@ -3753,11 +3785,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
             return ZGEC_ERR_MAGIC;
         err = zgec_trailer_parse(&trailer, src + src_size - 16);
         if (err != ZGEC_OK) return err;
-        if (trailer.footer_offset + (uint64_t)trailer.footer_size + 16u !=
-            (uint64_t)src_size)
-            return ZGEC_ERR_TRUNCATED;
-        if (trailer.footer_offset > (uint64_t)src_size ||
-            (size_t)trailer.footer_offset < 32)
+        if (!zgec_validate_trailer_bounds(&trailer, src_size))
             return ZGEC_ERR_TRUNCATED;
         err = zgec_footer_parse(&footer, src + (size_t)trailer.footer_offset,
                                 trailer.footer_size);
@@ -3768,10 +3796,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                zgec_rd32(src + src_size - 4) == ZGEC_TRAILER_MAGIC_U32) {
         /* Trailer present without the flag: still honour it. */
         if (zgec_trailer_parse(&trailer, src + src_size - 16) == ZGEC_OK &&
-            trailer.footer_offset + (uint64_t)trailer.footer_size + 16u ==
-                (uint64_t)src_size &&
-            trailer.footer_offset >= 32 &&
-            trailer.footer_offset < (uint64_t)src_size) {
+            zgec_validate_trailer_bounds(&trailer, src_size)) {
             if (zgec_footer_parse(&footer,
                                   src + (size_t)trailer.footer_offset,
                                   trailer.footer_size) == ZGEC_OK) {
@@ -4399,8 +4424,7 @@ zgec_err zgec_decode_block(zgec_decoder *d,
         return ZGEC_ERR_MAGIC;
     e = zgec_trailer_parse(&tr, src + src_size - 16);
     if (e != ZGEC_OK) return e;
-    if (tr.footer_offset + (uint64_t)tr.footer_size + 16u !=
-        (uint64_t)src_size)
+    if (!zgec_validate_trailer_bounds(&tr, src_size))
         return ZGEC_ERR_TRUNCATED;
     memset(&f, 0, sizeof(f));
     e = zgec_footer_parse(&f, src + (size_t)tr.footer_offset,
@@ -4435,8 +4459,7 @@ zgec_err zgec_decode_block_index(zgec_decoder *d,
         return ZGEC_ERR_MAGIC;
     e = zgec_trailer_parse(&tr, src + src_size - 16);
     if (e != ZGEC_OK) return e;
-    if (tr.footer_offset + (uint64_t)tr.footer_size + 16u !=
-        (uint64_t)src_size)
+    if (!zgec_validate_trailer_bounds(&tr, src_size))
         return ZGEC_ERR_TRUNCATED;
     memset(&f, 0, sizeof(f));
     e = zgec_footer_parse(&f, src + (size_t)tr.footer_offset,
@@ -4474,8 +4497,7 @@ zgec_err zgec_export_literals(zgec_decoder *d,
         return ZGEC_ERR_MAGIC;
     e = zgec_trailer_parse(&tr, src + src_size - 16);
     if (e != ZGEC_OK) return e;
-    if (tr.footer_offset + (uint64_t)tr.footer_size + 16u !=
-        (uint64_t)src_size)
+    if (!zgec_validate_trailer_bounds(&tr, src_size))
         return ZGEC_ERR_TRUNCATED;
     memset(&f, 0, sizeof(f));
     e = zgec_footer_parse(&f, src + (size_t)tr.footer_offset,
