@@ -1178,3 +1178,13 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## 2026-10-28 - AVX2 Context Evaluation and Greedy Clustering Unrolling
+
+**Learning:**
+1. In `zgec_cluster_greedy` (`src/encode.c`), initial row copy and 256-element sum reduction operated in 8-element SIMD chunks. Unrolling 4-wide (`s += 32` per step) with 4 SIMD accumulators (`vsum0..vsum3`) pipelines vector loads, stores, and additions. Short-circuiting `dlt[c][bb] = 0.0` when `ctot[c] == 0 || ctot[bb] == 0` during delta seeding and lazy re-verification bypasses SIMD additions and entropy calculations on empty classes.
+2. In `zgec_ctx_body_bits` (`src/encode.c`), removing loop-carried `grp_total` scalar increments from the inner loop and passing `ZGEC_ENC_TOTAL_UNKNOWN` to `zgec_enc_entropy_bits_u32` eliminates 8 memory read-modify-writes per 8-byte chunk while preserving exact group symbol totals via 256-bit AVX2 SIMD additions.
+3. Precomputing a 256-entry group offset table `grp_off[b] = (uint32_t)grp_lut[b] << 8` and consolidating inner loop input byte reads into 64-bit unaligned word loads (`zgec_rd64`) accelerates multi-context body bits calculation.
+
+**Action:**
+Vectorize 256-element histogram copy+sum operations 4-wide, short-circuit zero-count class entropy deltas in greedy clustering, and eliminate inner-loop group total scalar increments in multi-context entropy scoring.
