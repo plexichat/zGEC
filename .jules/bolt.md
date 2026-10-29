@@ -1178,3 +1178,9 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## 2026-10-29 - Sequence Symbol Store Packing and FSE Table Build Cleanups
+
+1. In `src/seq.c` (`zgec_seq_stream_encode` and `zgec_seq_stream_encode_cond`), symbol byte extraction for values `< 512` packs 8 symbol lookup bytes into a single 64-bit integer written via `zgec_wr64`, eliminating scalar byte stores and store-to-load forwarding stalls.
+2. In `src/fse.c` (`zgec_fse_build_dec` and `zgec_fse_build_enc`), precomputing sequence pad bytes (`pad`) in the primary decode table fill loop eliminates a secondary loop over states, and copying `off` to `cur_off` avoids resetting and indexing `used[256]` arrays during encoder construction.
+3. Verified strict byte-identity across all compression levels (pins match, l7 SHA-256 equals `13AF5E256B1731FEAC2FD795A51B9E9A8073F75E14990B75D2006D79FD1A4CDE`). Interleaved A/B benchmark confirmed speedups (+1.16% at l1, +1.00% at l2, +1.67% at l4).

@@ -163,7 +163,6 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
        the second pass reads table[i] while writing t->e[i], which would
        otherwise alias. */
     unsigned char table[1u << ZGEC_MAX_AL];   /* S <= 2048 */
-    memset(table, 0, (size_t)S);
     int high = S - 1;
     for (int s_idx = 0; s_idx < nsym; s_idx++) {
         if (counts[s_idx] < 0) table[high--] = (unsigned char)s_idx;
@@ -196,6 +195,7 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
     }
 #endif
     for (; s_next < nsym; s_next++) next[s_next] = counts[s_next] < 0 ? 1 : counts[s_next];
+    uint8_t is_seq = (nsym == ZGEC_NSYM_SEQ) ? 1u : 0u;
     for (int i = 0; i < S; i++) {
         int s = table[i];
         if (s < 0 || s >= nsym) { zgec_free(t); return ZGEC_ERR_FSE_COUNTS; }
@@ -204,6 +204,7 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
         if (nbBits > (unsigned)al) nbBits = (unsigned)al;
         t->e[i].symbol = (int16_t)s;
         t->e[i].nb_bits = (uint8_t)nbBits;
+        t->e[i].pad = is_seq ? zgec_seq_nbits[(unsigned)s] : 0u;
         t->e[i].baseline = (int32_t)(((unsigned)ns << nbBits) - (unsigned)S);
     }
 
@@ -211,18 +212,6 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
     for (int i = 0; i < S; i++) {
         int s = t->e[i].symbol;
         if (t->first_state[s] < 0) t->first_state[s] = i;
-    }
-
-    if (nsym == ZGEC_NSYM_SEQ) {
-        /* Bake each entry's extra-bits width into the spare pad byte: the
-         * steady sequence decode loops read it from the entry load they
-         * already perform, instead of a second dependent load from
-         * zgec_seq_nbits[] on the per-symbol state chain. Every sequence
-         * table in the process is built here or copied whole from one
-         * that was, so the byte is current whenever those loops run. */
-        for (int i = 0; i < S; i++) {
-            t->e[i].pad = zgec_seq_nbits[(unsigned)t->e[i].symbol];
-        }
     }
 
     *out = t;
@@ -292,12 +281,11 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
      * with the same j indexing, so the expansion below reads exactly
      * what the old intermediate table held. */
     {
-        int used[256];
-        memset(used, 0, sizeof(used));
+        int cur_off[256];
+        memcpy(cur_off, off, (size_t)nsym * sizeof(int));
         for (int i = 0; i < S; i++) {
             int s = dec->e[i].symbol;
-            int j = used[s]++;
-            struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
+            struct zgec_fse_occ *o = &occ[(size_t)cur_off[s]++];
             o->nb_bits = dec->e[i].nb_bits;
             o->new_state = (uint16_t)i;
             o->baseline = (uint16_t)dec->e[i].baseline;
@@ -1394,31 +1382,12 @@ zgec_err zgec_fse_encode(const zgec_fse_enc_table *t, zgec_bw *bw,
                         ? (uint32_t)(state - (uint32_t)entry.baseline)
                         : 0u;
 
-            /* The transition field and the value's extra bits are
-             * adjacent in the bitstream, so one accumulate-and-flush of
-             * the concatenation is bit-identical to writing them
-             * separately: the byte order is fixed by the accumulation
-             * order, not by where the flushes land. Halving the number of
-             * write sites is the point -- this loop is throughput-bound.
-             *
-             * The nb == 0 case is folded in rather than branched: a symbol
-             * with no extra bits stands for exactly base[s] and the code
-             * above derives s from val, so extra is 0 and the mask is 0,
-             * contributing nothing while still paying one branch per
-             * symbol (bit widths vary enough that the branch mispredicts).
-             * The two range checks below are unchanged for nb > 0; for
-             * nb == 0 they only reject a value that is not base[s], which
-             * the symbol derivation already rules out. */
             comb = (uint64_t)bits;
             cn = (unsigned)entry.nb_bits;
             lo = base[s];
             if (val < lo) return ZGEC_ERR_FSE_SYMBOL;
             extra = val - lo;
             if (nb < 32u && extra >= (1u << nb)) return ZGEC_ERR_FSE_SYMBOL;
-            /* extra is now known to fit in nb bits (and for nb >= 32 it is
-             * a full 32-bit value), so masking it again is a no-op. The
-             * transition field bits is < 2^entry.nb_bits <= 2^cn, so the
-             * two fields cannot overlap; + and | therefore agree. */
             comb += (uint64_t)extra << cn;
             cn += nb;
             bw_acc |= comb << bw_nacc;
