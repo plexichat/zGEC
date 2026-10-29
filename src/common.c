@@ -5,6 +5,7 @@
 #include "zgec_common.h"
 #include "zgec_internal.h"
 
+#include <assert.h>
 #include <stdio.h> /* Linux physical-core probe reads sysfs */
 #include <stdlib.h>
 #include <string.h>
@@ -264,6 +265,11 @@ void *zgec_alloc(size_t n, size_t align)
     aligned = sum & ~(uintptr_t)(align - 1);
     ((void **)aligned)[-1] = raw;
     ((size_t *)aligned)[-2] = total;
+
+    assert((uintptr_t)aligned >= (uintptr_t)raw + 2u * sizeof(void *));
+    assert(total >= n + prefix);
+    assert(((uintptr_t)aligned & (align - 1)) == 0);
+
     return (void *)aligned;
 }
 
@@ -280,6 +286,9 @@ void zgec_free(void *p)
     if (!p) return;
     void *raw = ((void **)p)[-1];
     size_t total = ((size_t *)p)[-2];
+    assert(raw != NULL);
+    assert((uintptr_t)p > (uintptr_t)raw);
+    assert(total >= 2u * sizeof(void *));
     if (total >= ZGEC_POOL_MIN && total <= ZGEC_POOL_MAX_BLOCK &&
         zgec_pool_put(raw, total)) {
         return;
