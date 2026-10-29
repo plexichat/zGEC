@@ -135,3 +135,14 @@ l1 16.0, l4 33.1, l5 41.5, l6 51.7, l7 115.6, l10 425.0 cycles per input byte.
 Anything in this journal's area has to move the parser or the match finder to
 matter; below that, the only open question is the v2 format, where interleaved
 entropy states and a different block/segment policy are allowed.
+
+2026-10-29 - Remaining Decode-Side Hot-Path Heap Allocation Elimination (vise-1)
+Learning: Audited all dynamic heap allocations (`zgec_alloc`) during block/segment/frame decompression. Identified multiple hot-path allocation sites:
+  1. `seg_hdr_push_new` in `src/decode.c` (parsed NEW descriptors): embedded `stack_descs[4]` inside `seg_hdr_t`.
+  2. `seg_tables` in `src/decode.c` and `zgec_dict_prev` in `src/dict.c`: embedded 64-byte aligned `stack_lit[1]` (`zgec_rans_dec_table`) for single-context rANS decoding tables.
+  3. `zgec_dict_decode_segment` in `src/dict.c`: added `stack_rs[8192]` fallback for runstart bitmask buffers and `stack_lt[1]` fallback for tail-only rANS literal tables.
+  4. `zgec_phaseA_spawn` and `zgec_dec_blocks_spawn` in `src/decode.c`: added bounded stack fallbacks (`stack_ths`, `stack_started`, `stack_hs`) for worker thread arrays up to `ZGEC_MAX_WORKERS`.
+  5. `zgec_dec_frame_blocks` in `src/decode.c`: added `stack_off[64]` and `stack_sz[64]` fallbacks for block offset and size arrays.
+  6. `zgec_export_cache_init` in `src/decode.c`: added `stack_slot[64]` fallback for export cache slots.
+All stack buffers are bounded (<= 32 KiB each), preserving stack headroom and thread safety. Verified 100% test pass rate across `ctest` under AddressSanitizer and UndefinedBehaviorSanitizer trees and confirmed bit-for-bit output identity.
+Action: Prefer bounded stack fallback buffers for per-frame / per-segment worker structures and single-context rANS tables on decompression hot paths.
