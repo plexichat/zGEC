@@ -130,6 +130,10 @@ Safety invariants that are not negotiable, regardless of the speed claim:
     ctest 4/4, and a measured cycle delta - a memory change that cannot show a
     cycle delta is either free (take it with the proof) or pointless (leave it).
 
+2026-10-29 - Allocator & Pool Hardening, Pointer Clears, and Thread Exit Cleanups
+Learning: Audited thread-local pools (`zgec_pool` in `src/common.c` and `zgec_fse_enc_pool` in `src/fse.c`), `zgec_alloc`, `zgec_free`, and table release logic. Added explicit debug assertions to verify header pointer offsets, minimum size requirements (`total >= n + prefix`), power-of-two alignments, and non-NULL pointers when returning tables to pools. Verified that all worker thread exit paths across `src/encode.c` and `src/decode.c` call `zgec_thread_cleanup()`, preventing thread-local pool leaks on thread termination. Ensured all FSE encoder table pointers (`enc_ll`, `enc_ml`, `enc_of`, `enc_ll3`, `enc_of3`) and decode table pointers in `zgec_emit_segment` are cleared to `NULL` upon release across all success and error paths.
+Action: Keep assertions active in debug builds to catch unaligned or corrupt allocations, ensure all thread loops call `zgec_thread_cleanup()` on exit, and clear all pooled pointers to NULL immediately after freeing.
+
 Where the remaining budget is (cross-reference, same measurement session):
 l1 16.0, l4 33.1, l5 41.5, l6 51.7, l7 115.6, l10 425.0 cycles per input byte.
 Anything in this journal's area has to move the parser or the match finder to
