@@ -14,6 +14,10 @@
 #include <string.h>
 #include <stdint.h>
 
+#if defined(__AVX2__) || defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
+
 /* Format limits per section 3.3: dictionary at most 2^26 bytes.
  * P24 profile limit (2^24) is warn-only: larger dictionaries within the
  * format limit remain decodable, so no error is raised for them. */
@@ -183,16 +187,25 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
 {
     uint8_t *dst = vb + pos;
     if (lit_form == 0) {
-        /* C14: src is the segment's literal buffer and dst is the dictionary's
-         * virtual buffer — separate allocations, so the plain case is a block
-         * copy rather than a byte loop. */
         if (n > 0) memcpy(dst, src, n);
         return;
     }
-    for (size_t i = 0; i < n; i++) {
+    size_t i = 0;
+#if defined(__AVX2__)
+    if ((uint64_t)rep0 <= pos && rep0 >= 32 && pos >= (size_t)rep0) {
+        const uint8_t *back_ptr = vb + pos - (size_t)rep0;
+        while (i + 32 <= n) {
+            __m256i vsrc = _mm256_loadu_si256((const __m256i *)(const void *)(src + i));
+            __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(back_ptr + i));
+            __m256i vsum = _mm256_add_epi8(vsrc, vpred);
+            _mm256_storeu_si256((__m256i *)(void *)(dst + i), vsum);
+            i += 32;
+        }
+    }
+#endif
+    for (; i < n; i++) {
         size_t cur = pos + i;
-        uint8_t pred = 0;
-        if ((uint64_t)rep0 <= (uint64_t)cur) pred = vb[cur - (size_t)rep0];
+        uint8_t pred = (rep0 == 0u || (size_t)rep0 > cur) ? 0 : vb[cur - (size_t)rep0];
         dst[i] = (uint8_t)(src[i] + pred);
     }
 }
@@ -202,12 +215,32 @@ static void zgec_dict_store_literals(uint8_t *vb, size_t pos,
 static void zgec_dict_copy_match(uint8_t *dst, size_t off, size_t len)
 {
     const uint8_t *src = dst - off;
-    /* C13: when off >= len the source range [src, src + len) ends at or before
-     * dst, so the two ranges cannot overlap and a block copy is exact. The
-     * overlapping case must stay a forward byte loop: an LZ match replicates
-     * the bytes just written, which neither a snapshot nor a bulk copy gives. */
     if (off >= len) {
         if (len > 0) memcpy(dst, src, len);
+        return;
+    }
+    if (off == 1) {
+        memset(dst, src[0], len);
+        return;
+    }
+    if (off >= 32) {
+        size_t i = 0;
+#if defined(__AVX2__)
+        while (i + 32 <= len) {
+            _mm256_storeu_si256((__m256i *)(dst + i), _mm256_loadu_si256((const __m256i *)(src + i)));
+            i += 32;
+        }
+#endif
+        for (; i < len; i++) dst[i] = src[i];
+        return;
+    }
+    if (off >= 8) {
+        size_t i = 0;
+        while (i + 8 <= len) {
+            zgec_wr64(dst + i, zgec_rd64(src + i));
+            i += 8;
+        }
+        for (; i < len; i++) dst[i] = src[i];
         return;
     }
     for (size_t i = 0; i < len; i++) dst[i] = src[i];

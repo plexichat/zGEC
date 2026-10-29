@@ -205,24 +205,15 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
         t->e[i].symbol = (int16_t)s;
         t->e[i].nb_bits = (uint8_t)nbBits;
         t->e[i].baseline = (int32_t)(((unsigned)ns << nbBits) - (unsigned)S);
+        if (nsym == ZGEC_NSYM_SEQ) {
+            t->e[i].pad = zgec_seq_nbits[(unsigned)s];
+        }
     }
 
     memset(t->first_state, 0xFF, (size_t)nsym * sizeof(int));
     for (int i = 0; i < S; i++) {
         int s = t->e[i].symbol;
         if (t->first_state[s] < 0) t->first_state[s] = i;
-    }
-
-    if (nsym == ZGEC_NSYM_SEQ) {
-        /* Bake each entry's extra-bits width into the spare pad byte: the
-         * steady sequence decode loops read it from the entry load they
-         * already perform, instead of a second dependent load from
-         * zgec_seq_nbits[] on the per-symbol state chain. Every sequence
-         * table in the process is built here or copied whole from one
-         * that was, so the byte is current whenever those loops run. */
-        for (int i = 0; i < S; i++) {
-            t->e[i].pad = zgec_seq_nbits[(unsigned)t->e[i].symbol];
-        }
     }
 
     *out = t;

@@ -335,34 +335,51 @@ void zgec_lit_sub_reconstruct(uint8_t *Z,
     for (size_t i = 0; i < n_seq; i++) {
         uint32_t rep0 = rep0_before[i];
         size_t runlen = (size_t)ll[i];
+        size_t t = 0;
 
-        for (size_t t = 0; t < runlen && pos < n_lit; t++, pos++) {
-            size_t cur = vbpos + pos;
-            uint8_t pred;
-            if (rep0 == 0u || (size_t)rep0 > cur) {
-                pred = 0;
-            } else {
-                pred = (uint8_t)*(Z + (ptrdiff_t)pos - (ptrdiff_t)rep0);
+#if defined(__AVX2__)
+        if ((uint64_t)rep0 <= vbpos + pos && rep0 >= 32 && pos >= (size_t)rep0) {
+            const uint8_t *back_ptr = Z + (ptrdiff_t)pos - (ptrdiff_t)rep0;
+            while (t + 32 <= runlen && pos + 32 <= n_lit) {
+                __m256i vres = _mm256_loadu_si256((const __m256i *)(const void *)(Z + pos));
+                __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(back_ptr + t));
+                __m256i vsum = _mm256_add_epi8(vres, vpred);
+                _mm256_storeu_si256((__m256i *)(void *)(Z + pos), vsum);
+                t += 32;
+                pos += 32;
             }
+        }
+#endif
+
+        for (; t < runlen && pos < n_lit; t++, pos++) {
+            size_t cur = vbpos + pos;
+            uint8_t pred = (rep0 == 0u || (size_t)rep0 > cur) ? 0 : (uint8_t)*(Z + (ptrdiff_t)pos - (ptrdiff_t)rep0);
             Z[pos] = (uint8_t)(Z[pos] + pred);
         }
     }
 
     /* Tail literals: use rep0 after the last sequence. */
     if (tail > 0) {
-        uint32_t rep0 = 1u;
-        if (n_seq > 0) {
-            rep0 = rep0_before[n_seq];
-        }
+        uint32_t rep0 = (n_seq > 0) ? rep0_before[n_seq] : 1u;
+        size_t t = 0;
 
-        for (size_t t = 0; t < tail && pos < n_lit; t++, pos++) {
-            size_t cur = vbpos + pos;
-            uint8_t pred;
-            if (rep0 == 0u || (size_t)rep0 > cur) {
-                pred = 0;
-            } else {
-                pred = (uint8_t)*(Z + (ptrdiff_t)pos - (ptrdiff_t)rep0);
+#if defined(__AVX2__)
+        if ((uint64_t)rep0 <= vbpos + pos && rep0 >= 32 && pos >= (size_t)rep0) {
+            const uint8_t *back_ptr = Z + (ptrdiff_t)pos - (ptrdiff_t)rep0;
+            while (t + 32 <= tail && pos + 32 <= n_lit) {
+                __m256i vres = _mm256_loadu_si256((const __m256i *)(const void *)(Z + pos));
+                __m256i vpred = _mm256_loadu_si256((const __m256i *)(const void *)(back_ptr + t));
+                __m256i vsum = _mm256_add_epi8(vres, vpred);
+                _mm256_storeu_si256((__m256i *)(void *)(Z + pos), vsum);
+                t += 32;
+                pos += 32;
             }
+        }
+#endif
+
+        for (; t < tail && pos < n_lit; t++, pos++) {
+            size_t cur = vbpos + pos;
+            uint8_t pred = (rep0 == 0u || (size_t)rep0 > cur) ? 0 : (uint8_t)*(Z + (ptrdiff_t)pos - (ptrdiff_t)rep0);
             Z[pos] = (uint8_t)(Z[pos] + pred);
         }
     }

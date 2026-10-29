@@ -121,8 +121,21 @@ zgec_err zgec_seq_stream_decode(uint32_t *out, size_t n,
             return ZGEC_ERR_FSE_SYMBOL;
         unsigned nb = (unsigned)nbits[rle_symbol];
         uint32_t bval = base[rle_symbol];
+        if (nb == 0) {
+            size_t i = 0;
+#if defined(__AVX2__)
+            __m256i vbval = _mm256_set1_epi32((int)bval);
+            while (i + 8 <= n) {
+                _mm256_storeu_si256((__m256i *)(out + i), vbval);
+                i += 8;
+            }
+#endif
+            for (; i < n; i++) out[i] = bval;
+            if (!zgec_br_done(br)) return ZGEC_ERR_BITSTREAM_UNCONSUMED;
+            return ZGEC_OK;
+        }
         for (size_t i = 0; i < n; i++) {
-            uint32_t extra = (nb > 0) ? zgec_br_read(br, nb) : 0u;
+            uint32_t extra = zgec_br_read(br, nb);
             if (br->overflow) return ZGEC_ERR_BITSTREAM;
             out[i] = bval + extra;
         }
