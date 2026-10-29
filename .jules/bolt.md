@@ -1178,3 +1178,11 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## 2026-10-28 - Empty Context Class Short-Circuiting in Greedy Clustering
+
+**Learning:**
+In `src/encode.c` (`zgec_cluster_greedy`), greedy context clustering evaluates thousands of pair merges across 64 context classes. When a context class contains 0 symbols (`ctot == 0`), its entropy contribution is 0.0 and merging it with another class yields a net delta of exactly 0.0. Short-circuiting `if (ctot == 0)` during both singleton delta seeding and candidate delta re-evaluations sets `cand_delta = 0.0` directly, bypassing 256-element AVX2 SIMD additions and floating-point `zgec_class_entropy` calculations across empty classes.
+
+**Action:**
+Always check `ctot == 0` before running vector additions or entropy calculations in context merge loops.
