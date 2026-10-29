@@ -227,14 +227,18 @@ size_t zgec_seq_stream_encode(const uint32_t *values, size_t n,
     while (i + 8 <= n) {
         __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
         if (_mm256_testz_si256(vv, vmask)) {
-            syms[i + 0] = (uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8);
-            syms[i + 1] = (uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8);
-            syms[i + 2] = (uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8);
-            syms[i + 3] = (uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8);
-            syms[i + 4] = (uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8);
-            syms[i + 5] = (uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8);
-            syms[i + 6] = (uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8);
-            syms[i + 7] = (uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8);
+            /* Eight symbol bytes written with one 64-bit store: the byte
+             * lanes are independent, and separate byte stores would form
+             * a store-to-load forwarding chain with the FSE loop below. */
+            uint64_t s8 = (uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8) << 8)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8) << 16)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8) << 24)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8) << 32)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8) << 40)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8) << 48)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8) << 56);
+            zgec_wr64(syms + i, s8);
         } else {
             for (size_t k = 0; k < 8; k++) {
                 uint8_t nb_dummy;
@@ -320,14 +324,18 @@ size_t zgec_seq_stream_encode_cond(const uint32_t *values, size_t n,
     while (i + 8 <= n) {
         __m256i vv = _mm256_loadu_si256((const __m256i *)(const void *)(values + i));
         if (_mm256_testz_si256(vv, vmask)) {
-            syms[i + 0] = (uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8);
-            syms[i + 1] = (uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8);
-            syms[i + 2] = (uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8);
-            syms[i + 3] = (uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8);
-            syms[i + 4] = (uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8);
-            syms[i + 5] = (uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8);
-            syms[i + 6] = (uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8);
-            syms[i + 7] = (uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8);
+            /* Eight symbol bytes written with one 64-bit store: the byte
+             * lanes are independent, and separate byte stores would form
+             * a store-to-load forwarding chain with the FSE loop below. */
+            uint64_t s8 = (uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 0]] >> 8)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 1]] >> 8) << 8)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 2]] >> 8) << 16)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 3]] >> 8) << 24)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 4]] >> 8) << 32)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 5]] >> 8) << 40)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 6]] >> 8) << 48)
+                        | ((uint64_t)(uint8_t)(zgec_seq_lut512[values[i + 7]] >> 8) << 56);
+            zgec_wr64(syms + i, s8);
         } else {
             for (size_t k = 0; k < 8; k++) {
                 uint8_t nb;

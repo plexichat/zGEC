@@ -163,7 +163,9 @@ zgec_err zgec_fse_build_dec(zgec_fse_dec_table **out,
        the second pass reads table[i] while writing t->e[i], which would
        otherwise alias. */
     unsigned char table[1u << ZGEC_MAX_AL];   /* S <= 2048 */
-    memset(table, 0, (size_t)S);
+    /* No clear: the placeholders write the upper slots and the scatter
+     * below writes every slot at or below `high`, exactly S writes total,
+     * so every entry is initialised before it is read. */
     int high = S - 1;
     for (int s_idx = 0; s_idx < nsym; s_idx++) {
         if (counts[s_idx] < 0) table[high--] = (unsigned char)s_idx;
@@ -292,12 +294,11 @@ zgec_err zgec_fse_build_enc(zgec_fse_enc_table **out, const zgec_fse_dec_table *
      * with the same j indexing, so the expansion below reads exactly
      * what the old intermediate table held. */
     {
-        int used[256];
-        memset(used, 0, sizeof(used));
+        int cur_off[256];
+        memcpy(cur_off, off, (size_t)nsym * sizeof(int));
         for (int i = 0; i < S; i++) {
             int s = dec->e[i].symbol;
-            int j = used[s]++;
-            struct zgec_fse_occ *o = &occ[(size_t)off[s] + (size_t)j];
+            struct zgec_fse_occ *o = &occ[(size_t)cur_off[s]++];
             o->nb_bits = dec->e[i].nb_bits;
             o->new_state = (uint16_t)i;
             o->baseline = (uint16_t)dec->e[i].baseline;
