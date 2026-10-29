@@ -1178,3 +1178,91 @@ Every candidate also proves pinned sizes at l1..l10, the l7 SHA-256, and ctest
 4/4 before any timing is believed. And report ratio, not just MB/s: the whole
 point of the table above is that MB/s at a level is meaningless without the
 ratio it buys.
+
+## 2026-10-29 - Intake triage: 29 remote branches, one keep, one v2 datapoint
+
+All 29 remote branches were based on a24c26a (main), each with a single commit.
+Every one got a diff read; the ones with a non-noise mechanism were built,
+checked against the ten pinned sizes, and A/B'd pinned on CPU 9 with
+`ZGEC_CPUTIME=1`, interleaved, 9-13 pairs.
+
+### Taken
+
+1. `bolt-2-seq-fse-opt` (a1075f3). Three pieces, all byte-identical:
+   `zgec_fse_build_dec` cleared a 2048-byte scratch table that the placeholder
+   pass and the scatter then write completely (exactly S writes, disjoint
+   regions), `zgec_fse_build_enc` no longer keeps `used[256]` beside `off[256]`
+   to rebuild the same offsets, and the seq symbol emitter writes its eight
+   independent byte lanes with one 64-bit store instead of eight byte stores
+   (the FSE loop below loads them, so the old code formed a store-to-load
+   chain). Measured: l1 -1.02% median (8/13), l4 -0.48% (3/9), l6 -0.37%
+   (3/11), l7 +1.61% (4/9). Only l1 separates at all; kept as a free removal
+   of work, not as a speed win.
+2. `vise-trailer-bounds-and-alloc-overflow-hardening` (87a5326) and
+   `vise-2-pool-hardening-audit` (acc7e58) plus `jules-3403` (tests, 65c57f7).
+   Correctness/security, not speed: the trailer test
+   `footer_offset + footer_size + 16 == src_size` wrapped in uint64, so a
+   footer_offset near UINT64_MAX passed it and every caller then indexed
+   `src + trailer.footer_offset` out of bounds. Replaced by an overflow-free
+   equality (`footer_size >= 24`, which is exactly `zgec_footer_parse`'s own
+   minimum, so no valid frame is rejected). Also guards the litref_len and
+   worker-limit additions against the same wrap, and adds the pool/allocator
+   assertions plus table-pointer clears.
+
+### Rejected, with the reason
+
+- `bolt/matcher-...-lazy-match-caching` and `bolt-lazy-lookahead-opt`: reusing
+  the lazy probe's match instead of re-running the finder at ip+1. Changes
+  output, because the probe asked for `min_lazy_len` while the loop asks for 4,
+  so a shorter candidate can win at the deferred position. Fails the pinned
+  gate: l7 61,912,957 (+3,918), l8 61,792,908, l9 61,294,366 (-5,434),
+  l10 61,153,392. **But it is the strongest high-tier lever measured so far**:
+  l7 -3.28% median (6/9), l9 -8.22% median (8/9, min -4.94%), ratio neutral
+  (l9 actually smaller). This is a v2 item, not a v1 one: the win is real, the
+  byte identity is not.
+- `bolt-opt-rans-decode-unroll`: eight explicit scalar lanes in
+  `zgec_rans_decode`. l1 decode **+13.3% ms** (0/9), l4 +5.5%, l7/l10 noise.
+  The existing compact loop already beats explicit unrolling; this is the same
+  result as when the AVX2 gather loop was removed.
+- `avx2-decode-optimization` (class map + ml/of): decode 0.0-0.3% over 9 pairs,
+  wins 5/9. Noise. `bolt-avx2-decode-optimization` (lit.c sub-literal
+  reconstruction only): l6 decode +0.8% median (3/9), i.e. slightly worse.
+- `bolt/greedy-cluster-zero-count-opt` (also inside
+  `bolt-opt-lbar-zero-block-...` and `bolt-context-sublit-opt`): exact and
+  free in theory, neutral in practice (l5 -0.93% 6/9, l6 +0.35% 5/9, l7 +2.29%
+  3/9) - on 211 MB of literals essentially all 64 classes are non-empty, so
+  the guard never fires. Dropped rather than carried.
+- `bolt/avx2-encode-opt-1027`, `bolt/single-context-ctx-body-bits-opt`,
+  `jules-15963953290202765423`, `jules-ctx-sublit-unroll-opt-*`,
+  `bolt/avx2-context-histogram-opt`, `bolt/avx2-encode-path-opt`,
+  `bolt/avx2-encode-simd-opt`, `jules-4870692441727784275`: the same
+  four-bank/grp_lut/split-pass histogram shapes, 8 accumulator entropy sums and
+  32-element unrolls that were already rejected above; re-measuring them would
+  reproduce those numbers.
+- `bolt/fast-parse-hash-tag-filtering`: replaces the per-block generation tag
+  with a 7-bit hash tag, so a stale entry whose tag happens to match is now a
+  live candidate wherever its bytes verify - a parse change by construction.
+  It also deletes the `ZGEC_FAST_PIPE` / `ZGEC_FAST_PREFETCH` blocks that were
+  accepted wins.
+- `bolt/encode-path-fast-order0-and-rs-built`: the useful half is the
+  `rs_built` flag that skips rebuilding the identical runstart bitmap for the
+  sub-literal candidate; the rest is the rejected unrolls. The rebuild is
+  O(n_seq) plus a sub-KB clear, i.e. below this box's noise floor, and the flag
+  costs a parameter through `zgec_select_coder`. Not worth it.
+- `bolt-export-cache-mutex-opt`, `jules-14350851361244736739`,
+  `bolt-seq-gather-opt`, `vise-1-decode-stack-fallbacks`,
+  `vise-pool-hardening-audit` (the earlier, more aggressive pool commit),
+  `jules-1380973380312707039`: respectively a locking change with no measurable
+  win (decode already reuses the export cache), a superset of the rejected
+  rANS unroll plus 7-byte match-copy overruns, AVX2 gathers on a symbol table
+  that is 2.5 cycles/symbol, a 226-line decode allocation rewrite with no
+  pinned-size or cycle effect, a pool bound that changes allocation behaviour
+  for no measured gain, and a levels-15-25 lazy_max rescale outside the ladder.
+
+The rejected lazy-match commit is preserved as the annotated tag
+`v2-candidate-lazy-match` (not a branch) so the v2 measurement does not die with
+the branch deletion.
+
+Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
+tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
+binding constraint on the one change that actually moves the high tier.
