@@ -327,6 +327,61 @@ static void test_rans_context_bounds(void)
     printf("rans context bounds ok\n");
 }
 
+static void test_trailer_overflow_bounds(void)
+{
+    uint8_t buf[128];
+    memset(buf, 0, sizeof(buf));
+
+    /* Valid frame magic at start */
+    zgec_wr32(buf, ZGEC_MAGIC_U32);
+    buf[4] = 1; /* version major */
+    zgec_wr16(buf + 6, ZGEC_FLAG_HAS_FOOTER);
+    buf[8] = 16; /* block_log2 = 16 (64 KiB) */
+    buf[11] = 14; /* seg_hint_log2 (range 14..22) */
+    zgec_wr32(buf + 28, zgec_crc32c(buf, 28u, 0u));
+
+    /* Valid trailer magic at end */
+    zgec_wr32(buf + sizeof(buf) - 4, ZGEC_TRAILER_MAGIC_U32);
+
+    zgec_decoder *d = zgec_decoder_create(ZGEC_LEVEL_EXTENDED, NULL);
+    CHECK(d != NULL, "decoder create ok");
+
+    /* Test 1: footer_offset = UINT64_MAX - 15, footer_size = 100.
+     * Unchecked addition (footer_offset + footer_size + 16) would overflow uint64_t
+     * and wrap to 128 == sizeof(buf), leading to OOB pointer dereference. */
+    zgec_wr64(buf + sizeof(buf) - 16, UINT64_MAX - 15u);
+    zgec_wr32(buf + sizeof(buf) - 8, 100u);
+
+    const uint8_t *blk_out = NULL;
+    size_t blk_size = 0;
+    uint8_t *lit_buf = NULL;
+    size_t lit_size = 0;
+
+    zgec_err err = zgec_decode_block(d, buf, sizeof(buf), 0, &blk_out, &blk_size);
+    CHECK(err == ZGEC_ERR_TRUNCATED, "overflowing trailer offset rejected in decode_block");
+
+    err = zgec_decode_block_index(d, buf, sizeof(buf), 0, &blk_out, &blk_size);
+    CHECK(err == ZGEC_ERR_TRUNCATED, "overflowing trailer offset rejected in decode_block_index");
+
+    err = zgec_export_literals(d, buf, sizeof(buf), 0, &lit_buf, &lit_size);
+    CHECK(err == ZGEC_ERR_TRUNCATED, "overflowing trailer offset rejected in export_literals");
+
+    uint8_t *frame_dst = NULL;
+    size_t frame_dst_size = 0;
+    err = zgec_decode_frame(d, buf, sizeof(buf), &frame_dst, &frame_dst_size);
+    CHECK(err == ZGEC_ERR_TRUNCATED, "overflowing trailer offset rejected in decode_frame");
+
+    /* Test 2: footer_size too large (exceeding frame buffer size) */
+    zgec_wr64(buf + sizeof(buf) - 16, 32u);
+    zgec_wr32(buf + sizeof(buf) - 8, 1000u);
+
+    err = zgec_decode_block(d, buf, sizeof(buf), 0, &blk_out, &blk_size);
+    CHECK(err == ZGEC_ERR_TRUNCATED, "oversized trailer footer_size rejected in decode_block");
+
+    zgec_decoder_destroy(d);
+    printf("trailer overflow bounds ok\n");
+}
+
 static void test_corrupted_bitstreams(void)
 {
     uint8_t dummy[1024];
@@ -359,6 +414,7 @@ int main(void)
     test_seg_k3();
     test_bitstream();
     test_rans_context_bounds();
+    test_trailer_overflow_bounds();
     test_corrupted_bitstreams();
     if (fails == 0) printf("ALL BLOCK/BITSTREAM CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);

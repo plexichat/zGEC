@@ -135,3 +135,7 @@ l1 16.0, l4 33.1, l5 41.5, l6 51.7, l7 115.6, l10 425.0 cycles per input byte.
 Anything in this journal's area has to move the parser or the match finder to
 matter; below that, the only open question is the v2 format, where interleaved
 entropy states and a different block/segment policy are allowed.
+
+2026-10-28 - Safe Trailer Bounds Validation and Litref Allocation Overflow Protection
+Learning: In frame decompression (`src/decode.c`), evaluating trailer footer bounds using addition `footer_offset + footer_size + 16u == src_size` allowed malformed bitstreams with `footer_offset = UINT64_MAX - 15` to integer-overflow `uint64_t` back to `src_size`, bypassing truncation checks and causing out-of-bounds pointer reads in `zgec_footer_parse`. Validating trailer bounds via safe subtraction `footer_offset == src_size - 16u - footer_size` eliminates integer overflow. Furthermore, checking `litref_len` against `0xFFFFFFFFu - Ld - expect_raw` before calculating `vb_total` prevents uint64 wraparound and heap buffer overflows when allocating `ba->vb`.
+Action: Always use subtraction-based bounds checking for trailer/footer offset math and check uint64 addition operands against upper bounds prior to summation in decoder allocation paths.
