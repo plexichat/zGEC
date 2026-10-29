@@ -1565,7 +1565,6 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
     double body = 0.0;
     uint32_t rs_hist[ZGEC_NSYM_LIT];
     uint64_t rs_total = 0; /* P4: symbols routed to rs_hist */
-    uint64_t grp_total[ZGEC_ENC_MAXCTX]; /* P4: per-group symbol totals */
     size_t start[ZGEC_NLANES];
     size_t j;
     int g;
@@ -1578,12 +1577,11 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
         memset(cls_hist, 0, k_clear * 256u * sizeof(uint32_t));
     }
     memset(rs_hist, 0, sizeof(rs_hist));
-    memset(grp_total, 0, sizeof(grp_total));
     zgec_lit_lane_starts(start, n_z);
     {
-        /* Byte -> context group, resolved once (estimate-only: out-of-range
+        /* Byte -> context group row offset, precalculated (estimate-only: out-of-range
          * classes/groups fold to 0, as the per-byte clamps below did). */
-        uint8_t grp_lut[256];
+        uint32_t grp_offset[256];
         unsigned b;
         for (b = 0; b < 256u; b++) {
             unsigned cls = zgec_classify(ctx_mode, (uint8_t)b);
@@ -1591,7 +1589,7 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
             if (cls >= 64u) cls = 0u;
             grp = (unsigned)cmap[cls];
             if (grp >= (unsigned)k) grp = 0u;
-            grp_lut[b] = (uint8_t)grp;
+            grp_offset[b] = (uint32_t)grp * 256u;
         }
         int has_rs = (runstart && !zgec_rs_is_empty(runstart, n_z));
         for (size_t lane = 0; lane < ZGEC_NLANES; lane++) {
@@ -1609,58 +1607,48 @@ static double zgec_ctx_body_bits(const uint8_t *z, size_t n_z,
                         rs_hist[z[j]]++;
                         rs_total++;
                     } else {
-                        unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                        cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                        grp_total[grp]++;
+                        uint32_t goff = grp_offset[z[j - 1]];
+                        cls_hist[goff + (uint32_t)z[j]]++;
                     }
                 }
             } else {
                 /* Fast path: no runstarts and no lane boundary checks in interior */
                 j = l_start + 1;
                 for (; j + 8 <= l_end; j += 8) {
-                    unsigned ga = (unsigned)grp_lut[z[j - 1]];
-                    cls_hist[(size_t)ga * 256u + (uint32_t)z[j]]++;
-                    grp_total[ga]++;
+                    uint32_t goa = grp_offset[z[j - 1]];
+                    cls_hist[goa + (uint32_t)z[j]]++;
 
-                    unsigned gb = (unsigned)grp_lut[z[j]];
-                    cls_hist[(size_t)gb * 256u + (uint32_t)z[j + 1]]++;
-                    grp_total[gb]++;
+                    uint32_t gob = grp_offset[z[j]];
+                    cls_hist[gob + (uint32_t)z[j + 1]]++;
 
-                    unsigned gc = (unsigned)grp_lut[z[j + 1]];
-                    cls_hist[(size_t)gc * 256u + (uint32_t)z[j + 2]]++;
-                    grp_total[gc]++;
+                    uint32_t goc = grp_offset[z[j + 1]];
+                    cls_hist[goc + (uint32_t)z[j + 2]]++;
 
-                    unsigned gd = (unsigned)grp_lut[z[j + 2]];
-                    cls_hist[(size_t)gd * 256u + (uint32_t)z[j + 3]]++;
-                    grp_total[gd]++;
+                    uint32_t god = grp_offset[z[j + 2]];
+                    cls_hist[god + (uint32_t)z[j + 3]]++;
 
-                    unsigned ge = (unsigned)grp_lut[z[j + 3]];
-                    cls_hist[(size_t)ge * 256u + (uint32_t)z[j + 4]]++;
-                    grp_total[ge]++;
+                    uint32_t goe = grp_offset[z[j + 3]];
+                    cls_hist[goe + (uint32_t)z[j + 4]]++;
 
-                    unsigned gf = (unsigned)grp_lut[z[j + 4]];
-                    cls_hist[(size_t)gf * 256u + (uint32_t)z[j + 5]]++;
-                    grp_total[gf]++;
+                    uint32_t gof = grp_offset[z[j + 4]];
+                    cls_hist[gof + (uint32_t)z[j + 5]]++;
 
-                    unsigned gg = (unsigned)grp_lut[z[j + 5]];
-                    cls_hist[(size_t)gg * 256u + (uint32_t)z[j + 6]]++;
-                    grp_total[gg]++;
+                    uint32_t gog = grp_offset[z[j + 5]];
+                    cls_hist[gog + (uint32_t)z[j + 6]]++;
 
-                    unsigned gh = (unsigned)grp_lut[z[j + 6]];
-                    cls_hist[(size_t)gh * 256u + (uint32_t)z[j + 7]]++;
-                    grp_total[gh]++;
+                    uint32_t goh = grp_offset[z[j + 6]];
+                    cls_hist[goh + (uint32_t)z[j + 7]]++;
                 }
                 for (; j < l_end; j++) {
-                    unsigned grp = (unsigned)grp_lut[z[j - 1]];
-                    cls_hist[(size_t)grp * 256u + (uint32_t)z[j]]++;
-                    grp_total[grp]++;
+                    uint32_t goff = grp_offset[z[j - 1]];
+                    cls_hist[goff + (uint32_t)z[j]]++;
                 }
             }
         }
     }
     for (g = 0; g < k; g++) {
         body += zgec_enc_entropy_bits_u32(cls_hist + (size_t)g * 256u,
-                                          ZGEC_NSYM_LIT, grp_total[g]);
+                                          ZGEC_NSYM_LIT, ZGEC_ENC_TOTAL_UNKNOWN);
     }
     body += zgec_enc_entropy_bits_u32(rs_hist, ZGEC_NSYM_LIT, rs_total);
     return body;
