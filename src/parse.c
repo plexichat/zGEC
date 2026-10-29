@@ -344,8 +344,13 @@ static float parse_lbar(const uint32_t *lit_hist, size_t total)
     float log2_t = log2f(t);
 #if defined(__AVX2__)
     __m256 vprior = _mm256_set1_ps(PARSE_LBAR_PRIOR);
+    float zero_block_bits = (8.0f * PARSE_LBAR_PRIOR) * (log2_t - log2f(PARSE_LBAR_PRIOR));
     for (; s + 8 <= 256; s += 8) {
         __m256i vhist = _mm256_loadu_si256((const __m256i *)(const void *)(lit_hist + s));
+        if (_mm256_testz_si256(vhist, vhist)) {
+            bits += zero_block_bits;
+            continue;
+        }
         __m256 vc = _mm256_add_ps(_mm256_cvtepi32_ps(vhist), vprior);
         float c_arr[8];
         _mm256_storeu_ps(c_arr, vc);
@@ -1690,8 +1695,19 @@ zgec_err zgec_parse_block_dial(zgec_parse **out,
 #endif
 
             if (ll > 0) {
-                uint32_t u;
-                for (u = 0; u < ll; u++) lit_hist[vb[anchor + (size_t)u]]++;
+                uint32_t u = 0u;
+                for (; u + 8u <= ll; u += 8u) {
+                    uint64_t v8_lit = zgec_rd64(vb + anchor + (size_t)u);
+                    lit_hist[v8_lit & 0xFFu]++;
+                    lit_hist[(v8_lit >> 8) & 0xFFu]++;
+                    lit_hist[(v8_lit >> 16) & 0xFFu]++;
+                    lit_hist[(v8_lit >> 24) & 0xFFu]++;
+                    lit_hist[(v8_lit >> 32) & 0xFFu]++;
+                    lit_hist[(v8_lit >> 40) & 0xFFu]++;
+                    lit_hist[(v8_lit >> 48) & 0xFFu]++;
+                    lit_hist[(v8_lit >> 56) & 0xFFu]++;
+                }
+                for (; u < ll; u++) lit_hist[vb[anchor + (size_t)u]]++;
                 memcpy(p->lit + p->n_lit, vb + anchor, ll);
                 p->n_lit += ll;
                 lit_total += ll;
