@@ -139,20 +139,13 @@ zgec_err zgec_class_map_decode(uint8_t *map,
     return ZGEC_OK;
 }
 
-void zgec_class_map_encode(uint8_t *packed,
+zgec_err zgec_class_map_encode(uint8_t *packed,
                            const uint8_t *map)
 {
-    if (packed == NULL || map == NULL) return;
-    /* Every one of the 24 bytes is stored by the loop below (8 groups x
-     * 3 bytes), so there is nothing to pre-clear. Entries are masked to
-     * their low three bits -- 255 becomes 7 and 8 becomes 0, i.e. they
-     * are wrapped modulo 8, not clamped into range. This is the
-     * trusted-input fast path, and an entry that is not a legal class
-     * for the block's k is not rejected here: zgec_class_map_decode
-     * (above) rejects such a stream with ZGEC_ERR_CLASS_MAP, so a
-     * wrapped entry can turn an encode into a stream its own decoder
-     * refuses. The checked variant that would take k and validate every
-     * entry needs a declaration in include/zgec_lit.h. */
+    if (packed == NULL || map == NULL) return ZGEC_ERR_INVAL;
+    for (int i = 0; i < 64; i++) {
+        if (map[i] >= 8u) return ZGEC_ERR_CLASS_MAP;
+    }
     for (int g = 0; g < 8; g++) {
         uint8_t *p = packed + (size_t)g * 3u;
         uint32_t val24 = 0;
@@ -163,6 +156,7 @@ void zgec_class_map_encode(uint8_t *packed,
         p[1] = (uint8_t)((val24 >> 8) & 0xFFu);
         p[2] = (uint8_t)((val24 >> 16) & 0xFFu);
     }
+    return ZGEC_OK;
 }
 
 /* ---- run-start bitmap ---- */
@@ -274,7 +268,7 @@ void zgec_lit_lane_geom(size_t start[ZGEC_NLANES], size_t len[ZGEC_NLANES],
 
 /* ---- sub-literal reconstruction ---- */
 
-void zgec_lit_sub_reconstruct(uint8_t *Z,
+zgec_err zgec_lit_sub_reconstruct(uint8_t *Z,
                               size_t n_lit,
                               const uint32_t *rep0_before,
                               const uint32_t *ll,
@@ -299,37 +293,19 @@ void zgec_lit_sub_reconstruct(uint8_t *Z,
      * provide an array of n_seq + 1 entries. */
     size_t pos = 0;
 
-    if (n_lit == 0) return;
-    if (Z == NULL) return;
-    if (n_seq > 0 && (rep0_before == NULL || ll == NULL)) return;
-    if (tail > n_lit) return;
+    if (n_lit == 0) return ZGEC_OK;
+    if (Z == NULL) return ZGEC_ERR_INVAL;
+    if (n_seq > 0 && (rep0_before == NULL || ll == NULL)) return ZGEC_ERR_INVAL;
+    if (tail > n_lit) return ZGEC_ERR_LL_SUM;
 
-    /* Check the metadata the loops below rely on before writing
-     * anything: sum(ll[0..n_seq-1]) + tail == n_lit, with the running
-     * sum held at or below n_lit so it cannot wrap. This replaces a
-     * guard that was dead - "tail > 0 && pos >= n_lit" could never
-     * hold, since pos is still 0 there and the n_lit == 0 case already
-     * returned above - and it is what stops a malformed segment from
-     * being half-reconstructed.
-     *
-     * Note the consequence of the void return, which include/zgec_lit.h
-     * fixes: a mismatch makes this call a no-op, and the caller has no
-     * way to tell that from a completed reconstruction. That is still
-     * strictly better than the previous behaviour, which wrote a prefix
-     * and presented the half-built buffer as success, but it is not a
-     * resting place. As of this writing the routine has no callers in
-     * the tree, so the decision owed here is whether it survives at all:
-     * either delete it together with its declaration, or change the
-     * return to zgec_err so the refusal above is observable. Both need
-     * include/zgec_lit.h, so neither is done here. */
     {
         size_t vsum = 0;
         for (size_t vi = 0; vi < n_seq; vi++) {
             size_t vadd = (size_t)ll[vi];
-            if (vadd > n_lit - vsum) return;
+            if (vadd > n_lit - vsum) return ZGEC_ERR_LL_SUM;
             vsum += vadd;
         }
-        if (vsum != n_lit - tail) return;
+        if (vsum != n_lit - tail) return ZGEC_ERR_LL_SUM;
     }
 
     for (size_t i = 0; i < n_seq; i++) {
@@ -366,4 +342,6 @@ void zgec_lit_sub_reconstruct(uint8_t *Z,
             Z[pos] = (uint8_t)(Z[pos] + pred);
         }
     }
+
+    return ZGEC_OK;
 }
