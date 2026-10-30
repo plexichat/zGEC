@@ -234,6 +234,7 @@ static zgec_fse_dec_table *zgec_dict_fse_clone(const zgec_fse_dec_table *s)
 /* Tables carried across the segments of one inner COMPRESSED payload
  * for REPEAT inheritance (section 7.4; repeats never cross blocks). */
 typedef struct {
+    _Alignas(64) zgec_rans_dec_table stack_lit[1];
     zgec_rans_dec_table *lit;   /* value tables: plain memcpy clone */
     int n_lit_tbl;
     int lit_form;
@@ -276,7 +277,7 @@ static void zgec_dict_prev_free(zgec_dict_prev *p)
         if ((int)i < p->n_of && p->of[i]) zgec_fse_free_dec(p->of[i]);
     }
     if (p->ml) zgec_fse_free_dec(p->ml);
-    zgec_free(p->lit);
+    if (p->lit != p->stack_lit) zgec_free(p->lit);
     zgec_dict_prev_init(p);
 }
 
@@ -686,14 +687,19 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
         rem = hdr_size - fp;
 
         /* Literal tables (omitted when lit_coder == 0). */
+        _Alignas(64) zgec_rans_dec_table stack_lt[1];
         if (lit_coder != 0) {
-            lt = (zgec_rans_dec_table *)zgec_alloc(
-                (size_t)n_lit_tbl * sizeof(*lt), 64);
-            if (!lt) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+            if (n_lit_tbl == 1) {
+                lt = stack_lt;
+            } else {
+                lt = (zgec_rans_dec_table *)zgec_alloc(
+                    (size_t)n_lit_tbl * sizeof(*lt), 64);
+                if (!lt) { zgec_dict_seg_release(seg); return ZGEC_ERR_NOMEM; }
+            }
             if (lit_mode == ZGEC_TBL_REPEAT) {
                 if (is_first || !prev->has_lit || prev->lit_form != lit_form ||
                     prev->lit_k != k || prev->n_lit_tbl != n_lit_tbl) {
-                    zgec_free(lt);
+                    if (lt != stack_lt) zgec_free(lt);
                     zgec_dict_seg_release(seg);
                     return ZGEC_ERR_TABLE_INHERIT;
                 }
@@ -701,7 +707,11 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
             } else {
                 for (ti = 0; ti < n_lit_tbl; ti++) {
                     derr = zgec_dict_build_rans(&lt[ti], &dp, &rem);
-                    if (derr != ZGEC_OK) goto lit_seq_fail;
+                    if (derr != ZGEC_OK) {
+                        if (lt != stack_lt) zgec_free(lt);
+                        lt = NULL;
+                        goto lit_seq_fail;
+                    }
                 }
             }
         }
@@ -964,7 +974,12 @@ static zgec_err zgec_dict_decode_segment(zgec_dict_seg *seg,
          * only sequence tables; rANS segments carry both. */
         zgec_dict_prev_free(prev);
         if (lit_coder != 0) {
-            prev->lit = lt;
+            if (lt == stack_lt) {
+                memcpy(prev->stack_lit, stack_lt, sizeof(zgec_rans_dec_table));
+                prev->lit = prev->stack_lit;
+            } else {
+                prev->lit = lt;
+            }
             lt = NULL;
             prev->n_lit_tbl = n_lit_tbl;
             prev->lit_form = lit_form;
