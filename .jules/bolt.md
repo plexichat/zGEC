@@ -1266,3 +1266,10 @@ the branch deletion.
 Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
 tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
 binding constraint on the one change that actually moves the high tier.
+
+## Task 6 (`jules-1`) - Decode Throughput Audit & Evaluation
+- **Analysis**:
+  - Analyzed decompression hot paths in `src/decode.c` (LZ77 Phase B match copy dispatch, conditioned sequence decoding `seq_decode_cond`), `src/fse.c` (`zgec_fse_decode`, `zgec_fse_decode2`), `src/rans.c` (`zgec_rans_decode`), and `src/dict.c`.
+  - Confirmed that previous optimizations already incorporated in `origin/main` at `4a2e714` (fused FSE bitreader fast refills, branchless renorm, SIMD match copy dispatch for `moff >= 8`, 32-byte AVX2 sub-literal reconstruction, and unrolled scalar lane processing) have saturated decode throughput within the frozen bitstream format constraints.
+  - Experimental unrolling and gather modifications on rANS decoding/match copy branches were previously evaluated across 29 incoming branches and rejected due to either performance noise/regressions or safety/byte-identity constraints.
+- **Verification**: Tested build, ctest suite (4/4 passed), and compression/decompression round-trip integrity on test files.
