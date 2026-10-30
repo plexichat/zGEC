@@ -1266,3 +1266,12 @@ the branch deletion.
 Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
 tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
 binding constraint on the one change that actually moves the high tier.
+
+## 2026-10-30 - AVX2 Greedy Cluster Initialization & Order-0 Single-Context Evaluation Fast-Path
+
+**Learning:**
+1. In `src/encode.c` (`zgec_cluster_greedy`), initial class histogram copying and horizontal summation over 256 symbols was unrolled 4-wide using AVX2 SIMD (`_mm256_loadu_si256`/`_mm256_storeu_si256`/`_mm256_add_epi32` across `s += 32` per step) with 4 SIMD accumulators, eliminating scalar iteration overhead. In addition, checking `ctot == 0` for empty classes short-circuits singleton delta seeding and candidate delta re-evaluation (`cand_delta = 0.0`), bypassing 256-element SIMD additions and entropy calculations.
+2. In `src/encode.c` (`zgec_ctx_body_bits`), adding a 4-bank parallel accumulator fast path (`c0`..`c3`) for `k <= 1` and `!has_rs` (order-0 single context, no runstarts) bypasses 256-entry `grp_lut` table evaluation, 256-stride index multiplications, and store-to-load forwarding stalls during literal context evaluation.
+
+**Action:**
+Vectorize 256-element class histogram initialization and horizontal total calculation using 4-wide AVX2 unrolling, short-circuit empty class entropy deltas, and bypass group LUT lookups for single-context literal streams.
