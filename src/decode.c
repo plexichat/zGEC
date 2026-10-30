@@ -79,6 +79,7 @@ static void zgec_block_arrays_free(zgec_block_arrays *a)
 
 /* Inherited / built tables for one segment (section 7.4). */
 typedef struct {
+    _Alignas(64) zgec_rans_dec_table stack_lit[1];
     zgec_rans_dec_table *lit; /* n_lit_tbl entries (values, not pointers) */
     int n_lit_tbl;
     int lit_form;
@@ -122,7 +123,7 @@ static void seg_tables_free(seg_tables *t)
         if (t->of[i]) zgec_fse_free_dec(t->of[i]);
     }
     if (t->ml) zgec_fse_free_dec(t->ml);
-    zgec_free(t->lit);
+    if (t->lit != t->stack_lit) zgec_free(t->lit);
     seg_tables_init(t);
 }
 
@@ -393,19 +394,30 @@ typedef struct {
      * description once and stashes its counts here; seg_tables_build
      * consumes them in order instead of re-running
      * zgec_fse_read_counts. RLE/REPEAT descriptors add no entry. */
+    new_desc_t stack_descs[4];
     new_desc_t *new_descs;
     uint16_t n_new;
     uint16_t cap_new;
 } seg_hdr_t;
 
+static void seg_hdr_init(seg_hdr_t *h)
+{
+    memset(h, 0, sizeof(*h));
+    h->new_descs = h->stack_descs;
+    h->cap_new = 4;
+    h->n_new = 0;
+}
+
 /* Release a header's cached NEW descriptors (idempotent; scalars kept). */
 static void seg_hdr_free_descs(seg_hdr_t *h)
 {
     if (h == NULL) return;
-    zgec_free(h->new_descs);
-    h->new_descs = NULL;
+    if (h->new_descs != h->stack_descs) {
+        zgec_free(h->new_descs);
+    }
+    h->new_descs = h->stack_descs;
     h->n_new = 0;
-    h->cap_new = 0;
+    h->cap_new = 4;
 }
 
 /* Append one parsed NEW description to the header cache. */
@@ -426,8 +438,10 @@ static zgec_err seg_hdr_push_new(seg_hdr_t *h, const int16_t *counts, int nsym,
         nb = (new_desc_t *)zgec_alloc((size_t)ncap * sizeof(*nb),
                                       _Alignof(new_desc_t));
         if (nb == NULL) return ZGEC_ERR_NOMEM;
-        if (h->new_descs != NULL) {
+        if (h->new_descs != NULL && h->n_new > 0) {
             memcpy(nb, h->new_descs, (size_t)h->n_new * sizeof(*nb));
+        }
+        if (h->new_descs != h->stack_descs) {
             zgec_free(h->new_descs);
         }
         h->new_descs = nb;
@@ -511,7 +525,7 @@ static zgec_err seg_hdr_parse(seg_hdr_t *h, const uint8_t *buf, size_t size,
     zgec_err e;
 
     if (!h || !buf || !bp) return ZGEC_ERR_INVAL;
-    memset(h, 0, sizeof(*h));
+    seg_hdr_init(h);
     if (size < 2) return ZGEC_ERR_TRUNCATED;
     h->seg_flags = buf[0];
     h->tbl_modes = buf[1];
@@ -792,15 +806,23 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
             if (can_move) {
                 /* Serial path: transfer prev's lit tables to cur. prev is
                  * retired the moment this segment finishes (the caller frees
-                 * it and rotates cur into prev), so nulling its pointer here
-                 * leaves exactly one owner and seg_tables_free(&prev) simply
-                 * skips lit. Saves the per-REPEAT alloc+memcpy+free. */
-                cur->lit = prev->lit;
-                ((seg_tables *)prev)->lit = NULL;
+                 * it and rotates cur into prev). If prev->lit points to its
+                 * stack_lit, copy it into cur->stack_lit and set cur->lit to stack_lit. */
+                if (prev->lit == prev->stack_lit) {
+                    memcpy(cur->stack_lit, prev->stack_lit, sizeof(zgec_rans_dec_table));
+                    cur->lit = cur->stack_lit;
+                } else {
+                    cur->lit = prev->lit;
+                    ((seg_tables *)prev)->lit = NULL;
+                }
             } else {
-                cur->lit = (zgec_rans_dec_table *)zgec_alloc(
-                    (size_t)n_lit_tables * sizeof(zgec_rans_dec_table), 64);
-                if (!cur->lit) return ZGEC_ERR_NOMEM;
+                if (n_lit_tables == 1) {
+                    cur->lit = cur->stack_lit;
+                } else {
+                    cur->lit = (zgec_rans_dec_table *)zgec_alloc(
+                        (size_t)n_lit_tables * sizeof(zgec_rans_dec_table), 64);
+                    if (!cur->lit) return ZGEC_ERR_NOMEM;
+                }
                 memcpy(cur->lit, prev->lit,
                        (size_t)n_lit_tables * sizeof(zgec_rans_dec_table));
             }
@@ -808,9 +830,13 @@ static zgec_err seg_tables_build(seg_tables *cur, const seg_hdr_t *h,
         } else if (lit_mode == ZGEC_TBL_RLE) {
             return ZGEC_ERR_TABLE_MODE;
         } else {
-            cur->lit = (zgec_rans_dec_table *)zgec_alloc(
-                (size_t)n_lit_tables * sizeof(zgec_rans_dec_table), 64);
-            if (!cur->lit) return ZGEC_ERR_NOMEM;
+            if (n_lit_tables == 1) {
+                cur->lit = cur->stack_lit;
+            } else {
+                cur->lit = (zgec_rans_dec_table *)zgec_alloc(
+                    (size_t)n_lit_tables * sizeof(zgec_rans_dec_table), 64);
+                if (!cur->lit) return ZGEC_ERR_NOMEM;
+            }
             cur->n_lit_tbl = n_lit_tables;
             for (i = 0; i < n_lit_tables; i++) {
                 e = build_new_rans(&dc, &cur->lit[i], &p, &rem);
@@ -2029,13 +2055,18 @@ static void *zgec_phaseA_proc_posix(void *arg)
 static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
 {
 #if defined(_WIN32)
+    HANDLE stack_hs[ZGEC_MAX_WORKERS];
     HANDLE *hs = NULL;
     size_t t;
     if (ranges == NULL || w == 0u) return;
-    hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
-    if (hs == NULL) {
-        for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
-        return;
+    if (w <= ZGEC_MAX_WORKERS) {
+        hs = stack_hs;
+    } else {
+        hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
+        if (hs == NULL) {
+            for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
+            return;
+        }
     }
     for (t = 0; t < w; t++) hs[t] = NULL;
     for (t = 0; t < w; t++) {
@@ -2054,19 +2085,26 @@ static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
         if (nv > 0u) (void)WaitForMultipleObjects(nv, hs, TRUE, INFINITE);
         for (t = 0; t < (size_t)nv; t++) (void)CloseHandle(hs[t]);
     }
-    zgec_free(hs);
+    if (hs != stack_hs) zgec_free(hs);
 #else
+    pthread_t stack_ths[ZGEC_MAX_WORKERS];
+    unsigned char stack_started[ZGEC_MAX_WORKERS];
     pthread_t *ths = NULL;
     unsigned char *started = NULL;
     size_t t;
     if (ranges == NULL || w == 0u) return;
-    ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
-    started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
-    if (ths == NULL || started == NULL) {
-        for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
-        zgec_free(ths);
-        zgec_free(started);
-        return;
+    if (w <= ZGEC_MAX_WORKERS) {
+        ths = stack_ths;
+        started = stack_started;
+    } else {
+        ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
+        started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
+        if (ths == NULL || started == NULL) {
+            for (t = 0; t < w; t++) zgec_phaseA_run_range(&ranges[t]);
+            zgec_free(ths);
+            zgec_free(started);
+            return;
+        }
     }
     memset(started, 0, w * sizeof(*started));
     for (t = 0; t < w; t++) {
@@ -2080,8 +2118,8 @@ static void zgec_phaseA_spawn(zgec_phaseA_range *ranges, size_t w)
     for (t = 0; t < w; t++) {
         if (started[t] != 0) (void)pthread_join(ths[t], NULL);
     }
-    zgec_free(ths);
-    zgec_free(started);
+    if (ths != stack_ths) zgec_free(ths);
+    if (started != stack_started) zgec_free(started);
 #endif
 }
 
@@ -2422,6 +2460,9 @@ static zgec_err decode_compressed(zgec_block_arrays **out,
             if (ba->segs[i].lit_form != 0 || ba->segs[i].ll_cond) ok = 0;
             seg_tables_free(&prev);
             prev = cur;
+            if (prev.lit == cur.stack_lit) {
+                prev.lit = prev.stack_lit;
+            }
             seg_tables_init(&cur);
             memset(&cur, 0, sizeof(cur));
             cur.ll_rle[0] = cur.ll_rle[1] = cur.ll_rle[2] = -1;
@@ -2668,6 +2709,9 @@ static zgec_err export_block_literals(const uint8_t *payload, size_t psz,
         if (rs_owned) zgec_free(runstart);
         seg_tables_free(&prev);
         prev = cur;
+        if (prev.lit == cur.stack_lit) {
+            prev.lit = prev.stack_lit;
+        }
         seg_tables_init(&cur);
         memset(&cur, 0, sizeof(cur));
         cur.ll_rle[0] = cur.ll_rle[1] = cur.ll_rle[2] = -1;
@@ -2729,6 +2773,7 @@ typedef struct {
 } zgec_export_slot;
 
 typedef struct {
+    zgec_export_slot stack_slot[64];
     zgec_export_slot *slot;   /* one per block; NULL disables the cache */
     size_t nblk;
     const zgec_frame_header *fh;
@@ -2791,7 +2836,7 @@ static void zgec_export_cache_free(zgec_export_cache *c)
             if (c->slot[i].alias == 0u) zgec_free(c->slot[i].lit);
         }
     }
-    zgec_free(c->slot);
+    if (c->slot != c->stack_slot) zgec_free(c->slot);
     memset(c, 0, sizeof(*c));
 }
 
@@ -2825,11 +2870,15 @@ static void zgec_export_cache_init(zgec_export_cache *c,
     c->src_size = src_size;
     c->nblk = (size_t)f->block_count;
     if (c->nblk > SIZE_MAX / sizeof(*c->slot)) return; /* stays disabled */
-    c->slot = (zgec_export_slot *)zgec_alloc(c->nblk * sizeof(*c->slot),
-                                            _Alignof(zgec_export_slot));
-    if (c->slot == NULL) {
-        c->nblk = 0u;
-        return;
+    if (c->nblk <= 64) {
+        c->slot = c->stack_slot;
+    } else {
+        c->slot = (zgec_export_slot *)zgec_alloc(c->nblk * sizeof(*c->slot),
+                                                _Alignof(zgec_export_slot));
+        if (c->slot == NULL) {
+            c->nblk = 0u;
+            return;
+        }
     }
     memset(c->slot, 0, c->nblk * sizeof(*c->slot));
     for (i = 0; i < c->nblk; i++) zgec_mu_init(&c->slot[i].mu);
@@ -3002,6 +3051,7 @@ static zgec_err dec_litref_gather(zgec_decoder *d, const uint8_t *src,
                                   size_t src_size, const zgec_frame_header *fh,
                                   const zgec_footer *f, uint32_t blk,
                                   uint8_t depth, zgec_export_cache *xc,
+                                  uint8_t *stack_buf, size_t stack_cap,
                                   uint8_t **litref, size_t *litref_len)
 {
     const uint8_t *parts[ZGEC_MAX_LITREF_DEPTH];
@@ -3046,10 +3096,14 @@ static zgec_err dec_litref_gather(zgec_decoder *d, const uint8_t *src,
     }
 
     if (total > 0) {
-        buf = (uint8_t *)zgec_alloc(total, 64);
-        if (buf == NULL) {
-            e = ZGEC_ERR_NOMEM;
-            goto fail;
+        if (stack_buf != NULL && total <= stack_cap) {
+            buf = stack_buf;
+        } else {
+            buf = (uint8_t *)zgec_alloc(total, 64);
+            if (buf == NULL) {
+                e = ZGEC_ERR_NOMEM;
+                goto fail;
+            }
         }
         for (k8 = 0; k8 < depth; k8++) {
             if (part_sz[k8] > 0) {
@@ -3411,13 +3465,18 @@ static void *zgec_dec_blocks_proc_posix(void *arg)
 static void zgec_dec_blocks_spawn(zgec_dec_block_job *jobs, size_t w)
 {
 #if defined(_WIN32)
-    HANDLE *hs;
+    HANDLE stack_hs[ZGEC_MAX_WORKERS];
+    HANDLE *hs = NULL;
     size_t t;
     if (jobs == NULL || w == 0u) return;
-    hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
-    if (hs == NULL) {
-        for (t = 0; t < w; t++) zgec_dec_blocks_run(&jobs[t]);
-        return;
+    if (w <= ZGEC_MAX_WORKERS) {
+        hs = stack_hs;
+    } else {
+        hs = (HANDLE *)zgec_alloc(w * sizeof(*hs), _Alignof(HANDLE));
+        if (hs == NULL) {
+            for (t = 0; t < w; t++) zgec_dec_blocks_run(&jobs[t]);
+            return;
+        }
     }
     for (t = 0; t < w; t++) {
         hs[t] = CreateThread(NULL, 0, zgec_dec_blocks_proc_win,
@@ -3434,19 +3493,26 @@ static void zgec_dec_blocks_spawn(zgec_dec_block_job *jobs, size_t w)
         if (nv > 0u) (void)WaitForMultipleObjects(nv, hs, TRUE, INFINITE);
         for (t = 0; t < (size_t)nv; t++) (void)CloseHandle(hs[t]);
     }
-    zgec_free(hs);
+    if (hs != stack_hs) zgec_free(hs);
 #else
-    pthread_t *ths;
-    unsigned char *started;
+    pthread_t stack_ths[ZGEC_MAX_WORKERS];
+    unsigned char stack_started[ZGEC_MAX_WORKERS];
+    pthread_t *ths = NULL;
+    unsigned char *started = NULL;
     size_t t;
     if (jobs == NULL || w == 0u) return;
-    ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
-    started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
-    if (ths == NULL || started == NULL) {
-        for (t = 0; t < w; t++) zgec_dec_blocks_run(&jobs[t]);
-        zgec_free(ths);
-        zgec_free(started);
-        return;
+    if (w <= ZGEC_MAX_WORKERS) {
+        ths = stack_ths;
+        started = stack_started;
+    } else {
+        ths = (pthread_t *)zgec_alloc(w * sizeof(*ths), _Alignof(pthread_t));
+        started = (unsigned char *)zgec_alloc(w * sizeof(*started), 1);
+        if (ths == NULL || started == NULL) {
+            for (t = 0; t < w; t++) zgec_dec_blocks_run(&jobs[t]);
+            zgec_free(ths);
+            zgec_free(started);
+            return;
+        }
     }
     memset(started, 0, w * sizeof(*started));
     for (t = 0; t < w; t++) {
@@ -3460,8 +3526,8 @@ static void zgec_dec_blocks_spawn(zgec_dec_block_job *jobs, size_t w)
     for (t = 0; t < w; t++) {
         if (started[t] != 0) (void)pthread_join(ths[t], NULL);
     }
-    zgec_free(ths);
-    zgec_free(started);
+    if (ths != stack_ths) zgec_free(ths);
+    if (started != stack_started) zgec_free(started);
 #endif
 }
 
@@ -3677,16 +3743,28 @@ static zgec_err zgec_dec_frame_blocks(zgec_decoder *d, const uint8_t *src,
         inner = (want > n_workers) ? (want / n_workers) : 1u;
         if (inner < 1u) inner = 1u;
     }
-    ws = (zgec_decoder **)zgec_alloc(n_workers * sizeof(*ws),
-                                     _Alignof(zgec_decoder *));
-    if (ws) memset(ws, 0, n_workers * sizeof(*ws));
-    jobs = (zgec_dec_block_job *)zgec_alloc(n_workers * sizeof(*jobs),
-                                            _Alignof(zgec_dec_block_job));
-    if (jobs) memset(jobs, 0, n_workers * sizeof(*jobs));
+    zgec_decoder *stack_ws[64];
+    zgec_dec_block_job stack_jobs[64];
+    int ws_owned = 0, jobs_owned = 0;
+    if (n_workers <= 64) {
+        ws = stack_ws;
+        jobs = stack_jobs;
+    } else {
+        ws = (zgec_decoder **)zgec_alloc(n_workers * sizeof(*ws),
+                                         _Alignof(zgec_decoder *));
+        if (ws) ws_owned = 1;
+        jobs = (zgec_dec_block_job *)zgec_alloc(n_workers * sizeof(*jobs),
+                                                _Alignof(zgec_dec_block_job));
+        if (jobs) jobs_owned = 1;
+    }
     if (ws == NULL || jobs == NULL) {
+        if (ws_owned) zgec_free(ws);
+        if (jobs_owned) zgec_free(jobs);
         err = ZGEC_ERR_NOMEM;
         goto done;
     }
+    memset(ws, 0, n_workers * sizeof(*ws));
+    memset(jobs, 0, n_workers * sizeof(*jobs));
     for (t = 0; t < n_workers; t++) {
         ws[t] = dec_block_worker_create(d, (int)inner);
         if (ws[t] == NULL) {
@@ -3741,8 +3819,8 @@ done:
             if (ws[t] != NULL) zgec_decoder_destroy(ws[t]);
         }
     }
-    zgec_free(ws);
-    zgec_free(jobs);
+    if (ws_owned) zgec_free(ws);
+    if (jobs_owned) zgec_free(jobs);
     if (off_owned) {
         zgec_free(off);
         zgec_free(sz);
@@ -3936,7 +4014,9 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                       (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
             n_blocks++;
         } else if (rh.record_type == ZGEC_REC_RLE) {
+            uint8_t stack_tmp[8192];
             uint8_t *tmp = NULL;
+            int tmp_owned = 0;
             if (rh.payload_size != 1) {
                 zgec_free(out);
                 if (have_footer) zgec_footer_free(&footer);
@@ -3954,18 +4034,23 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                 if (have_footer) zgec_footer_free(&footer);
                 return ZGEC_ERR_CHECKSUM; /* V10 */
             }
-            tmp = (uint8_t *)zgec_alloc(
-                rh.raw_size ? (size_t)rh.raw_size : 1, 64);
-            if (!tmp) {
-                zgec_free(out);
-                if (have_footer) zgec_footer_free(&footer);
-                return ZGEC_ERR_NOMEM;
+            if (rh.raw_size <= sizeof(stack_tmp)) {
+                tmp = stack_tmp;
+            } else {
+                tmp = (uint8_t *)zgec_alloc(
+                    rh.raw_size ? (size_t)rh.raw_size : 1, 64);
+                if (!tmp) {
+                    zgec_free(out);
+                    if (have_footer) zgec_footer_free(&footer);
+                    return ZGEC_ERR_NOMEM;
+                }
+                tmp_owned = 1;
             }
             memset(tmp, payload[0], (size_t)rh.raw_size);
             if ((rh.rflags & ZGEC_RFLAG_HAS_CHECKSUM) != 0) {
                 uint32_t crc = zgec_crc32c(tmp, rh.raw_size, 0u);
                 if (crc != rh.checksum) { /* V10 */
-                    zgec_free(tmp);
+                    if (tmp_owned) zgec_free(tmp);
                     zgec_free(out);
                     if (have_footer) zgec_footer_free(&footer);
                     return ZGEC_ERR_CHECKSUM;
@@ -3976,7 +4061,7 @@ zgec_err zgec_decode_frame(zgec_decoder *d,
                                       (uint64_t)d->limits.max_total);
             hist_push(d, tmp, rh.raw_size,
                       (rh.rflags & ZGEC_RFLAG_LIT_EXPORTABLE) != 0);
-            zgec_free(tmp);
+            if (tmp_owned) zgec_free(tmp);
             if (err != ZGEC_OK) {
                 zgec_free(out);
                 if (have_footer) zgec_footer_free(&footer);
@@ -4351,7 +4436,9 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
      * multi-threaded decode from re-exporting each predecessor once per
      * worker -- and exports them locally otherwise, as a lone
      * random-access read does. */
+    uint8_t stack_litref[8192];
     e = dec_litref_gather(d, src, src_size, fh, f, blk, rec.lit_ref_depth, xc,
+                          stack_litref, sizeof(stack_litref),
                           &litref, &litref_len);
     if (e != ZGEC_OK) return e;
 
@@ -4390,7 +4477,7 @@ static zgec_err decode_block_record(zgec_decoder *d, const uint8_t *src,
                               (rec.rflags & ZGEC_RFLAG_HAS_CHECKSUM) != 0,
                               &dummy_ok, filter_mode, filter_param);
     }
-    zgec_free(litref);
+    if (litref != stack_litref) zgec_free(litref);
     if (e != ZGEC_OK) return e;
     {
         uint8_t *bp = dec_block_dst(d, ovr, ovr_cap, ba->raw_size);
