@@ -41,17 +41,13 @@ static inline int zgec_rans_renorm(uint32_t *xp, const uint8_t **cursorp,
 /* Unguarded renormalisation for the fast rounds: the caller guarantees at
  * least two readable bytes at *cursorp, so the cursor bound test and the
  * clamped-load select of zgec_rans_renorm are dead and dropped. Same
- * arithmetic, same cursor/remaining updates; the load stays unconditional
- * (a data-dependent branch on `need` would mispredict about a third of the
- * time and costs far more than the always-taken load). */
+ * arithmetic and cursor update; remaining is updated once after the loop. */
 static inline uint32_t zgec_rans_renorm_unguarded(uint32_t x,
-                                                  const uint8_t **cursorp,
-                                                  size_t *remainingp)
+                                                  const uint8_t **cursorp)
 {
     uint32_t need = (x < ZGEC_RANS_STATE_MIN) ? 1u : 0u;
     uint32_t w = (uint32_t)zgec_rd16(*cursorp);
     *cursorp += (size_t)need * 2u;
-    *remainingp -= (size_t)need * 2u;
     return need ? ((x << 16) | w) : x;
 }
 
@@ -271,11 +267,12 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                 if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                 Z[j] = (uint8_t)e;
                 x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
+                x = zgec_rans_renorm_unguarded(x, &cursor);
                 state[lane] = x;
             }
             if (err != ZGEC_OK) break;
         }
+        remaining = (size_t)(safe_end2 + 2u - cursor);
         for (; round < max_rounds && err == ZGEC_OK; round++) {
             unsigned m = (round < full) ? 8u : rem;
             for (unsigned lane = 0; lane < m; lane++) {
@@ -342,11 +339,12 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                         if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                         Z[j] = (uint8_t)e;
                         x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                        x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
+                        x = zgec_rans_renorm_unguarded(x, &cursor);
                         state[lane] = x;
                     }
                     if (err != ZGEC_OK) break;
                 }
+                remaining = (size_t)(safe_end2 + 2u - cursor);
                 for (; round < max_rounds && err == ZGEC_OK; round++) {
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {
@@ -387,11 +385,12 @@ zgec_err zgec_rans_decode(uint8_t *Z, size_t n_lit,
                         if (f == 0u) { err = ZGEC_ERR_RANS_STATE; break; }
                         Z[j] = (uint8_t)e;
                         x = f * (x >> ZGEC_RANS_L) + (e >> 20);
-                        x = zgec_rans_renorm_unguarded(x, &cursor, &remaining);
+                        x = zgec_rans_renorm_unguarded(x, &cursor);
                         state[lane] = x;
                     }
                     if (err != ZGEC_OK) break;
                 }
+                remaining = (size_t)(safe_end2 + 2u - cursor);
                 for (; round < max_rounds && err == ZGEC_OK; round++) {
                     unsigned m = (round < full) ? 8u : rem;
                     for (unsigned lane = 0; lane < m; lane++) {
