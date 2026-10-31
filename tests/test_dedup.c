@@ -135,13 +135,48 @@ static void test_class_map_shared(void)
 {
     uint8_t map[64], packed[24], back[64];
     for (int i = 0; i < 64; i++) map[i] = (uint8_t)(i % 4);
-    zgec_class_map_encode(packed, map);
+    CHECK(zgec_class_map_encode(packed, map) == ZGEC_OK, "class map encode ok");
     CHECK(zgec_class_map_decode(back, packed, 4) == ZGEC_OK, "class map round-trip");
     CHECK(memcmp(back, map, 64) == 0, "class map identical");
     /* Entry >= k rejected, same rule block params rely on. */
     packed[0] |= 0x07u;
     CHECK(zgec_class_map_decode(back, packed, 4) != ZGEC_OK, "class map >=k rejected");
+
+    /* Out-of-bounds entry (>= 8) rejected during encoding */
+    map[10] = 8;
+    CHECK(zgec_class_map_encode(packed, map) == ZGEC_ERR_CLASS_MAP, "class map encode >=8 rejected");
     printf("classmap ok\n");
+}
+
+static void test_lit_sub_reconstruct(void)
+{
+    uint8_t Z[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    uint32_t rep0_before[3] = { 1, 2, 1 };
+    uint32_t ll[2] = { 3, 4 };
+    size_t tail = 3;
+
+    /* Empty n_lit */
+    CHECK(zgec_lit_sub_reconstruct(NULL, 0, NULL, NULL, 0, 0, 0) == ZGEC_OK, "sub reconstruct empty ok");
+
+    /* NULL buffer rejection */
+    CHECK(zgec_lit_sub_reconstruct(NULL, 10, rep0_before, ll, 2, tail, 0) == ZGEC_ERR_INVAL, "sub reconstruct null Z rejected");
+
+    /* NULL rep0_before or ll with n_seq > 0 rejected */
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, NULL, ll, 2, tail, 0) == ZGEC_ERR_INVAL, "sub reconstruct null rep0 rejected");
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, NULL, 2, tail, 0) == ZGEC_ERR_INVAL, "sub reconstruct null ll rejected");
+
+    /* Sequence sum + tail mismatch rejected */
+    {
+        uint32_t bad_ll[2] = { 5, 5 };
+        CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, bad_ll, 2, tail, 0) == ZGEC_ERR_LL_SUM, "sub reconstruct oversum rejected");
+    }
+
+    /* Tail > n_lit rejected */
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, ll, 2, 11, 0) == ZGEC_ERR_LL_SUM, "sub reconstruct bad tail rejected");
+
+    /* Valid sub-literal reconstruction */
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, ll, 2, tail, 0) == ZGEC_OK, "sub reconstruct valid ok");
+    printf("sub reconstruct ok\n");
 }
 
 static void test_cpu_count(void)
@@ -189,6 +224,7 @@ int main(void)
     test_shuffle_count();
     test_runstart();
     test_class_map_shared();
+    test_lit_sub_reconstruct();
     test_cpu_count();
     test_cpu_physical_count();
     test_reps_shared();

@@ -269,6 +269,7 @@ void *zgec_alloc(size_t n, size_t align)
     assert((uintptr_t)aligned >= (uintptr_t)raw + 2u * sizeof(void *));
     assert(total >= n + prefix);
     assert(((uintptr_t)aligned & (align - 1)) == 0);
+    assert((uintptr_t)aligned + n <= (uintptr_t)raw + total);
 
     return (void *)aligned;
 }
