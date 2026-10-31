@@ -1217,16 +1217,8 @@ zgec_match zgec_matcher_find_lens(zgec_matcher *m, const uint8_t *vb, size_t ip,
          * and the mask is truncated to nlanes bits for nlanes < 32. */
         {
             uint32_t n = m->nlanes;
-            uint32_t s = (n - head) & (n - 1u);
-            uint32_t rm;
-            if (s == 0u) {
-                rm = mask;
-            } else {
-                rm = (mask << s) | (mask >> (n - s));
-            }
-            if (n < 32u) {
-                rm &= (uint32_t)(((uint64_t)1u << n) - 1u);
-            }
+            uint64_t m64 = (uint64_t)mask;
+            uint32_t rm = (uint32_t)(((m64 | (m64 << n)) >> head) & (((uint64_t)1u << n) - 1u));
             while (rm != 0u && nhit > 0) {
                 uint32_t bpos = 31u - (uint32_t)__builtin_clz(rm);
                 uint32_t lane = (head + bpos) & (n - 1u);
