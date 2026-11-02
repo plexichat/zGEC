@@ -57,7 +57,7 @@ static inline unsigned zgec_classify(int ctx_mode, uint8_t b)
 zgec_err zgec_class_map_decode(uint8_t *map /* 64 entries */,
                                          const uint8_t *packed /* 24 bytes */,
                                          int k);
-void zgec_class_map_encode(uint8_t *packed /* 24 bytes */,
+zgec_err zgec_class_map_encode(uint8_t *packed /* 24 bytes */,
                                  const uint8_t *map /* 64 entries */);
 
 /* Run-start bitmap (9.3), packed one bit per literal, least significant
@@ -139,7 +139,7 @@ void zgec_lit_lane_geom(size_t start[ZGEC_NLANES], size_t len[ZGEC_NLANES],
  * than the run length, later bytes use earlier bytes of the
  * same run as predictors.
  */
-void zgec_lit_sub_reconstruct(uint8_t *Z, size_t n_lit,
+zgec_err zgec_lit_sub_reconstruct(uint8_t *Z, size_t n_lit,
                                       const uint32_t *rep0_before,
                                       const uint32_t *ll, size_t n_seq,
                                       size_t tail, size_t vbpos);

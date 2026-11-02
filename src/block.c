@@ -54,7 +54,7 @@ static size_t zgec_ctx_desc_emit(uint8_t *buf, size_t cap, const zgec_ctx_desc *
         for (int i = 0; i < 64; i++) {
             if (desc->class_map[i] >= desc->ctx_count) return 0;
         }
-        zgec_class_map_encode(buf + 2, desc->class_map);
+        if (zgec_class_map_encode(buf + 2, desc->class_map) != ZGEC_OK) return 0;
     }
     return needed;
 }

@@ -3359,7 +3359,10 @@ static size_t dec_block_stride(uint32_t nblk)
 
 static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
 {
-    if (jb == NULL) return;
+    if (jb == NULL) {
+        zgec_thread_cleanup();
+        return;
+    }
     for (;;) {
         uint32_t k = (uint32_t)zgec_atomic_fetch_add_size(jb->next, 1);
         uint32_t i;
