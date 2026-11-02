@@ -158,9 +158,10 @@ const char *zgec_strerror(zgec_err e)
    which is always a safe lower bound because a block is only ever written up
    to its requested size. Blocks still held at thread exit are reachable from
    this thread-local array. */
-#define ZGEC_POOL_MIN       (128u * 1024u)
-#define ZGEC_POOL_MAX_BLOCK (4u * 1024u * 1024u)
-#define ZGEC_POOL_SLOTS     8u
+#define ZGEC_POOL_MIN             (128u * 1024u)
+#define ZGEC_POOL_MAX_BLOCK       (4u * 1024u * 1024u)
+#define ZGEC_POOL_SLOTS           8u
+#define ZGEC_POOL_MAX_TOTAL_BYTES (32u * 1024u * 1024u)
 
 struct zgec_pool_slot {
     void  *raw;
@@ -169,6 +170,7 @@ struct zgec_pool_slot {
 
 static ZGEC_ALLOC_TLS struct zgec_pool_slot zgec_pool[ZGEC_POOL_SLOTS];
 static ZGEC_ALLOC_TLS unsigned zgec_pool_n;
+static ZGEC_ALLOC_TLS size_t   zgec_pool_bytes;
 
 /* Smallest cached block that can hold `total`, removed from the cache, or
    NULL if none fits. */
@@ -186,7 +188,12 @@ static void *zgec_pool_take(size_t total)
     if (best == ZGEC_POOL_SLOTS) return NULL;
     {
         void *raw = zgec_pool[best].raw;
+        size_t slot_total = zgec_pool[best].total;
+        assert(zgec_pool_bytes >= slot_total);
+        zgec_pool_bytes -= slot_total;
         zgec_pool[best] = zgec_pool[--zgec_pool_n];
+        zgec_pool[zgec_pool_n].raw = NULL;
+        zgec_pool[zgec_pool_n].total = 0;
         return raw;
     }
 }
@@ -194,9 +201,17 @@ static void *zgec_pool_take(size_t total)
 /* Offer a block to the cache; returns 0 if it was not taken (caller frees). */
 static int zgec_pool_put(void *raw, size_t total)
 {
+    assert(raw != NULL);
     if (zgec_pool_n >= ZGEC_POOL_SLOTS) return 0;
+    if (zgec_pool_bytes + total > ZGEC_POOL_MAX_TOTAL_BYTES) return 0;
+#ifndef NDEBUG
+    for (unsigned i = 0; i < zgec_pool_n; i++) {
+        assert(zgec_pool[i].raw != raw);
+    }
+#endif
     zgec_pool[zgec_pool_n].raw = raw;
     zgec_pool[zgec_pool_n].total = total;
+    zgec_pool_bytes += total;
     zgec_pool_n++;
     return 1;
 }
@@ -210,6 +225,7 @@ void zgec_alloc_cleanup_tls(void)
         zgec_pool[zgec_pool_n].raw = NULL;
         zgec_pool[zgec_pool_n].total = 0;
     }
+    zgec_pool_bytes = 0;
 }
 
 /* Aligned allocation via over-allocation: the block
@@ -269,6 +285,7 @@ void *zgec_alloc(size_t n, size_t align)
     assert((uintptr_t)aligned >= (uintptr_t)raw + 2u * sizeof(void *));
     assert(total >= n + prefix);
     assert(((uintptr_t)aligned & (align - 1)) == 0);
+    assert((uintptr_t)aligned + n <= (uintptr_t)raw + total);
 
     return (void *)aligned;
 }
@@ -289,6 +306,7 @@ void zgec_free(void *p)
     assert(raw != NULL);
     assert((uintptr_t)p > (uintptr_t)raw);
     assert(total >= 2u * sizeof(void *));
+    assert((uintptr_t)p + sizeof(void *) <= (uintptr_t)raw + total);
     if (total >= ZGEC_POOL_MIN && total <= ZGEC_POOL_MAX_BLOCK &&
         zgec_pool_put(raw, total)) {
         return;

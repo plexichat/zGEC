@@ -5,6 +5,7 @@
 #include "zgec.h"
 #include "zgec_lit.h"
 #include "zgec_seq.h"
+#include "zgec_fse.h"
 #include "../src/zgec_internal.h"
 
 /* Regression tests for the deduplicated shared helpers (see
@@ -181,6 +182,61 @@ static void test_reps_shared(void)
     printf("reps ok\n");
 }
 
+static void test_pools_and_allocator(void)
+{
+    /* 1. Test block allocator pooling and surplus freeing */
+    void *ptrs[16];
+    for (int i = 0; i < 16; i++) {
+        ptrs[i] = zgec_alloc(256 * 1024, 64);
+        CHECK(ptrs[i] != NULL, "alloc 256K ok");
+        memset(ptrs[i], (int)(i + 1), 256 * 1024);
+    }
+    for (int i = 0; i < 16; i++) {
+        zgec_free(ptrs[i]);
+    }
+    /* Re-allocate from pool */
+    for (int i = 0; i < 8; i++) {
+        ptrs[i] = zgec_alloc(256 * 1024, 64);
+        CHECK(ptrs[i] != NULL, "re-alloc 256K ok");
+    }
+    for (int i = 0; i < 8; i++) {
+        zgec_free(ptrs[i]);
+    }
+    zgec_alloc_cleanup_tls();
+
+    /* 2. Test FSE encoder table pooling and bounds */
+    int16_t counts[66];
+    uint32_t hist[66];
+    memset(hist, 0, sizeof(hist));
+    hist[0] = 100;
+    hist[1] = 100;
+    zgec_normalize_counts(counts, hist, 66, 10);
+    zgec_fse_dec_table *dec = NULL;
+    CHECK(zgec_fse_build_dec(&dec, counts, 66, 10) == ZGEC_OK, "fse build dec ok");
+    zgec_fse_enc_table *enc_tables[16];
+    for (int i = 0; i < 16; i++) {
+        enc_tables[i] = NULL;
+        CHECK(zgec_fse_build_enc(&enc_tables[i], dec) == ZGEC_OK, "build enc ok");
+        CHECK(enc_tables[i] != NULL, "enc table non-null");
+    }
+    for (int i = 0; i < 16; i++) {
+        zgec_fse_free_enc(enc_tables[i]);
+        enc_tables[i] = NULL;
+    }
+    /* Rent back from pool */
+    for (int i = 0; i < 8; i++) {
+        CHECK(zgec_fse_build_enc(&enc_tables[i], dec) == ZGEC_OK, "rent enc ok");
+        CHECK(enc_tables[i] != NULL, "rented enc table non-null");
+    }
+    for (int i = 0; i < 8; i++) {
+        zgec_fse_free_enc(enc_tables[i]);
+        enc_tables[i] = NULL;
+    }
+    zgec_fse_free_dec(dec);
+    zgec_thread_cleanup();
+    printf("pools and allocator ok\n");
+}
+
 int main(void)
 {
     test_normalize();
@@ -192,6 +248,7 @@ int main(void)
     test_cpu_count();
     test_cpu_physical_count();
     test_reps_shared();
+    test_pools_and_allocator();
     if (fails == 0) printf("ALL DEDUP CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);
     return fails ? 1 : 0;
