@@ -26,7 +26,10 @@
  * slot's capacity is recovered from them on reuse. Slots that survive to
  * process exit are still reachable from this pointer, so they are not
  * leaked in the LSan sense. */
+#define ZGEC_FSE_POOL_MAX_SLOTS 8u
+
 static ZGEC_FSE_TLS zgec_fse_enc_table *zgec_fse_enc_pool;
+static ZGEC_FSE_TLS unsigned zgec_fse_enc_pool_count;
 
 static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
 {
@@ -34,6 +37,7 @@ static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
         zgec_fse_enc_table *t = zgec_fse_enc_pool;
         size_t cap;
         zgec_fse_enc_pool = (zgec_fse_enc_table *)(void *)t->e;
+        if (zgec_fse_enc_pool_count > 0) zgec_fse_enc_pool_count--;
         cap = sizeof(*t)
             + (size_t)t->nsym * ((size_t)1u << (unsigned)t->al)
             * sizeof(zgec_fse_enc_entry);
@@ -49,8 +53,13 @@ static zgec_fse_enc_table *zgec_fse_enc_rent(size_t need)
 static void zgec_fse_enc_return(zgec_fse_enc_table *t)
 {
     assert(t != NULL);
+    if (zgec_fse_enc_pool_count >= ZGEC_FSE_POOL_MAX_SLOTS) {
+        zgec_free(t);
+        return;
+    }
     t->e = (zgec_fse_enc_entry *)(void *)zgec_fse_enc_pool;
     zgec_fse_enc_pool = t;
+    zgec_fse_enc_pool_count++;
 }
 
 /* Free all cached FSE encoder tables in the thread-local pool for the calling thread. */
@@ -61,6 +70,7 @@ void zgec_fse_cleanup_tls(void)
         zgec_fse_enc_pool = (zgec_fse_enc_table *)(void *)t->e;
         zgec_free(t);
     }
+    zgec_fse_enc_pool_count = 0;
 }
 
 /* ---- forward bit reader (LSB-first, little-endian words) ---- */
