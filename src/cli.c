@@ -281,6 +281,7 @@ typedef struct {
     int       filter;
     int       ck;
     int       block_log2;
+    int       lazy_max;
     int       impl;   /* 1 = implemented preset, 0 = reserved slot */
 } cli_level;
 
@@ -345,31 +346,31 @@ typedef struct {
  * (fast+ctx+sub+cond, 63,055,806 B at 4.7 s) stays reachable as level 6
  * plus --conditioning. */
 static const cli_level cli_levels[CLI_LEVEL_MAX] = {
-    /*  1 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  2 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  3 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  4 */ { ZGEC_TIER_FAST, 0.0, 0, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  5 */ { ZGEC_TIER_FAST, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  6 */ { ZGEC_TIER_FAST, 0.0, 1, 1, 0, 0, 0, 0, 0, 21, 1 },
-    /*  7 */ { ZGEC_TIER_MAIN, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
-    /*  8 */ { ZGEC_TIER_HIGH, 0.0, 1, 0, 0, 0, 0, 0, 0, 21, 1 },
-    /*  9 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 0, 0, 0, 0, 21, 1 },
-    /* 10 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 1 },
-    /* 11 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 0, 21, 0 },
-    /* 12 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 0, 0, 1, 21, 1 },
-    /* 13 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 0, 1, 21, 1 },
-    /* 14 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 21, 1 },
-    /* 15 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 1 },
-    /* 16 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 22, 1 },
-    /* 17 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 1 },
-    /* 18 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 23, 1 },
-    /* 19 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 20 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 21 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 22 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 23 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 24 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 },
-    /* 25 */ { ZGEC_TIER_HIGH, 0.0, 1, 1, 1, 1, 1, 1, 1, 24, 1 }
+    /*  1 */ { .tier = ZGEC_TIER_FAST, .lambda = 0.0, .ctx = 0, .sub = 0, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  2 */ { .tier = ZGEC_TIER_FAST, .lambda = 0.0, .ctx = 0, .sub = 0, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  3 */ { .tier = ZGEC_TIER_FAST, .lambda = 0.0, .ctx = 0, .sub = 0, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  4 */ { .tier = ZGEC_TIER_FAST, .lambda = 0.0, .ctx = 0, .sub = 0, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  5 */ { .tier = ZGEC_TIER_FAST, .lambda = 0.0, .ctx = 1, .sub = 0, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  6 */ { .tier = ZGEC_TIER_FAST, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  7 */ { .tier = ZGEC_TIER_MAIN, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  8 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 0, .cond = 0, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /*  9 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 0, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /* 10 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /* 11 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 0, .filter = 0, .ck = 0, .block_log2 = 21, .lazy_max = 16, .impl = 0 },
+    /* 12 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 0, .filter = 0, .ck = 1, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /* 13 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 0, .ck = 1, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /* 14 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 21, .lazy_max = 16, .impl = 1 },
+    /* 15 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 22, .lazy_max = 32, .impl = 1 },
+    /* 16 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 22, .lazy_max = 48, .impl = 1 },
+    /* 17 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 23, .lazy_max = 64, .impl = 1 },
+    /* 18 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 23, .lazy_max = 96, .impl = 1 },
+    /* 19 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 128, .impl = 1 },
+    /* 20 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 192, .impl = 1 },
+    /* 21 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 256, .impl = 1 },
+    /* 22 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 384, .impl = 1 },
+    /* 23 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 512, .impl = 1 },
+    /* 24 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 768, .impl = 1 },
+    /* 25 */ { .tier = ZGEC_TIER_HIGH, .lambda = 0.0, .ctx = 1, .sub = 1, .cond = 1, .litref = 1, .dicts = 1, .filter = 1, .ck = 1, .block_log2 = 24, .lazy_max = 1024, .impl = 1 }
 };
 
 static void cli_apply_level(zgec_params *p, int level)
@@ -388,6 +389,7 @@ static void cli_apply_level(zgec_params *p, int level)
     p->use_dicts = l->dicts;
     p->use_filter = l->filter;
     p->block_checksums = l->ck;
+    p->lazy_max = l->lazy_max;
     /* Rungs 1-3 are the fast tier's speed ladder: level 1 is the fastest and
      * largest, running the single-table lean core (dial 4); levels 2 and 3
      * step the parser back toward the pinned default (dial 0) that level 4
