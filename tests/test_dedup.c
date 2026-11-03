@@ -5,6 +5,7 @@
 #include "zgec.h"
 #include "zgec_lit.h"
 #include "zgec_seq.h"
+#include "zgec_fse.h"
 #include "../src/zgec_internal.h"
 
 /* Regression tests for the deduplicated shared helpers (see
@@ -135,13 +136,48 @@ static void test_class_map_shared(void)
 {
     uint8_t map[64], packed[24], back[64];
     for (int i = 0; i < 64; i++) map[i] = (uint8_t)(i % 4);
-    zgec_class_map_encode(packed, map);
+    CHECK(zgec_class_map_encode(packed, map) == ZGEC_OK, "class map encode ok");
     CHECK(zgec_class_map_decode(back, packed, 4) == ZGEC_OK, "class map round-trip");
     CHECK(memcmp(back, map, 64) == 0, "class map identical");
     /* Entry >= k rejected, same rule block params rely on. */
     packed[0] |= 0x07u;
     CHECK(zgec_class_map_decode(back, packed, 4) != ZGEC_OK, "class map >=k rejected");
+
+    /* Out-of-bounds entry (>= 8) rejected during encoding */
+    map[10] = 8;
+    CHECK(zgec_class_map_encode(packed, map) == ZGEC_ERR_CLASS_MAP, "class map encode >=8 rejected");
     printf("classmap ok\n");
+}
+
+static void test_lit_sub_reconstruct(void)
+{
+    uint8_t Z[10] = { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    uint32_t rep0_before[3] = { 1, 2, 1 };
+    uint32_t ll[2] = { 3, 4 };
+    size_t tail = 3;
+
+    /* Empty n_lit */
+    CHECK(zgec_lit_sub_reconstruct(NULL, 0, NULL, NULL, 0, 0, 0) == ZGEC_OK, "sub reconstruct empty ok");
+
+    /* NULL buffer rejection */
+    CHECK(zgec_lit_sub_reconstruct(NULL, 10, rep0_before, ll, 2, tail, 0) == ZGEC_ERR_INVAL, "sub reconstruct null Z rejected");
+
+    /* NULL rep0_before or ll with n_seq > 0 rejected */
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, NULL, ll, 2, tail, 0) == ZGEC_ERR_INVAL, "sub reconstruct null rep0 rejected");
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, NULL, 2, tail, 0) == ZGEC_ERR_INVAL, "sub reconstruct null ll rejected");
+
+    /* Sequence sum + tail mismatch rejected */
+    {
+        uint32_t bad_ll[2] = { 5, 5 };
+        CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, bad_ll, 2, tail, 0) == ZGEC_ERR_LL_SUM, "sub reconstruct oversum rejected");
+    }
+
+    /* Tail > n_lit rejected */
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, ll, 2, 11, 0) == ZGEC_ERR_LL_SUM, "sub reconstruct bad tail rejected");
+
+    /* Valid sub-literal reconstruction */
+    CHECK(zgec_lit_sub_reconstruct(Z, 10, rep0_before, ll, 2, tail, 0) == ZGEC_OK, "sub reconstruct valid ok");
+    printf("sub reconstruct ok\n");
 }
 
 static void test_cpu_count(void)
@@ -189,9 +225,66 @@ int main(void)
     test_shuffle_count();
     test_runstart();
     test_class_map_shared();
+    test_lit_sub_reconstruct();
     test_cpu_count();
     test_cpu_physical_count();
     test_reps_shared();
+
+    /* 1. Test block allocator pooling and surplus freeing */
+    {
+        void *ptrs[16];
+        for (int i = 0; i < 16; i++) {
+            ptrs[i] = zgec_alloc(256 * 1024, 64);
+            CHECK(ptrs[i] != NULL, "alloc 256K ok");
+            memset(ptrs[i], (int)(i + 1), 256 * 1024);
+        }
+        for (int i = 0; i < 16; i++) {
+            zgec_free(ptrs[i]);
+        }
+        /* Re-allocate from pool */
+        for (int i = 0; i < 8; i++) {
+            ptrs[i] = zgec_alloc(256 * 1024, 64);
+            CHECK(ptrs[i] != NULL, "re-alloc 256K ok");
+        }
+        for (int i = 0; i < 8; i++) {
+            zgec_free(ptrs[i]);
+        }
+        zgec_alloc_cleanup_tls();
+    }
+
+    /* 2. Test FSE encoder table pooling and bounds */
+    {
+        int16_t counts[66];
+        uint32_t hist[66];
+        memset(hist, 0, sizeof(hist));
+        hist[0] = 100;
+        hist[1] = 100;
+        zgec_normalize_counts(counts, hist, 66, 10);
+        zgec_fse_dec_table *dec = NULL;
+        CHECK(zgec_fse_build_dec(&dec, counts, 66, 10) == ZGEC_OK, "fse build dec ok");
+        zgec_fse_enc_table *enc_tables[16];
+        for (int i = 0; i < 16; i++) {
+            enc_tables[i] = NULL;
+            CHECK(zgec_fse_build_enc(&enc_tables[i], dec) == ZGEC_OK, "build enc ok");
+            CHECK(enc_tables[i] != NULL, "enc table non-null");
+        }
+        for (int i = 0; i < 16; i++) {
+            zgec_fse_free_enc(enc_tables[i]);
+            enc_tables[i] = NULL;
+        }
+        /* Rent back from pool */
+        for (int i = 0; i < 8; i++) {
+            CHECK(zgec_fse_build_enc(&enc_tables[i], dec) == ZGEC_OK, "rent enc ok");
+            CHECK(enc_tables[i] != NULL, "rented enc table non-null");
+        }
+        for (int i = 0; i < 8; i++) {
+            zgec_fse_free_enc(enc_tables[i]);
+            enc_tables[i] = NULL;
+        }
+        zgec_fse_free_dec(dec);
+        zgec_thread_cleanup();
+    }
+
     if (fails == 0) printf("ALL DEDUP CHECKS PASSED\n");
     else printf("FAILURES %d\n", fails);
     return fails ? 1 : 0;
