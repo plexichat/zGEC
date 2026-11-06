@@ -1266,3 +1266,11 @@ the branch deletion.
 Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
 tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
 binding constraint on the one change that actually moves the high tier.
+
+## 2026-11-06 - Branchless Short-Bucket Hit Mask Rotation in LZ Match Finder
+
+**Learning:**
+In `src/match.c` (`zgec_matcher_find_lens`), querying short buckets computes candidate match lanes across $n \in \{4, 8, 16, 32\}$ lanes. Rotating the hit mask to align `head - 1` with the most significant bit previously used a conditional branch `if (s == 0u) rm = mask; else rm = (mask << s) | (mask >> (n - s));` followed by conditional truncation. Because `head` varies dynamically per bucket, `s == 0` mispredicts frequently. Replicating the 32-bit mask into a 64-bit word `m64 = (uint64_t)mask` and right-shifting `(m64 | (m64 << n)) >> head` computes the exact circular rotation branchlessly in a single barrel-shift operation, avoiding pipeline stalls and shift arithmetic overhead.
+
+**Action:**
+For power-of-two lane circular mask rotations in match finders and search grids, use 64-bit barrel shifts `((m64 | (m64 << n)) >> head) & (((uint64_t)1u << n) - 1u)` instead of branchy shift-and-combine logic.
