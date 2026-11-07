@@ -152,7 +152,7 @@ static int zgec_test_class_map_round_trip(void)
     uint8_t map[64];
     uint8_t packed[24];
     for (int i = 0; i < 64; i++) map[i] = (uint8_t)(i % 4);
-    zgec_class_map_encode(packed, map);
+    if (zgec_class_map_encode(packed, map) != ZGEC_OK) return 0;
     uint8_t unpacked[64];
     if (zgec_class_map_decode(unpacked, packed, 4) != ZGEC_OK) return 0;
     for (int i = 0; i < 64; i++) {
