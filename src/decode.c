@@ -2000,7 +2000,10 @@ typedef struct {
 static void zgec_phaseA_run_range(zgec_phaseA_range *r)
 {
     size_t k;
-    if (r == NULL) return;
+    if (r == NULL) {
+        zgec_thread_cleanup();
+        return;
+    }
     for (k = r->begin; k < r->end; k++) {
         zgec_phaseA_job *jb = &r->jobs[k];
         jb->err = decode_segment_streams(jb->seg, jb->seg_buf, jb->seg_size,
@@ -3359,7 +3362,10 @@ static size_t dec_block_stride(uint32_t nblk)
 
 static void zgec_dec_blocks_run(zgec_dec_block_job *jb)
 {
-    if (jb == NULL) return;
+    if (jb == NULL) {
+        zgec_thread_cleanup();
+        return;
+    }
     for (;;) {
         uint32_t k = (uint32_t)zgec_atomic_fetch_add_size(jb->next, 1);
         uint32_t i;
