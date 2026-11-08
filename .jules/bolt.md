@@ -1263,6 +1263,21 @@ The rejected lazy-match commit is preserved as the annotated tag
 `v2-candidate-lazy-match` (not a branch) so the v2 measurement does not die with
 the branch deletion.
 
+- `jules-2 / Task 7` audit of context and sub-literal evaluation in `src/encode.c`
+  (`zgec_select_coder`, `zgec_select_contexts`, `zgec_cluster_greedy`,
+  `zgec_ctx_body_bits`, `zgec_enc_build_resid`, `zgec_enc_entropy_bits_u32`):
+  Profile on Silesia (l7: ~17.8 s min, ~18.1 s median over 7 runs; l9: ~32.9 s)
+  shows runtime is 50-60% `zgec_matcher_find_lens` and 15-20% `zgec_parse_block_*`.
+  All Task 7 target functions in `src/encode.c` cumulatively account for < 10%
+  of execution time at levels 7-10 (`zgec_ctx_body_bits` ~5-8%, greedy clustering
+  < 1%, sub-literal residual build ~1%). The valid output-neutral optimizations
+  (AVX2 row copying + horizontal sums in `zgec_cluster_greedy`, early `break` on
+  `rep0_before[t] < 32` in `zgec_select_coder`, and AVX2 residue calculations in
+  `zgec_enc_build_resid`) are already present in the codebase. Micro-optimizations
+  such as accumulator splitting or loop unrolling in `zgec_ctx_body_bits` produce
+  under 0.5% net impact (far below the 2% detection gate) and risk regressing
+  cache locality. Re-confirmed negative/below-noise gate; code preserved intact.
+
 Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
 tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
 binding constraint on the one change that actually moves the high tier.
