@@ -1249,6 +1249,16 @@ checked against the ten pinned sizes, and A/B'd pinned on CPU 9 with
   sub-literal candidate; the rest is the rejected unrolls. The rebuild is
   O(n_seq) plus a sub-KB clear, i.e. below this box's noise floor, and the flag
   costs a parameter through `zgec_select_coder`. Not worth it.
+## 2026-11-09 - 4-wide AVX2 Unrolling in Greedy Context Clustering
+
+**Learning:**
+1. In `src/encode.c` (`zgec_cluster_greedy`), 256-element uint32_t vector additions previously executed in single-vector AVX2 loops (`s += 8`). Because 256 uint32_t elements (1024 bytes) form 32 vector registers, unrolling 4-wide (`s += 32` elements per step) processes 128 bytes per iteration.
+2. In class row copying and totaling, unrolling 4-wide with four independent 256-bit SIMD accumulators (`vsum0`, `vsum1`, `vsum2`, `vsum3`) breaks the adder dependency chain across 8 loop iterations.
+3. In singleton delta seeding ($64 \times 63 / 2 = 2016$ pairs), candidate verification, and cluster merging, 4-wide AVX2 unrolling lowers loop control instruction overhead and pipeline stalls during context training while strictly maintaining bitstream byte identity and determinism.
+
+**Action:**
+Unroll 256-element histogram vector additions 4-wide with AVX2 SIMD in context clustering and entropy modeling loops.
+
 - `bolt-export-cache-mutex-opt`, `jules-14350851361244736739`,
   `bolt-seq-gather-opt`, `vise-1-decode-stack-fallbacks`,
   `vise-pool-hardening-audit` (the earlier, more aggressive pool commit),
