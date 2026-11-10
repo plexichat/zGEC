@@ -1266,3 +1266,12 @@ the branch deletion.
 Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
 tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
 binding constraint on the one change that actually moves the high tier.
+
+## 2026-11-06 - 4-Wide AVX2 Unrolling in Greedy Clustering and Branchless 64-bit Barrel Shift Mask Rotation
+
+**Learning:**
+1. In `src/encode.c` (`zgec_cluster_greedy`), class row copy/totals, singleton delta pair additions, candidate verification delta additions, and survivor cluster merges operate on 256 uint32_t histogram elements. Unrolling 4-wide (`s += 32` per iteration) with independent AVX2 SIMD vector accumulators (`_mm256_loadu_si256`, `_mm256_add_epi32`, `_mm256_storeu_si256`) breaks loop-carried dependencies and reduces loop control instruction overhead.
+2. In `src/match.c` (`zgec_matcher_find_lens`), circular rotation of short-bucket candidate hit masks across $n \le 32$ lanes previously used conditional branching (`if (s == 0u)`). Replacing this with a branchless 64-bit barrel shift `((m64 | (m64 << n)) >> head) & (((uint64_t)1u << n) - 1u)` eliminates dynamic branch mispredictions in LZ match finding.
+
+**Action:**
+Unroll 256-element histogram vector operations 4-wide with AVX2 SIMD in entropy clustering, and use 64-bit barrel shifts for branchless circular bitmask rotations.
