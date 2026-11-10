@@ -1266,3 +1266,12 @@ the branch deletion.
 Net: one byte-identical cleanup (~1% at l1 only), two correctness fixes, one
 tests commit, and one quantified v2 candidate. The v1 byte-identity gate is the
 binding constraint on the one change that actually moves the high tier.
+
+## 2026-11-09 - Match Finder Mask Rotation Barrel Shift and Greedy Clustering AVX2 4-Wide Unrolling
+
+**Learning:**
+1. In `src/match.c` (`zgec_matcher_find_lens`), rotating the cyclic hit mask across `nlanes <= 32` lanes previously used conditional branching (`if (s == 0u)`) and split 32-bit bitshifts `(mask << s) | (mask >> (n - s))`. Replicating the mask into 64-bit space (`uint64_t m64 = (uint64_t)mask;`) and performing a 64-bit barrel shift `uint32_t rm = (uint32_t)(((m64 | (m64 << n)) >> head) & (((uint64_t)1u << n) - 1u));` eliminates the conditional branch and evaluates the rotated lane mask branchlessly for all lane configurations (`n = 4, 8, 16, 32`).
+2. In `src/encode.c` (`zgec_cluster_greedy`), class histogram copying/summation, singleton delta seeding, candidate delta verification, and cluster merging process 256 uint32_t symbols. Unrolling the AVX2 SIMD addition loops 4-wide (`s += 32` per step) using four independent vector accumulators eliminates loop control overhead, pipelines unaligned SIMD loads/stores across memory banks, and avoids store-to-load forwarding stalls.
+
+**Action:**
+Use 64-bit barrel shifts to rotate cyclic bitmasks of length `<= 32` branchlessly in match finders and search routines, and unroll 256-symbol histogram operations 4-wide with AVX2 SIMD in context clustering.
