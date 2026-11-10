@@ -2757,24 +2757,18 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
                 }
             }
         }
-        zgec_fse_free_enc(enc_ll);
-        zgec_fse_free_dec(dec_ll);
-        zgec_fse_free_enc(enc_ml);
-        zgec_fse_free_dec(dec_ml);
-        zgec_fse_free_enc(enc_of);
-        zgec_fse_free_dec(dec_of);
+        zgec_fse_free_enc(enc_ll); enc_ll = NULL;
+        zgec_fse_free_dec(dec_ll); dec_ll = NULL;
+        zgec_fse_free_enc(enc_ml); enc_ml = NULL;
+        zgec_fse_free_dec(dec_ml); dec_ml = NULL;
+        zgec_fse_free_enc(enc_of); enc_of = NULL;
+        zgec_fse_free_dec(dec_of); dec_of = NULL;
         for (ci = 0; ci < 3; ci++) {
-            zgec_fse_free_enc(enc_of3[ci]);
-            zgec_fse_free_dec(dec_of3[ci]);
-            enc_of3[ci] = NULL;
-            dec_of3[ci] = NULL;
-            zgec_fse_free_enc(enc_ll3[ci]);
-            zgec_fse_free_dec(dec_ll3[ci]);
-            enc_ll3[ci] = NULL;
-            dec_ll3[ci] = NULL;
+            zgec_fse_free_enc(enc_of3[ci]); enc_of3[ci] = NULL;
+            zgec_fse_free_dec(dec_of3[ci]); dec_of3[ci] = NULL;
+            zgec_fse_free_enc(enc_ll3[ci]); enc_ll3[ci] = NULL;
+            zgec_fse_free_dec(dec_ll3[ci]); dec_ll3[ci] = NULL;
         }
-        enc_ll = enc_ml = enc_of = NULL;
-        dec_ll = dec_ml = dec_of = NULL;
         {
             zgec_seg_header sh;
             size_t hz;
@@ -2873,23 +2867,17 @@ static zgec_err zgec_emit_segment(uint8_t **payload, size_t *cap, size_t *off,
         zgec_free(lit_stream);
         zgec_free(tb_blk);
         for (ci = 0; ci < 3; ci++) {
-            zgec_fse_free_enc(enc_of3[ci]);
-            zgec_fse_free_dec(dec_of3[ci]);
-            enc_of3[ci] = NULL;
-            dec_of3[ci] = NULL;
-            zgec_fse_free_enc(enc_ll3[ci]);
-            zgec_fse_free_dec(dec_ll3[ci]);
-            enc_ll3[ci] = NULL;
-            dec_ll3[ci] = NULL;
+            zgec_fse_free_enc(enc_of3[ci]); enc_of3[ci] = NULL;
+            zgec_fse_free_dec(dec_of3[ci]); dec_of3[ci] = NULL;
+            zgec_fse_free_enc(enc_ll3[ci]); enc_ll3[ci] = NULL;
+            zgec_fse_free_dec(dec_ll3[ci]); dec_ll3[ci] = NULL;
         }
-        zgec_fse_free_enc(enc_ll);
-        zgec_fse_free_dec(dec_ll);
-        zgec_fse_free_enc(enc_ml);
-        zgec_fse_free_dec(dec_ml);
-        zgec_fse_free_enc(enc_of);
-        zgec_fse_free_dec(dec_of);
-        enc_ll = enc_ml = enc_of = NULL;
-        dec_ll = dec_ml = dec_of = NULL;
+        zgec_fse_free_enc(enc_ll); enc_ll = NULL;
+        zgec_fse_free_dec(dec_ll); dec_ll = NULL;
+        zgec_fse_free_enc(enc_ml); enc_ml = NULL;
+        zgec_fse_free_dec(dec_ml); dec_ml = NULL;
+        zgec_fse_free_enc(enc_of); enc_of = NULL;
+        zgec_fse_free_dec(dec_of); dec_of = NULL;
         return err;
     }
 
